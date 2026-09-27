@@ -149,7 +149,7 @@ const DEFAULT_CONFIG = {
     categoryLabel: 'General Support', welcomeMessage: 'Our support team will assist you shortly.',
     welcomeThumbnail: null, welcomeImage: null
   },
-  automod: { badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
+  automod: { enabled: false, badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
   afk: {},
   autorole: { enabled: false, roleId: null, humanRoleId: null, botRoleId: null },
   reactionRoles: {},
