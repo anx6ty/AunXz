@@ -5,7 +5,7 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
-  StringSelectMenuBuilder, PermissionFlagsBits,
+  StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent
 } = require('discord.js');
 
@@ -246,6 +246,46 @@ async function handlePrefixCommand(message) {
   return true;
 }
 
+const SETUP_MODAL_SPECS = {
+  antinuke: { punishment: [{ id:'value', label:'Punishment', value:c=>c.antinuke.punishment }], threshold:[{id:'value',label:'Action threshold',value:c=>String(c.antinuke.maxBans)}], window_seconds:[{id:'value',label:'Time window (seconds)',value:c=>String(c.antinuke.windowSeconds)}] },
+  antilink: { mode:[{id:'value',label:'Link action',value:c=>c.antilink.mode}] },
+  antispam: { max_messages:[{id:'value',label:'Max messages',value:c=>String(c.antispam.maxMessages)}], window_seconds:[{id:'value',label:'Window seconds',value:c=>String(c.antispam.windowSeconds)}], punishment:[{id:'value',label:'Spam action',value:c=>c.antispam.punishment}] },
+  antiraid: { join_threshold:[{id:'value',label:'Join threshold',value:c=>String(c.antiraid.joinThreshold)}], window_seconds:[{id:'value',label:'Window seconds',value:c=>String(c.antiraid.windowSeconds)}], min_account_age_days:[{id:'value',label:'Minimum account age (days)',value:c=>String(c.antiraid.minAccountAgeDays)}], action:[{id:'value',label:'Raid action',value:c=>c.antiraid.action}] },
+  greetmessage: { message:[{id:'value',label:'Welcome message',style:TextInputStyle.Paragraph,value:c=>c.greetmessage.message||''}], image:[{id:'value',label:'Image/GIF URL',value:c=>c.greetmessage.image||''}] },
+  leveling: { xp_per_message:[{id:'value',label:'XP per message',value:c=>String(c.leveling.xpPerMessage)}], cooldown_seconds:[{id:'value',label:'Cooldown seconds',value:c=>String(c.leveling.cooldownSeconds)}] },
+  tickets: {
+    panel_text:[{id:'title',label:'Panel title',value:c=>c.ticket.panelTitle||''},{id:'description',label:'Panel message',style:TextInputStyle.Paragraph,value:c=>c.ticket.panelDescription||''}],
+    panel_media:[{id:'thumbnail',label:'Panel thumbnail URL',value:c=>c.ticket.panelThumbnail||''},{id:'image',label:'Panel banner URL',value:c=>c.ticket.panelImage||''}],
+    welcome_text:[{id:'category',label:'Ticket category label',value:c=>c.ticket.categoryLabel||''},{id:'message',label:'Welcome message',style:TextInputStyle.Paragraph,value:c=>c.ticket.welcomeMessage||''}],
+    welcome_media:[{id:'thumbnail',label:'Welcome thumbnail URL',value:c=>c.ticket.welcomeThumbnail||''},{id:'image',label:'Welcome banner URL',value:c=>c.ticket.welcomeImage||''}]
+  }
+};
+
+function setupChannelSelect(interaction, sub, field) {
+  const menu=new ChannelSelectMenuBuilder().setCustomId(`setup_channel_pick:${sub}:${field}`).setPlaceholder('Select a channel…');
+  if(field==='hub_channel') menu.setChannelTypes(ChannelType.GuildVoice);
+  else if(field==='category') menu.setChannelTypes(ChannelType.GuildCategory);
+  else menu.setChannelTypes(ChannelType.GuildText);
+  return interaction.reply({embeds:[ui.base(`${ui.emoji('settings')} Select ${field.replace(/_/g,' ')}`).setDescription('Pick the Discord channel below. No IDs to copy or paste.')],components:[new ActionRowBuilder().addComponents(menu)],ephemeral:true});
+}
+function setupRoleSelect(interaction, sub, field) {
+  const menu=new RoleSelectMenuBuilder().setCustomId(`setup_role_pick:${sub}:${field}`).setPlaceholder('Select a role…');
+  return interaction.reply({embeds:[ui.base(`${ui.emoji('settings')} Select role`).setDescription('Pick the role below. No role IDs to copy or paste.')],components:[new ActionRowBuilder().addComponents(menu)],ephemeral:true});
+}
+async function openSimpleSetupSetting(interaction,sub,setting){
+  if(['hub_channel','category','channel','log_channel'].includes(setting)) return setupChannelSelect(interaction,sub,setting);
+  if(['bypass_role','support_role'].includes(setting)) return setupRoleSelect(interaction,sub,setting);
+  const spec=SETUP_MODAL_SPECS[sub]?.[setting];
+  if(!spec) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That setting is not available here.')],ephemeral:true});
+  const cfg=db.getConfig(interaction.guildId); const modal=new ModalBuilder().setCustomId(`setup_setting_modal:${sub}:${setting}`).setTitle(`Edit ${ui.SETUP_MODULE_META[sub].title}`);
+  for(const f of spec){const input=new TextInputBuilder().setCustomId(f.id).setLabel(f.label.slice(0,45)).setStyle(f.style||TextInputStyle.Short).setRequired(false);const v=f.value(cfg);if(v)input.setValue(String(v).slice(0,4000));modal.addComponents(new ActionRowBuilder().addComponents(input));}
+  return interaction.showModal(modal);
+}
+async function openTicketConfigSetting(interaction,setting){
+  if(setting==='preview'){const cfg=db.getConfig(interaction.guildId).ticket;return interaction.update({embeds:[ui.ticketPanelEmbed(interaction.guild.name,cfg),ui.ticketWelcomeEmbed(interaction.user,cfg)],components:ui.ticketConfigRow()});}
+  return openSimpleSetupSetting(interaction,'tickets',setting);
+}
+
 // ---------------------------------------------------------------------------------
 // interactionCreate — slash commands, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
@@ -266,7 +306,30 @@ client.on('interactionCreate', async (rawInteraction) => {
       return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
     }
 
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_setting:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
+      return openSimpleSetupSetting(interaction, interaction.customId.split(':')[1], interaction.values[0]);
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'ticketconfig_setting') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change ticket settings.')], ephemeral: true });
+      return openTicketConfigSetting(interaction, interaction.values[0]);
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId === 'vm_kick_pick') return handleVMKickPick(interaction);
+
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_channel_pick:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
+      const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0];
+      const map={hub_channel:{key:'voicemaster',prop:'hubChannelId'},category:sub==='voicemaster'?{key:'voicemaster',prop:'categoryId'}:sub==='tickets'?{key:'ticket',prop:'categoryId'}:null,channel:{key:sub,prop:sub==='leveling'?'channel':'channelId'},log_channel:{key:'ticket',prop:'logChannelId'}}; const target=map[field];
+      if(!target) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That channel setting is not available.')],ephemeral:true});
+      const cfg=db.saveConfig(interaction.guildId,{[target.key]:{[target.prop]:id}}); return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('setup_role_pick:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
+      const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0]; const map={bypass_role:{key:'antilink',prop:'bypassRoleId'},support_role:{key:'ticket',prop:'supportRoleId'}}; const target=map[field];
+      if(!target) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That role setting is not available.')],ephemeral:true});
+      const cfg=db.saveConfig(interaction.guildId,{[target.key]:{[target.prop]:id}}); return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
+    }
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_category_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -535,6 +598,16 @@ async function openVMModal(interaction, id) {
 }
 
 async function handleModal(interaction) {
+  if (interaction.customId.startsWith('setup_setting_modal:')) {
+    const [,sub,setting]=interaction.customId.split(':');
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator to change setup settings.')],ephemeral:true});
+    const values={}; for(const key of ['value','title','description','thumbnail','image','category','message']){try{const v=interaction.fields.getTextInputValue(key).trim();if(v)values[key]=v;}catch{}}
+    let o={}; if(sub==='tickets'){const map={panel_text:{panel_title:values.title,panel_description:values.description},panel_media:{panel_thumbnail:values.thumbnail,panel_image:values.image},welcome_text:{category_label:values.category,welcome_message:values.message},welcome_media:{welcome_thumbnail:values.thumbnail,welcome_image:values.image}};o=map[setting]||{};} else {const k=setting;if(values.value)o[k]=values.value;if(['threshold','window_seconds','max_messages','join_threshold','min_account_age_days','xp_per_message','cooldown_seconds'].includes(setting))o[k]=parseInt(values.value,10);}
+    const patch=buildModulePatch(sub,interaction.guildId,o); const cfg=db.saveConfig(interaction.guildId,patch);
+    if(interaction.message) return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
+    return interaction.reply({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg),ephemeral:true});
+  }
+
   if (interaction.customId.startsWith('setup_modal:')) {
     const sub = interaction.customId.split(':')[1];
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
