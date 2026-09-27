@@ -5,8 +5,8 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
-  StringSelectMenuBuilder, RoleSelectMenuBuilder, PermissionFlagsBits,
-  AuditLogEvent
+  StringSelectMenuBuilder, RoleSelectMenuBuilder, ChannelSelectMenuBuilder, ButtonBuilder, ButtonStyle,
+  PermissionFlagsBits, AuditLogEvent
 } = require('discord.js');
 
 const db = require('./database');
@@ -306,6 +306,42 @@ client.on('interactionCreate', async (interaction) => {
       const cfg=db.getConfig(interaction.guildId).antibadword;
       return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
     }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'autoresponder_cfg:remove') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const cfg=db.getConfig(interaction.guildId).autoresponder;
+      const triggers=(cfg.triggers||[]).filter(t=>t.id!==interaction.values[0]);
+      const next=db.saveConfig(interaction.guildId,{autoresponder:{triggers}}).autoresponder;
+      return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)});
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'autoreactor_cfg:remove') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const cfg=db.getConfig(interaction.guildId).autoreactor;
+      const triggers=(cfg.triggers||[]).filter(t=>t.id!==interaction.values[0]);
+      const next=db.saveConfig(interaction.guildId,{autoreactor:{triggers}}).autoreactor;
+      return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)});
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'embedbuilder:removebutton') {
+      const draft=sys.embedBuilderSessions.get(interaction.user.id);
+      if(!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
+      draft.buttons.splice(Number(interaction.values[0]),1);
+      return interaction.update({embeds:[ui.embedBuilderPreviewEmbed(draft)],components:ui.embedBuilderRow(draft)});
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'embedbuilder:post_channel') {
+      const draft=sys.embedBuilderSessions.get(interaction.user.id);
+      if(!draft) return interaction.update({content:'Session expired — run `/embedbuilder` again.',components:[]});
+      const channel=interaction.guild.channels.cache.get(interaction.values[0]);
+      if(!channel?.isTextBased()) return interaction.update({content:'That channel is not usable — pick a text channel.',components:[]});
+      const embed=ui.embedBuilderPreviewEmbed(draft);
+      const buttonComponents=(draft.buttons||[]).map(b=>{
+        const btn=new ButtonBuilder().setLabel(b.label.slice(0,80)).setStyle(ButtonStyle.Link).setURL(b.url);
+        if(b.emoji) btn.setEmoji(b.emoji);
+        return btn;
+      });
+      const rows=buttonComponents.length?[new ActionRowBuilder().addComponents(buttonComponents)]:[];
+      await channel.send({embeds:[embed],components:rows}).catch(()=>{});
+      sys.embedBuilderSessions.delete(interaction.user.id);
+      return interaction.update({content:`Posted in ${channel}.`,components:[]});
+    }
     if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:role') {
       return interaction.reply({content:'Select the role to use as the Greet Voice gate.',components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('greetvoice_cfg:role_select').setPlaceholder('Select gate role'))],ephemeral:true});
     }
@@ -355,6 +391,73 @@ async function handleButton(interaction) {
   if (id === 'honeypot_cfg:dm') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_dm_modal').setTitle('Honeypot Kick DM').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('DM text; use {invite}').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(db.getConfig(interaction.guildId).honeypot.dmMessage.slice(0,400)))));
   if (id === 'greetvoice_cfg:prompt') return interaction.showModal(new ModalBuilder().setCustomId('greetvoice_cfg_prompt_modal').setTitle('Greet Voice TTS').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prompt').setLabel('Text spoken in the voice channel').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((db.getConfig(interaction.guildId).greetvoice.ttsPrompt||'Welcome!').slice(0,400)))));
   if (id === 'greetvoice_cfg:test') { const cfg=db.getConfig(interaction.guildId).greetvoice; if(!cfg.vcId||!cfg.ttsPrompt) return interaction.reply({embeds:[ui.errorEmbed('Not Configured','Select a voice channel and set a TTS prompt first.')],ephemeral:true}); await interaction.deferReply({ephemeral:true}); try { await sys.playTTSInChannel(interaction.guild,cfg.vcId,cfg.ttsPrompt); return interaction.editReply({embeds:[ui.okEmbed('Greet Voice Test Complete','The TTS prompt finished playing.')]}); } catch(e) { return interaction.editReply({embeds:[ui.errorEmbed('Greet Voice Failed',String(e.message||e))]}); } }
+
+  // ---- Auto Responder setup panel ----
+  if (id === 'autoresponder_cfg:toggle') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{enabled:!cfg.enabled}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
+  if (id === 'autoresponder_cfg:case') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{ignoreCase:!cfg.ignoreCase}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
+  if (id === 'autoresponder_cfg:add') {
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    const modal=new ModalBuilder().setCustomId('autoresponder_add_modal').setTitle('Add Auto Responder Trigger');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('match').setLabel('Trigger phrase').setStyle(TextInputStyle.Short).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('mode').setLabel('Mode: exact or contains').setStyle(TextInputStyle.Short).setValue('contains').setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('response').setLabel('Response ({user}, {server})').setStyle(TextInputStyle.Paragraph).setRequired(true))
+    );
+    return interaction.showModal(modal);
+  }
+
+  // ---- Auto Reactor setup panel ----
+  if (id === 'autoreactor_cfg:toggle') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{enabled:!cfg.enabled}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
+  if (id === 'autoreactor_cfg:case') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{ignoreCase:!cfg.ignoreCase}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
+  if (id === 'autoreactor_cfg:add') {
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    const modal=new ModalBuilder().setCustomId('autoreactor_add_modal').setTitle('Add Auto Reactor Trigger');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('match').setLabel('Trigger phrase').setStyle(TextInputStyle.Short).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('mode').setLabel('Mode: exact or contains').setStyle(TextInputStyle.Short).setValue('contains').setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('emojis').setLabel('Emojis, space separated (max 5)').setStyle(TextInputStyle.Short).setRequired(true))
+    );
+    return interaction.showModal(modal);
+  }
+
+  // ---- Embed builder ----
+  if (id === 'embedbuilder:text') {
+    const draft = sys.embedBuilderSessions.get(interaction.user.id) || { title:'', description:'', color:'', footer:'' };
+    const modal=new ModalBuilder().setCustomId('embedbuilder_text_modal').setTitle('Edit Embed Text');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title').setLabel('Title').setStyle(TextInputStyle.Short).setRequired(false).setValue((draft.title||'').slice(0,200))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((draft.description||'').slice(0,3000))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('color').setLabel('Color hex, e.g. #5865F2').setStyle(TextInputStyle.Short).setRequired(false).setValue((draft.color||'').slice(0,10))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('footer').setLabel('Footer text').setStyle(TextInputStyle.Short).setRequired(false).setValue((draft.footer||'').slice(0,200)))
+    );
+    return interaction.showModal(modal);
+  }
+  if (id === 'embedbuilder:image') {
+    const draft = sys.embedBuilderSessions.get(interaction.user.id) || { imageUrl:'', thumbnailUrl:'' };
+    const modal=new ModalBuilder().setCustomId('embedbuilder_image_modal').setTitle('Edit Embed Images');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('imageUrl').setLabel('Large image URL').setStyle(TextInputStyle.Short).setRequired(false).setValue((draft.imageUrl||'').slice(0,500))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('thumbnailUrl').setLabel('Thumbnail URL').setStyle(TextInputStyle.Short).setRequired(false).setValue((draft.thumbnailUrl||'').slice(0,500)))
+    );
+    return interaction.showModal(modal);
+  }
+  if (id === 'embedbuilder:addbutton') {
+    const draft = sys.embedBuilderSessions.get(interaction.user.id);
+    if (!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
+    if ((draft.buttons||[]).length >= 5) return interaction.reply({embeds:[ui.errorEmbed('Button Limit','A single row supports at most 5 buttons.')],ephemeral:true});
+    const modal=new ModalBuilder().setCustomId('embedbuilder_button_modal').setTitle('Add Link Button');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('label').setLabel('Button label').setStyle(TextInputStyle.Short).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('url').setLabel('URL (https://…)').setStyle(TextInputStyle.Short).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('emoji').setLabel('Emoji (optional)').setStyle(TextInputStyle.Short).setRequired(false))
+    );
+    return interaction.showModal(modal);
+  }
+  if (id === 'embedbuilder:post') {
+    const draft = sys.embedBuilderSessions.get(interaction.user.id);
+    if (!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
+    return interaction.reply({content:'Select the channel to post this embed in.',components:[new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('embedbuilder:post_channel').setPlaceholder('Select a channel').setChannelTypes(ChannelType.GuildText))],ephemeral:true});
+  }
 
   if (id.startsWith('rolebtn:')) {
     const roleId=id.split(':')[1]; const role=interaction.guild.roles.cache.get(roleId);
@@ -637,10 +740,56 @@ async function openVMModal(interaction, id) {
 }
 
 async function handleModal(interaction) {
-  if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:[ui.birthdaySetupRow(cfg)],ephemeral:true}); }
-  if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words,enabled:true}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:[ui.antiBadwordSetupRow(cfg)],ephemeral:true}); }
+  if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words,enabled:true}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'honeypot_cfg_dm_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{honeypot:{dmMessage:msg||'You were removed. {invite}'}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt,enabled:true}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'autoresponder_add_modal') {
+    const match=interaction.fields.getTextInputValue('match').trim();
+    const mode=/^exact$/i.test(interaction.fields.getTextInputValue('mode').trim())?'exact':'contains';
+    const response=interaction.fields.getTextInputValue('response').trim();
+    if(!match || !response) return interaction.reply({embeds:[ui.errorEmbed('Missing Info','Both a trigger phrase and a response are required.')],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId).autoresponder;
+    const triggers=[...(cfg.triggers||[]), { id:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, match, mode, response }];
+    const next=db.saveConfig(interaction.guildId,{autoresponder:{triggers,enabled:true}}).autoresponder;
+    return interaction.reply({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next),ephemeral:true});
+  }
+  if (interaction.customId === 'autoreactor_add_modal') {
+    const match=interaction.fields.getTextInputValue('match').trim();
+    const mode=/^exact$/i.test(interaction.fields.getTextInputValue('mode').trim())?'exact':'contains';
+    const emojis=interaction.fields.getTextInputValue('emojis').trim().split(/\s+/).filter(Boolean).slice(0,5);
+    if(!match || !emojis.length) return interaction.reply({embeds:[ui.errorEmbed('Missing Info','A trigger phrase and at least one emoji are required.')],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId).autoreactor;
+    const triggers=[...(cfg.triggers||[]), { id:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, match, mode, emojis }];
+    const next=db.saveConfig(interaction.guildId,{autoreactor:{triggers,enabled:true}}).autoreactor;
+    return interaction.reply({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next),ephemeral:true});
+  }
+  if (interaction.customId === 'embedbuilder_text_modal') {
+    const draft=sys.embedBuilderSessions.get(interaction.user.id) || { buttons: [] };
+    draft.title=interaction.fields.getTextInputValue('title').trim();
+    draft.description=interaction.fields.getTextInputValue('description').trim();
+    draft.color=interaction.fields.getTextInputValue('color').trim();
+    draft.footer=interaction.fields.getTextInputValue('footer').trim();
+    sys.embedBuilderSessions.set(interaction.user.id, draft);
+    return interaction.reply({embeds:[ui.embedBuilderPreviewEmbed(draft)],components:ui.embedBuilderRow(draft),ephemeral:true});
+  }
+  if (interaction.customId === 'embedbuilder_image_modal') {
+    const draft=sys.embedBuilderSessions.get(interaction.user.id) || { buttons: [] };
+    draft.imageUrl=interaction.fields.getTextInputValue('imageUrl').trim();
+    draft.thumbnailUrl=interaction.fields.getTextInputValue('thumbnailUrl').trim();
+    sys.embedBuilderSessions.set(interaction.user.id, draft);
+    return interaction.reply({embeds:[ui.embedBuilderPreviewEmbed(draft)],components:ui.embedBuilderRow(draft),ephemeral:true});
+  }
+  if (interaction.customId === 'embedbuilder_button_modal') {
+    const draft=sys.embedBuilderSessions.get(interaction.user.id);
+    if(!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
+    const label=interaction.fields.getTextInputValue('label').trim();
+    const url=interaction.fields.getTextInputValue('url').trim();
+    const btnEmoji=interaction.fields.getTextInputValue('emoji').trim();
+    if(!label || !/^https?:\/\//i.test(url)) return interaction.reply({embeds:[ui.errorEmbed('Invalid Button','Provide a label and a valid https:// URL.')],ephemeral:true});
+    draft.buttons=[...(draft.buttons||[]), { label, url, emoji: btnEmoji || null }];
+    return interaction.reply({embeds:[ui.embedBuilderPreviewEmbed(draft)],components:ui.embedBuilderRow(draft),ephemeral:true});
+  }
   if (interaction.customId === 'birthday_modal') {
     const raw=interaction.fields.getTextInputValue('date').trim().replace(/\s+/g,'');
     const m=raw.match(/^(\d{1,2})[-\/.](\d{1,2})$/); if(!m) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','Use a format like `8-8` or `1-9`.')],ephemeral:true});
@@ -844,6 +993,8 @@ client.on('messageCreate', async (message) => {
   await sys.handleAntilink(message).catch(() => {});
   await sys.handleAntispam(message).catch(() => {});
   await sys.handleLevelingMessage(message).catch(() => {});
+  await sys.handleAutoresponder(message).catch(() => {});
+  await sys.handleAutoreactor(message).catch(() => {});
 
   const auto = cfgAll.automod;
   const anti = cfgAll.antibadword;
