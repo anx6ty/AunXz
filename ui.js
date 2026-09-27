@@ -96,6 +96,115 @@ function okEmbed(title, desc) { return base(title).setColor(OK).setDescription(d
 function warnEmbed(title, desc) { return base(title).setColor(WARN).setDescription(desc); }
 function errorEmbed(title, desc) { return base(title).setColor(DANGER).setDescription(desc); }
 
+
+// ---------------- DISCORD COMPONENTS V2 ----------------
+// Discord Components V2 messages cannot contain legacy `embeds`/`content`; the visual panel
+// is built from Container + Text Display + Media Gallery + Action Row components instead.
+// This helper is intentionally used at the final send/edit boundary so existing command code
+// can keep building normal EmbedBuilder instances while every embed that has controls becomes
+// one unified V2 container with the buttons/selects INSIDE that container.
+const COMPONENTS_V2_FLAG = 32768;
+const EPHEMERAL_FLAG = 64;
+
+function jsonOf(value) {
+  if (!value) return value;
+  if (typeof value.toJSON === 'function') return value.toJSON();
+  return value;
+}
+
+function embedToV2Parts(embedLike) {
+  const e = jsonOf(embedLike) || {};
+  const lines = [];
+  if (e.author?.name) lines.push(`*${e.author.name}*`);
+  if (e.title) lines.push(e.url ? `## [${e.title}](${e.url})` : `## ${e.title}`);
+  if (e.description) lines.push(e.description);
+  for (const field of (e.fields || [])) {
+    if (!field) continue;
+    lines.push(`**${field.name || ''}**\n${field.value || ''}`);
+  }
+  if (e.footer?.text) lines.push(`-# ${e.footer.text}`);
+  if (e.timestamp) lines.push(`-# ${new Date(e.timestamp).toLocaleString()}`);
+  const content = lines.join('\n\n').trim() || '\u200b';
+  const text = { type: 10, content: content.slice(0, 4000) };
+  return {
+    text,
+    thumbnail: e.thumbnail?.url ? { type: 11, media: { url: e.thumbnail.url }, description: e.thumbnail.description || undefined } : null,
+    image: e.image?.url ? { type: 12, items: [{ media: { url: e.image.url }, description: e.image.description || undefined }] } : null,
+    color: Number.isInteger(e.color) ? e.color : THEME
+  };
+}
+
+function componentsV2Payload(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const embeds = Array.isArray(payload.embeds) ? payload.embeds : [];
+  const components = Array.isArray(payload.components) ? payload.components : [];
+  if (!components.length) return payload;
+
+  const normalizedComponents = components.map(jsonOf);
+  let flags = Number(payload.flags) || 0;
+  flags |= COMPONENTS_V2_FLAG;
+  if (payload.ephemeral) flags |= EPHEMERAL_FLAG;
+
+  // Already a V2 container: just keep it and enforce the V2 flag.
+  if (normalizedComponents.length === 1 && normalizedComponents[0]?.type === 17) {
+    const next = { ...payload, components: normalizedComponents, flags };
+    delete next.embeds;
+    delete next.content;
+    delete next.ephemeral;
+    return next;
+  }
+
+  const container = {
+    type: 17,
+    accent_color: embeds.length ? embedToV2Parts(embeds[0]).color : THEME,
+    components: []
+  };
+
+  if (embeds.length) {
+    const parts = embeds.map(embedToV2Parts);
+    for (const part of parts) {
+      if (part.thumbnail) {
+        container.components.push({ type: 9, components: [part.text], accessory: part.thumbnail });
+      } else {
+        container.components.push(part.text);
+      }
+      if (part.image) container.components.push(part.image);
+    }
+  } else if (payload.content) {
+    container.components.push({ type: 10, content: String(payload.content).slice(0, 4000) });
+  }
+
+  // Put every existing action row (buttons/selects) INSIDE the same container.
+  for (const component of normalizedComponents) {
+    if (component?.type === 1) container.components.push(component);
+  }
+
+  // Container limit is 10 child components. Preserve controls whenever possible.
+  if (container.components.length > 10) {
+    const controls = container.components.filter(c => c.type === 1);
+    const contentParts = container.components.filter(c => c.type !== 1);
+    const room = Math.max(0, 10 - controls.length);
+    container.components = [...contentParts.slice(0, room), ...controls].slice(0, 10);
+  }
+
+  const next = { ...payload, components: [container], flags };
+  delete next.embeds;
+  delete next.content;
+  delete next.ephemeral;
+  return next;
+}
+
+function patchInteractionV2(interaction) {
+  if (!interaction || interaction.__componentsV2Patched) return interaction;
+  interaction.__componentsV2Patched = true;
+  for (const method of ['reply', 'update', 'editReply', 'followUp']) {
+    if (typeof interaction[method] !== 'function') continue;
+    const original = interaction[method].bind(interaction);
+    interaction[method] = payload => original(componentsV2Payload(payload));
+  }
+  return interaction;
+}
+
 // ---------------- HELP MENU ----------------
 const HELP_CATEGORIES = {
   protection: {
