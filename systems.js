@@ -354,10 +354,10 @@ async function handleVoicemasterJoin(oldState, newState) {
     });
     db.addVMChannel(channel.id, guild.id, newState.member.id);
     await newState.member.voice.setChannel(channel).catch(() => {});
-    const controlMsg = await channel.send({
+    const controlMsg = await channel.send(ui.toComponentsV2({
       embeds: [ui.vmControlEmbed(newState.member)],
       components: ui.vmControlRows(channel)
-    }).catch(() => {});
+    })).catch(() => {});
     return;
   }
 
