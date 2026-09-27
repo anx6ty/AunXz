@@ -39,6 +39,109 @@ commands.push({
   }
 });
 
+
+// ---------------------------------------------------------------------------------
+// Server / member information + invite utilities
+// ---------------------------------------------------------------------------------
+function resolveTargetUser(interaction, name = 'user') {
+  return interaction.options.getUser(name) || interaction.user;
+}
+
+function infoFooter(interaction) {
+  return { text: `Requested by ${interaction.user.tag} • Today at ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`, iconURL: interaction.user.displayAvatarURL({ size: 64 }) };
+}
+
+commands.push({
+  data: new SlashCommandBuilder().setName('serverinfo').setDescription('Show detailed information about this server.'),
+  async execute(interaction) {
+    const g = interaction.guild;
+    await g.members.fetch().catch(() => {});
+    const owner = await g.fetchOwner().catch(() => null);
+    const text = g.channels.cache.filter(c => c.type === ChannelType.GuildText).size;
+    const voice = g.channels.cache.filter(c => c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice).size;
+    const categories = g.channels.cache.filter(c => c.type === ChannelType.GuildCategory).size;
+    const threads = g.channels.cache.filter(c => c.isThread?.()).size;
+    const humans = g.members.cache.filter(m => !m.user.bot).size;
+    const bots = g.members.cache.filter(m => m.user.bot).size;
+    const embed = ui.serverInfoEmbed(g, { owner, text, voice, categories, threads, humans, bots, footer: infoFooter(interaction) });
+    await interaction.reply({ embeds: [embed] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('membercount').setDescription('Show server member counts.')
+    .addStringOption(o => o.setName('type').setDescription('all, humans or bots').addChoices({ name: 'all', value: 'all' }, { name: 'humans', value: 'humans' }, { name: 'bots', value: 'bots' })),
+  async execute(interaction) {
+    const g = interaction.guild;
+    await g.members.fetch().catch(() => {});
+    const humans = g.members.cache.filter(m => !m.user.bot).size;
+    const bots = g.members.cache.filter(m => m.user.bot).size;
+    const type = interaction.options.getString('type') || 'all';
+    await interaction.reply({ embeds: [ui.memberCountEmbed(g, humans, bots, infoFooter(interaction), type)] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('userinfo').setDescription('Show information about a member.')
+    .addUserOption(o => o.setName('user').setDescription('member')),
+  async execute(interaction) {
+    const user = resolveTargetUser(interaction);
+    const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+    await interaction.reply({ embeds: [ui.userInfoEmbed(user, member, infoFooter(interaction))] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('avatar').setDescription('Show a member avatar.')
+    .addUserOption(o => o.setName('user').setDescription('member')),
+  async execute(interaction) {
+    const user = resolveTargetUser(interaction);
+    await interaction.reply({ embeds: [ui.avatarEmbed(user, infoFooter(interaction))] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('banner').setDescription('Show a member banner.')
+    .addUserOption(o => o.setName('user').setDescription('member')),
+  async execute(interaction) {
+    const user = await resolveTargetUser(interaction).fetch();
+    if (!user.banner) return interaction.reply({ embeds: [ui.warnEmbed('No Banner', `${user} does not have a profile banner.`)] });
+    await interaction.reply({ embeds: [ui.bannerEmbed(user, infoFooter(interaction))] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('invites').setDescription('Show how many invites a member has generated.')
+    .addUserOption(o => o.setName('user').setDescription('member')),
+  async execute(interaction) {
+    const user = resolveTargetUser(interaction);
+    let invites;
+    try { invites = await interaction.guild.invites.fetch(); }
+    catch { return interaction.reply({ embeds: [ui.errorEmbed('Invites Unavailable', 'I need permission to view the server invites to calculate this.')], ephemeral: true }); }
+    const rows = invites.filter(i => i.inviter?.id === user.id);
+    const uses = rows.reduce((n, i) => n + (i.uses || 0), 0);
+    const active = rows.filter(i => !i.expiresTimestamp || i.expiresTimestamp > Date.now()).size;
+    await interaction.reply({ embeds: [ui.invitesEmbed(interaction.guild, user, uses, rows.size, active, infoFooter(interaction))] });
+  }
+});
+
+// /autorole <selection:bots|humans> <role>
+commands.push({
+  data: new SlashCommandBuilder().setName('autorole').setDescription('Give a selected role automatically when members join.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .addStringOption(o => o.setName('selection').setDescription('Who should receive the role?').setRequired(true)
+      .addChoices({ name: 'bots', value: 'bots' }, { name: 'humans', value: 'humans' }))
+    .addRoleOption(o => o.setName('role').setDescription('Role to give on join').setRequired(true)),
+  async execute(interaction) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return requireAdmin(interaction);
+    const selection = interaction.options.getString('selection');
+    const role = interaction.options.getRole('role');
+    const key = selection === 'bots' ? 'botRoleId' : 'humanRoleId';
+    db.saveConfig(interaction.guildId, { autorole: { enabled: true, [key]: role.id } });
+    await interaction.reply({ embeds: [ui.okEmbed('🎭 Autorole Updated', `**${selection}** will now receive ${role} when they join.`)] });
+  }
+});
+
 // ---------------------------------------------------------------------------------
 // Setup commands — every configurable feature follows /<feature> setup.
 // ---------------------------------------------------------------------------------
@@ -51,7 +154,7 @@ const ALL_MODULE_NAMES = [
   'leveling', 'tickets', 'logs', ...GENERIC_MODULES
 ];
 const GENERIC_COMMANDS = {
-  welcome: 'welcome', leave: 'leave', boost: 'boost', autorole: 'autorole', automod: 'automod',
+  welcome: 'welcome', leave: 'leave', boost: 'boost', automod: 'automod',
   starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
   snipe: 'snipeEnabled', nswffilter: 'nsfwFilter', reactionroles: 'reactionRoles', birthdays: 'birthdays'
 };
@@ -813,6 +916,68 @@ commands.push({
     else if (sub === 'reset') { xp = 0; level = 0; }
     db.setLevel(interaction.guildId, user.id, xp, level, rec.lastMessage);
     await interaction.reply({ embeds: [ui.okEmbed('📈 XP Updated', `${user} — **Level:** ${level} **XP:** ${xp}`)] });
+  }
+});
+
+
+// ---------------------------------------------------------------------------------
+// Giveaways
+// ---------------------------------------------------------------------------------
+function parseDuration(input) {
+  const m = String(input || '').trim().match(/^(\d+(?:\.\d+)?)(s|m|h|d|w)$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[m[2].toLowerCase()];
+  const ms = n * mult;
+  return Number.isFinite(ms) && ms >= 5000 && ms <= 31 * 86400000 ? ms : null;
+}
+
+commands.push({
+  data: new SlashCommandBuilder().setName('giveaway').setDescription('Create and manage giveaways.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(s => s.setName('start').setDescription('Start a giveaway.')
+      .addStringOption(o => o.setName('duration').setDescription('Examples: 30s, 10m, 2h, 1d').setRequired(true))
+      .addIntegerOption(o => o.setName('winners').setDescription('Number of winners').setRequired(true).setMinValue(1).setMaxValue(20))
+      .addStringOption(o => o.setName('prize').setDescription('Giveaway prize').setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('Where to post it').addChannelTypes(ChannelType.GuildText)))
+    .addSubcommand(s => s.setName('end').setDescription('End a giveaway now.').addStringOption(o => o.setName('id').setDescription('Giveaway ID').setRequired(true)))
+    .addSubcommand(s => s.setName('reroll').setDescription('Pick new winners.').addStringOption(o => o.setName('id').setDescription('Giveaway ID').setRequired(true)))
+    .addSubcommand(s => s.setName('cancel').setDescription('Cancel a giveaway.').addStringOption(o => o.setName('id').setDescription('Giveaway ID').setRequired(true)))
+    .addSubcommand(s => s.setName('list').setDescription('List recent giveaways.')),
+  async execute(interaction) {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'start') {
+      const duration = parseDuration(interaction.options.getString('duration'));
+      if (!duration) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Duration', 'Use `30s`, `10m`, `2h`, or `1d` (5 seconds to 31 days).')], ephemeral: true });
+      const winners = interaction.options.getInteger('winners');
+      const prize = interaction.options.getString('prize');
+      const channel = interaction.options.getChannel('channel') || interaction.channel;
+      const id = Math.random().toString(36).slice(2, 8).toUpperCase();
+      const endsAt = Date.now() + duration;
+      const msg = await channel.send({ embeds: [ui.giveawayEmbed({ id, prize, winners, host: interaction.user, endsAt, entrants: 0 })], components: [ui.giveawayButtonRow(id)] });
+      db.createGiveaway({ id, guildId: interaction.guildId, channelId: channel.id, messageId: msg.id, hostId: interaction.user.id, prize, winners, endsAt });
+      await interaction.reply({ embeds: [ui.okEmbed('🎉 Giveaway Started', `Giveaway **${id}** is live in ${channel}.`)], ephemeral: true });
+      return;
+    }
+    if (sub === 'list') {
+      const rows = db.listGiveaways(interaction.guildId, 10);
+      return interaction.reply({ embeds: [ui.giveawayListEmbed(rows)] });
+    }
+    const id = interaction.options.getString('id').toUpperCase();
+    const row = db.getGiveaway(id);
+    if (!row || row.guildId !== interaction.guildId) return interaction.reply({ embeds: [ui.errorEmbed('Not Found', `Giveaway **${id}** was not found.`)], ephemeral: true });
+    if (sub === 'cancel') {
+      db.finishGiveaway(id);
+      return interaction.reply({ embeds: [ui.warnEmbed('Giveaway Cancelled', `Giveaway **${id}** has been cancelled.`)] });
+    }
+    const entrants = JSON.parse(row.entrants || '[]');
+    if (!entrants.length) return interaction.reply({ embeds: [ui.warnEmbed('No Entrants', 'There are no entrants to choose from yet.')], ephemeral: true });
+    const pool = [...entrants];
+    const winners = [];
+    while (pool.length && winners.length < row.winners) winners.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+    if (sub === 'end') db.finishGiveaway(id, entrants);
+    const text = winners.map(x => `<@${x}>`).join(', ');
+    await interaction.reply({ embeds: [ui.okEmbed(sub === 'end' ? '🎉 Giveaway Ended' : '🎉 Giveaway Rerolled', `**Prize:** ${row.prize}\n**Winners:** ${text}\n**Giveaway:** ${id}`)] });
   }
 });
 
