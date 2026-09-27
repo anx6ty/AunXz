@@ -7,7 +7,7 @@
 
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, ChannelSelectMenuBuilder, UserSelectMenuBuilder,
+  StringSelectMenuBuilder, ChannelSelectMenuBuilder, UserSelectMenuBuilder, RoleSelectMenuBuilder,
   ChannelType, PermissionFlagsBits
 } = require('discord.js');
 const db = require('./database');
@@ -450,14 +450,88 @@ function setupPanelEmbed(sub, cfg) {
       'Every option below is fully unlocked for you to customize — use the buttons to toggle it or edit its settings.');
 }
 
+const SETUP_SETTING_OPTIONS = {
+  antinuke: [
+    ['punishment', 'Punishment', 'Choose ban, kick or strip roles'],
+    ['threshold', 'Action threshold', 'Choose the action limit'],
+    ['window_seconds', 'Time window', 'Choose the detection window']
+  ],
+  antilink: [
+    ['mode', 'Link action', 'Choose delete, warn or mute'],
+    ['bypass_role', 'Bypass role', 'Choose a role that can post links']
+  ],
+  antispam: [
+    ['max_messages', 'Message limit', 'Choose messages allowed in the window'],
+    ['window_seconds', 'Time window', 'Choose the detection window'],
+    ['punishment', 'Spam action', 'Choose mute, kick or ban']
+  ],
+  antiraid: [
+    ['join_threshold', 'Join limit', 'Choose joins allowed in the window'],
+    ['window_seconds', 'Time window', 'Choose the detection window'],
+    ['min_account_age_days', 'Account age', 'Choose minimum account age'],
+    ['action', 'Raid action', 'Choose lockdown or kick new accounts']
+  ],
+  voicemaster: [
+    ['hub_channel', 'Hub channel', 'Select the join-to-create voice channel'],
+    ['category', 'Category', 'Select where temporary channels are created']
+  ],
+  greetmessage: [
+    ['channel', 'Welcome channel', 'Select where welcome messages are posted'],
+    ['message', 'Welcome message', 'Edit the message text'],
+    ['image', 'Welcome image', 'Set an image/GIF URL']
+  ],
+  leveling: [
+    ['channel', 'Level-up channel', 'Select where level-ups are posted'],
+    ['xp_per_message', 'XP per message', 'Choose XP earned per message'],
+    ['cooldown_seconds', 'XP cooldown', 'Choose seconds between XP gains']
+  ],
+  tickets: [
+    ['category', 'Ticket category', 'Select where tickets are created'],
+    ['support_role', 'Support role', 'Select who can manage tickets'],
+    ['log_channel', 'Log channel', 'Select where ticket logs go'],
+    ['panel_text', 'Panel text', 'Edit the ticket panel title and message'],
+    ['panel_media', 'Panel media', 'Set panel thumbnail/banner URLs'],
+    ['welcome_text', 'Welcome text', 'Edit the message shown inside tickets'],
+    ['welcome_media', 'Welcome media', 'Set welcome thumbnail/banner URLs']
+  ]
+};
+
 function setupPanelRow(sub, cfg) {
   const meta = SETUP_MODULE_META[sub];
   const enabled = cfg[meta.cfgKey].enabled;
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled ? 'Disable' : 'Enable')
-      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? emoji('disabled') : emoji('enabled')),
-    new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings'))
-  );
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`setup_setting:${sub}`)
+    .setPlaceholder('Choose a setting to edit…')
+    .addOptions((SETUP_SETTING_OPTIONS[sub] || []).map(([value, label, description]) => ({ value, label, description, emoji: emoji('settings') })));
+  return [
+    new ActionRowBuilder().addComponents(menu),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled ? 'Disable' : 'Enable')
+        .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? emoji('disabled') : emoji('enabled'))
+    )
+  ];
+}
+
+function ticketConfigPanelEmbed(cfg = {}) {
+  return base(`${emoji('ticket')} Ticket Configuration`)
+    .setDescription('Choose exactly what you want to change. Text, media, category, support role and logging are separated so setup stays simple.')
+    .addFields(
+      { name: 'Panel', value: `${cfg.panelTitle || 'Default title'}\n${cfg.panelDescription || 'Default description'}`.slice(0, 1024) },
+      { name: 'Welcome', value: `${cfg.categoryLabel || 'General Support'}\n${cfg.welcomeMessage || 'Default welcome message'}`.slice(0, 1024) }
+    );
+}
+function ticketConfigRow() {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('ticketconfig_setting')
+    .setPlaceholder('Choose what to configure…')
+    .addOptions(
+      { label: 'Panel text', value: 'panel_text', description: 'Title and opening message', emoji: emoji('settings') },
+      { label: 'Panel media', value: 'panel_media', description: 'Thumbnail and banner image/GIF URLs', emoji: '🖼️' },
+      { label: 'Welcome text', value: 'welcome_text', description: 'Category and ticket welcome message', emoji: emoji('wave') },
+      { label: 'Welcome media', value: 'welcome_media', description: 'Thumbnail and banner image/GIF URLs', emoji: '🖼️' },
+      { label: 'Preview', value: 'preview', description: 'Show the current ticket design', emoji: '👀' }
+    );
+  return [new ActionRowBuilder().addComponents(menu)];
 }
 
 // ---------------- VOICEMASTER: KICK-FROM-VC SELECTION ----------------
@@ -495,6 +569,7 @@ module.exports = {
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
-  SETUP_MODULE_META, setupPanelEmbed, setupPanelRow,
+  SETUP_MODULE_META, SETUP_SETTING_OPTIONS, setupPanelEmbed, setupPanelRow,
+  ticketConfigPanelEmbed, ticketConfigRow,
   toComponentsV2, COMPONENTS_V2_FLAG
 };
