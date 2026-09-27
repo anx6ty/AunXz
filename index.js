@@ -36,7 +36,7 @@ function wrapInteraction(interaction) {
       if (methods.has(prop)) {
         return (...args) => {
           if (args.length && args[0] && typeof args[0] === 'object') {
-            args[0] = ui.toComponentsV2(args[0]);
+            args[0] = ui.toComponentsV2(args[0], prop === 'update' || prop === 'editReply');
           }
           return target[prop](...args);
         };
@@ -74,7 +74,7 @@ async function registerCommands() {
   }
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
@@ -303,7 +303,7 @@ client.on('interactionCreate', async (rawInteraction) => {
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
       const key = interaction.values[0];
-      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
+      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: ui.helpSelectRow() });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_setting:')) {
@@ -336,14 +336,14 @@ client.on('interactionCreate', async (rawInteraction) => {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
       }
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
-      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
     }
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_channel_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
       }
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { hubChannelId: interaction.values[0] } });
-      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
     }
     if (interaction.isUserSelectMenu() && interaction.customId === 'ticket_addmember_select') return handleTicketMemberSelect(interaction, 'add');
     if (interaction.isUserSelectMenu() && interaction.customId === 'ticket_removemember_select') return handleTicketMemberSelect(interaction, 'remove');
@@ -444,7 +444,7 @@ async function handleButton(interaction) {
     // toggle
     const current = db.getConfig(interaction.guildId).voicemaster.enabled;
     const cfg = db.saveConfig(interaction.guildId, { voicemaster: { enabled: !current } });
-    return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+    return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
   }
 
   // ---- Voicemaster: per-channel owner controls (Lock/Hide/Rename/Limit/Kick/Transfer) ----
@@ -494,7 +494,7 @@ async function handleButton(interaction) {
     const moduleKey = ui.SETUP_MODULE_META[sub].cfgKey;
     const enabled = !db.getConfig(interaction.guildId)[moduleKey].enabled;
     const cfg = db.saveConfig(interaction.guildId, { [moduleKey]: { enabled } });
-    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
+    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: ui.setupPanelRow(sub, cfg) });
   }
 }
 
@@ -620,7 +620,7 @@ async function handleModal(interaction) {
     }
     const patch = buildModulePatch(sub, interaction.guildId, o);
     const cfg = db.saveConfig(interaction.guildId, patch);
-    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
+    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: ui.setupPanelRow(sub, cfg) });
   }
 
   const vc = interaction.member.voice.channel;
