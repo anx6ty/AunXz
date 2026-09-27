@@ -465,6 +465,11 @@ const EXTRA_SETUP_META = {
 for (const [key, title] of Object.entries(EXTRA_SETUP_META)) {
   SETUP_MODULE_META[key] = { emojiKey: 'settings', title, cfgKey: key };
 }
+SETUP_MODULE_META.birthdays = { emojiKey: 'wave', title: 'Birthdays', cfgKey: 'birthdays' };
+SETUP_MODULE_META.buttonroles = { emojiKey: 'success', title: 'Button Roles', cfgKey: 'buttonroles' };
+SETUP_MODULE_META.staffapplications = { emojiKey: 'settings', title: 'Staff Applications', cfgKey: 'staffapplications' };
+SETUP_MODULE_META.antibadword = { emojiKey: 'warning', title: 'Anti Bad-Word', cfgKey: 'antibadword' };
+SETUP_MODULE_META.honeypot = { emojiKey: 'shield', title: 'Honeypot', cfgKey: 'honeypot' };
 
 function setupPanelEmbed(sub, cfg) {
   const meta = SETUP_MODULE_META[sub];
@@ -534,6 +539,12 @@ const SETUP_SETTING_OPTIONS = {
     ['welcome_text', 'Welcome text', 'Edit the message shown inside tickets'],
     ['welcome_media', 'Welcome media', 'Set welcome thumbnail/banner URLs']
   ]
+,
+  birthdays: [['panel_channel','Panel channel','Where users register birthdays'],['wish_channel','Wish channel','Where birthday wishes are sent'],['message','Wish message','Customize birthday message']],
+  antibadword: [['log_channel','Log channel','Where violations are logged'],['words','Blocked words','Custom blocked words']],
+  honeypot: [['channel','Honeypot channel','Channel to protect'],['action','Action','Delete, kick or ban'],['invite_back','Invite back','Create and DM an invite after kick']],
+  staffapplications: [['panel_channel','Panel channel','Where applications are opened'],['log_channel','Log channel','Where applications are reviewed'],['support_role','Staff role','Role allowed to review applications'],['message','Panel message','Customize the application panel']],
+  buttonroles: [['message','Panel message','Customize the role panel message']]
 };
 
 for (const key of Object.keys(EXTRA_SETUP_META)) {
@@ -680,6 +691,27 @@ function giveawayListEmbed(rows) {
   return base('🎉 Recent Giveaways').setDescription(rows.map(r => `**${r.id}** — ${r.prize} — ${r.ended ? 'Ended' : `<t:${Math.floor(r.endsAt / 1000)}:R>`} — ${r.winners} winner(s)`).join('\n'));
 }
 
+
+// ---------------- NEW SETUP PANELS ----------------
+function buttonRolePanelEmbed(title, description) { return base(title || '🎭 Role Selection').setDescription(description || 'Press a button to claim or remove your role.'); }
+function buttonRolePanelComponents(panel) {
+  const roles = panel.roles || [];
+  if (panel.mode === 'select') {
+    const menu = new StringSelectMenuBuilder().setCustomId(`buttonrole_select:${panel.id}`).setPlaceholder('Choose your role…').setMinValues(0).setMaxValues(1).addOptions(roles.slice(0,25).map(r=>({label:r.label || 'Role',value:r.roleId,description:r.description || 'Toggle this role'})));
+    return [new ActionRowBuilder().addComponents(menu)];
+  }
+  const rows=[];
+  for(let i=0;i<roles.length;i+=5) rows.push(new ActionRowBuilder().addComponents(roles.slice(i,i+5).map(r=>new ButtonBuilder().setCustomId(`buttonrole_toggle:${panel.id}:${r.roleId}`).setLabel((r.label||'Role').slice(0,80)).setStyle(ButtonStyle.Secondary))));
+  return rows;
+}
+function birthdayPanelEmbed(cfg){ return base(cfg.title || '🎂 Birthday Registration').setDescription('Click the button below and enter your birthday as **MM-DD** (for example `08-08` or `01-09`).'); }
+function birthdayPanelRow(){ return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('birthday_register').setLabel('Set Birthday').setStyle(ButtonStyle.Primary).setEmoji('🎂'))]; }
+function staffApplicationPanelEmbed(cfg){ return base(cfg.title || 'Staff Applications').setDescription(cfg.description || 'Think you would be a great fit? Click **Apply** to start your application in DMs.'); }
+function staffApplicationPanelRow(cfg,guildId){ return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`staffapp_apply:${guildId}`).setLabel((cfg.applyLabel||'Apply').slice(0,80)).setStyle(ButtonStyle.Primary))]; }
+function staffApplicationReadyRow(sessionId){ return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`staffapp_ready:${sessionId}`).setLabel("I'm Ready").setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`staffapp_notready:${sessionId}`).setLabel('Not Ready').setStyle(ButtonStyle.Secondary))]; }
+function staffApplicationReviewRow(id){ return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`staffapp_accept:${id}`).setLabel('Accept').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`staffapp_reject:${id}`).setLabel('Reject').setStyle(ButtonStyle.Danger))]; }
+function staffApplicationReviewEmbed(app,questions){ const answers=JSON.parse(app.answers||'[]'); const lines=questions.map((q,i)=>`**${i+1}. ${q}**\n${answers[i]||'*No answer*'}`).join('\n\n'); return base('📋 Staff Application').setDescription(`**Applicant:** <@${app.userId}>\n\n${lines}`.slice(0,4000)); }
+
 module.exports = {
   THEME, OK, WARN, DANGER, emoji, emojify, EMOJI_KEYS, DEFAULT_EMOJIS,
   base, okEmbed, warnEmbed, errorEmbed,
@@ -696,6 +728,7 @@ module.exports = {
   serverInfoEmbed, memberCountEmbed, userInfoEmbed, avatarEmbed, bannerEmbed, invitesEmbed,
   giveawayEmbed, giveawayButtonRow, giveawayListEmbed,
   SETUP_MODULE_META, SETUP_SETTING_OPTIONS, setupPanelEmbed, setupPanelRow,
+  buttonRolePanelEmbed, buttonRolePanelComponents, birthdayPanelEmbed, birthdayPanelRow, staffApplicationPanelEmbed, staffApplicationPanelRow, staffApplicationReadyRow, staffApplicationReviewRow, staffApplicationReviewEmbed,
   ticketConfigPanelEmbed, ticketConfigRow,
   toComponentsV2, COMPONENTS_V2_FLAG
 };
