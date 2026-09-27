@@ -146,12 +146,13 @@ commands.push({
 // Setup commands — every configurable feature follows /<feature> setup.
 // ---------------------------------------------------------------------------------
 const GENERIC_MODULES = [
-  'welcome', 'leave', 'boost', 'autorole', 'automod', 'starboard', 'inviteTracker',
+  'welcome', 'leave', 'boost', 'autorole', 'starboard', 'inviteTracker',
   'suggestions', 'polls', 'snipeEnabled', 'nsfwFilter', 'reactionRoles', 'birthdays'
 ];
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetvoice', 'greetmessage',
-  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
+  'leveling', 'tickets', 'logs', ...GENERIC_MODULES,
+  'sticky', 'counters', 'reminders', 'customcommands', 'autoresponder', 'verification', 'tempchannels', 'messagefilter', 'wordfilter', 'capsfilter', 'mentionguard', 'raidmode', 'serverstats', 'memberlogs', 'rolelogs', 'channellogs', 'voicelogs', 'mediaonly', 'linkfilter', 'antiemoji', 'antimention', 'nicknameguard', 'ghostping', 'selfroles', 'reactionrolesplus', 'suggestionbox', 'confessions', 'applications', 'forms', 'feedback', 'serverbackup', 'autorename', 'autothread', 'threadguard', 'activityroles', 'inactivity', 'commandlogs', 'moderatorroles', 'staffnotify', 'welcomeimages', 'goodbyeimages'
 ];
 const GENERIC_COMMANDS = {
   welcome: 'welcome', leave: 'leave', boost: 'boost', automod: 'automod',
@@ -159,7 +160,7 @@ const GENERIC_COMMANDS = {
   snipe: 'snipeEnabled', nswffilter: 'nsfwFilter', reactionroles: 'reactionRoles', birthdays: 'birthdays'
 };
 
-const PANEL_MODULES = ['antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetmessage', 'leveling', 'tickets'];
+const PANEL_MODULES = ['antinuke', 'antilink', 'antispam', 'antiraid', 'automod', 'voicemaster', 'greetmessage', 'leveling', 'tickets'];
 
 function extractModuleOptions(sub, interaction) {
   const o = { state: interaction.options.getString('state') };
@@ -192,8 +193,15 @@ function extractModuleOptions(sub, interaction) {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.xp_per_message = interaction.options.getInteger('xp_per_message');
     o.cooldown_seconds = interaction.options.getInteger('cooldown_seconds');
+    o.level_up_message = interaction.options.getString('level_up_message');
     o.reward_level = interaction.options.getInteger('reward_level');
     const r = interaction.options.getRole('reward_role'); o.reward_role_id = r ? r.id : null;
+  } else if (sub === 'automod') {
+    o.bad_word_filter = interaction.options.getBoolean('bad_word_filter');
+    o.bad_words = interaction.options.getString('bad_words');
+    o.caps_filter = interaction.options.getBoolean('caps_filter');
+    o.caps_threshold = interaction.options.getInteger('caps_threshold');
+    o.invite_filter = interaction.options.getBoolean('invite_filter');
   } else if (sub === 'tickets') {
     const c = interaction.options.getChannel('category'); o.category_id = c ? c.id : null;
     const r = interaction.options.getRole('support_role'); o.support_role_id = r ? r.id : null;
@@ -263,10 +271,19 @@ function buildModulePatch(sub, guildId, o) {
     if (o.channel_id) patch.leveling.channel = o.channel_id;
     if (o.xp_per_message) patch.leveling.xpPerMessage = o.xp_per_message;
     if (o.cooldown_seconds) patch.leveling.cooldownSeconds = o.cooldown_seconds;
+    if (o.level_up_message) patch.leveling.levelUpMessage = o.level_up_message;
     if (o.reward_level && o.reward_role_id) {
       const current = db.getConfig(guildId).leveling.roleRewards;
       patch.leveling.roleRewards = { ...current, [String(o.reward_level)]: o.reward_role_id };
     }
+  } else if (sub === 'automod') {
+    patch.automod = {};
+    if (state) patch.automod.enabled = state === 'enable';
+    if (o.bad_word_filter !== null && o.bad_word_filter !== undefined) patch.automod.badWordFilter = o.bad_word_filter;
+    if (o.bad_words !== null && o.bad_words !== undefined) patch.automod.badWords = o.bad_words.split(',').map(x => x.trim()).filter(Boolean).slice(0, 100);
+    if (o.caps_filter !== null && o.caps_filter !== undefined) patch.automod.capsFilter = o.caps_filter;
+    if (o.caps_threshold !== null && o.caps_threshold !== undefined) patch.automod.capsThreshold = o.caps_threshold;
+    if (o.invite_filter !== null && o.invite_filter !== undefined) patch.automod.inviteFilter = o.invite_filter;
   } else if (sub === 'tickets') {
     patch.ticket = {};
     if (state) patch.ticket.enabled = state === 'enable';
@@ -336,6 +353,13 @@ commands.push({
   }
 });
 
+commands.push(panelSetupCommand('automod', 'Configure automatic moderation.', sub => sub
+  .addBooleanOption(o => o.setName('bad_word_filter').setDescription('Enable bad-word filtering'))
+  .addStringOption(o => o.setName('bad_words').setDescription('Comma-separated words to block'))
+  .addBooleanOption(o => o.setName('caps_filter').setDescription('Enable excessive-caps filtering'))
+  .addIntegerOption(o => o.setName('caps_threshold').setDescription('Caps percentage threshold (1-100)'))
+  .addBooleanOption(o => o.setName('invite_filter').setDescription('Block Discord invite links'))));
+
 commands.push(panelSetupCommand('antinuke', 'Configure antinuke protection.', sub => sub
   .addStringOption(o => o.setName('punishment').setDescription('ban/kick/strip_roles')
     .addChoices({ name: 'ban', value: 'ban' }, { name: 'kick', value: 'kick' }, { name: 'strip_roles', value: 'strip_roles' }))
@@ -374,6 +398,7 @@ commands.push(panelSetupCommand('leveling', 'Configure the XP/leveling system.',
   .addChannelOption(o => o.setName('channel').setDescription('level-up announcement channel').addChannelTypes(ChannelType.GuildText))
   .addIntegerOption(o => o.setName('xp_per_message').setDescription('XP per eligible message'))
   .addIntegerOption(o => o.setName('cooldown_seconds').setDescription('seconds between XP gains'))
+  .addStringOption(o => o.setName('level_up_message').setDescription('message when a member levels up; {user} and {level} are supported'))
   .addIntegerOption(o => o.setName('reward_level').setDescription('level for a role reward'))
   .addRoleOption(o => o.setName('reward_role').setDescription('role granted at reward_level'))));
 
@@ -431,6 +456,53 @@ for (const [commandName, moduleName] of Object.entries(GENERIC_COMMANDS)) {
       const cfg = db.saveConfig(interaction.guildId, patch);
       const display = typeof cfg[moduleName] === 'boolean' ? { enabled: cfg[moduleName] } : cfg[moduleName];
       await interaction.reply({ embeds: [ui.configSummaryEmbed(moduleName, display)] });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------------
+// 40+ dedicated setup modules
+// ---------------------------------------------------------------------------------
+// These commands give each configurable module its own /<feature> setup entry.
+// Settings are persisted per guild and surfaced through the same interactive setup UI.
+const EXTRA_SETUP_MODULES = [
+  'sticky', 'counters', 'reminders', 'customcommands', 'autoresponder', 'verification',
+  'tempchannels', 'messagefilter', 'wordfilter', 'capsfilter', 'mentionguard', 'raidmode',
+  'serverstats', 'memberlogs', 'rolelogs', 'channellogs', 'voicelogs', 'mediaonly',
+  'linkfilter', 'antiemoji', 'antimention', 'nicknameguard', 'ghostping', 'selfroles',
+  'reactionrolesplus', 'suggestionbox', 'confessions', 'applications', 'forms', 'feedback',
+  'serverbackup', 'autorename', 'autothread', 'threadguard', 'activityroles', 'inactivity',
+  'commandlogs', 'moderatorroles', 'staffnotify', 'welcomeimages', 'goodbyeimages'
+];
+
+for (const moduleName of EXTRA_SETUP_MODULES) {
+  commands.push({
+    data: new SlashCommandBuilder().setName(moduleName).setDescription(`Configure ${moduleName}.`)
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .addSubcommand(s => s.setName('setup').setDescription(`Open the ${moduleName} configuration panel.`)
+        .addStringOption(o => o.setName('state').setDescription('enable or disable')
+          .addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
+        .addChannelOption(o => o.setName('channel').setDescription('optional channel for this module').addChannelTypes(ChannelType.GuildText))
+        .addRoleOption(o => o.setName('role').setDescription('optional role used by this module'))
+        .addStringOption(o => o.setName('message').setDescription('optional custom message'))),
+    async execute(interaction) {
+      if (!requireAdmin(interaction)) return;
+      const state = interaction.options.getString('state');
+      const channel = interaction.options.getChannel('channel');
+      const role = interaction.options.getRole('role');
+      const message = interaction.options.getString('message');
+      const current = db.getConfig(interaction.guildId)[moduleName];
+      const existing = current && typeof current === 'object' ? current : { enabled: false };
+      const patch = { [moduleName]: {
+        ...existing,
+        ...(state ? { enabled: state === 'enable' } : {}),
+        ...(channel ? { channelId: channel.id } : {}),
+        ...(role ? { roleId: role.id } : {}),
+        ...(message !== null ? { message } : {})
+      }};
+      const cfg = db.saveConfig(interaction.guildId, patch);
+      // Every dedicated setup uses the same configurable setup panel.
+      await interaction.reply({ embeds: [ui.setupPanelEmbed(moduleName, cfg)], components: ui.setupPanelRow(moduleName, cfg) });
     }
   });
 }
