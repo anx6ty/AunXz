@@ -20,15 +20,12 @@ function requireAdmin(interaction) {
   return true;
 }
 
-// Modules the generic /setup module toggle understands, beyond the dedicated subcommands.
-const GENERIC_MODULES = [
-  'welcome', 'leave', 'boost', 'autorole', 'automod', 'starboard', 'inviteTracker',
-  'suggestions', 'polls', 'snipeEnabled', 'nsfwFilter', 'reactionRoles', 'birthdays'
-];
-const ALL_MODULE_NAMES = [
-  'antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetvoice', 'greetmessage',
-  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
-];
+function getImageAttachment(interaction, optionName) {
+  const attachment = interaction.options.getAttachment(optionName);
+  if (!attachment) return null;
+  if (attachment.contentType && !attachment.contentType.startsWith('image/')) return null;
+  return attachment;
+}
 
 const commands = [];
 
@@ -43,71 +40,22 @@ commands.push({
 });
 
 // ---------------------------------------------------------------------------------
-// /setup — the mega config command
+// Setup commands — every configurable feature follows /<feature> setup.
 // ---------------------------------------------------------------------------------
-const setupCmd = new SlashCommandBuilder()
-  .setName('setup')
-  .setDescription('Configure a bot module.')
-  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-  .addSubcommand(s => s.setName('list').setDescription('List every configurable module.'))
-  .addSubcommand(s => s.setName('antinuke').setDescription('Configure antinuke protection.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addStringOption(o => o.setName('punishment').setDescription('ban/kick/strip_roles').addChoices({ name: 'ban', value: 'ban' }, { name: 'kick', value: 'kick' }, { name: 'strip_roles', value: 'strip_roles' }))
-    .addIntegerOption(o => o.setName('threshold').setDescription('actions allowed before punishment (applies to all antinuke limits)'))
-    .addIntegerOption(o => o.setName('window_seconds').setDescription('time window in seconds')))
-  .addSubcommand(s => s.setName('antilink').setDescription('Configure antilink.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addStringOption(o => o.setName('mode').setDescription('delete/warn/mute').addChoices({ name: 'delete', value: 'delete' }, { name: 'warn', value: 'warn' }, { name: 'mute', value: 'mute' }))
-    .addRoleOption(o => o.setName('bypass_role').setDescription('role exempt from antilink')))
-  .addSubcommand(s => s.setName('antispam').setDescription('Configure antispam.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addIntegerOption(o => o.setName('max_messages').setDescription('messages allowed per window'))
-    .addIntegerOption(o => o.setName('window_seconds').setDescription('window length in seconds'))
-    .addStringOption(o => o.setName('punishment').setDescription('mute/kick/ban').addChoices({ name: 'mute', value: 'mute' }, { name: 'kick', value: 'kick' }, { name: 'ban', value: 'ban' })))
-  .addSubcommand(s => s.setName('antiraid').setDescription('Configure antiraid.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addIntegerOption(o => o.setName('join_threshold').setDescription('joins allowed per window'))
-    .addIntegerOption(o => o.setName('window_seconds').setDescription('window length in seconds'))
-    .addIntegerOption(o => o.setName('min_account_age_days').setDescription('min account age to allow join'))
-    .addStringOption(o => o.setName('action').setDescription('lockdown/kick_new').addChoices({ name: 'lockdown', value: 'lockdown' }, { name: 'kick_new', value: 'kick_new' })))
-  .addSubcommand(s => s.setName('voicemaster').setDescription('Configure join-to-create voice.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addChannelOption(o => o.setName('hub_channel').setDescription('the "join to create" voice channel').addChannelTypes(ChannelType.GuildVoice))
-    .addChannelOption(o => o.setName('category').setDescription('category new channels are created under').addChannelTypes(ChannelType.GuildCategory)))
-  .addSubcommand(s => s.setName('greetmessage').setDescription('Configure the text welcome message.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addChannelOption(o => o.setName('channel').setDescription('channel to post in').addChannelTypes(ChannelType.GuildText))
-    .addStringOption(o => o.setName('message').setDescription('use {user} and {server}'))
-    .addStringOption(o => o.setName('image').setDescription('image/GIF URL shown with the greet message')))
-  .addSubcommand(s => s.setName('leveling').setDescription('Configure the XP/leveling system.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addChannelOption(o => o.setName('channel').setDescription('level-up announcement channel').addChannelTypes(ChannelType.GuildText))
-    .addIntegerOption(o => o.setName('xp_per_message').setDescription('XP per eligible message'))
-    .addIntegerOption(o => o.setName('cooldown_seconds').setDescription('seconds between XP gains'))
-    .addIntegerOption(o => o.setName('reward_level').setDescription('level to attach a role reward to'))
-    .addRoleOption(o => o.setName('reward_role').setDescription('role granted at reward_level')))
-  .addSubcommand(s => s.setName('tickets').setDescription('Configure the ticket system.')
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addChannelOption(o => o.setName('category').setDescription('category tickets are created under').addChannelTypes(ChannelType.GuildCategory))
-    .addRoleOption(o => o.setName('support_role').setDescription('role that can see/claim tickets'))
-    .addChannelOption(o => o.setName('log_channel').setDescription('ticket transcript/log channel').addChannelTypes(ChannelType.GuildText)))
-  .addSubcommand(s => s.setName('logs').setDescription('Route a log type to a channel.')
-    .addStringOption(o => o.setName('type').setDescription('log category').setRequired(true)
-      .addChoices(
-        { name: 'moderation', value: 'mod' }, { name: 'messages', value: 'message' }, { name: 'members', value: 'member' },
-        { name: 'voice', value: 'voice' }, { name: 'antinuke', value: 'antinuke' }, { name: 'server', value: 'server' },
-        { name: 'tickets', value: 'ticket' }, { name: 'joins/leaves', value: 'join' }))
-    .addChannelOption(o => o.setName('channel').setDescription('channel to send this log type to').setRequired(true).addChannelTypes(ChannelType.GuildText)))
-  .addSubcommand(s => s.setName('module').setDescription('Enable/disable one of the 40+ smaller modules.')
-    .addStringOption(o => o.setName('name').setDescription('module name').setRequired(true).addChoices(...GENERIC_MODULES.map(m => ({ name: m, value: m }))))
-    .addStringOption(o => o.setName('state').setDescription('enable/disable').setRequired(true).addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
-    .addChannelOption(o => o.setName('channel').setDescription('channel this module should use, if any')));
+const GENERIC_MODULES = [
+  'welcome', 'leave', 'boost', 'autorole', 'automod', 'starboard', 'inviteTracker',
+  'suggestions', 'polls', 'snipeEnabled', 'nsfwFilter', 'reactionRoles', 'birthdays'
+];
+const ALL_MODULE_NAMES = [
+  'antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetvoice', 'greetmessage',
+  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
+];
+const GENERIC_COMMANDS = {
+  welcome: 'welcome', leave: 'leave', boost: 'boost', autorole: 'autorole', automod: 'automod',
+  starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
+  snipe: 'snipeEnabled', nswffilter: 'nsfwFilter', reactionroles: 'reactionRoles', birthdays: 'birthdays'
+};
 
-// The 8 dedicated modules that get the full interactive setup panel (embed + toggle/edit
-// buttons). Pulls values out of a slash interaction's options into a flat, source-agnostic
-// object `o`, so the same buildModulePatch() below can also be driven by the setup-panel's
-// edit modal in index.js (which only has raw text field values, not resolved User/Role/Channel
-// objects).
 const PANEL_MODULES = ['antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetmessage', 'leveling', 'tickets'];
 
 function extractModuleOptions(sub, interaction) {
@@ -135,6 +83,8 @@ function extractModuleOptions(sub, interaction) {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.message = interaction.options.getString('message');
     o.image = interaction.options.getString('image');
+    const imageFile = getImageAttachment(interaction, 'image_file');
+    o.image_file = imageFile ? imageFile.url : null;
   } else if (sub === 'leveling') {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.xp_per_message = interaction.options.getInteger('xp_per_message');
@@ -145,13 +95,22 @@ function extractModuleOptions(sub, interaction) {
     const c = interaction.options.getChannel('category'); o.category_id = c ? c.id : null;
     const r = interaction.options.getRole('support_role'); o.support_role_id = r ? r.id : null;
     const l = interaction.options.getChannel('log_channel'); o.log_channel_id = l ? l.id : null;
+    o.panel_title = interaction.options.getString('panel_title');
+    o.panel_description = interaction.options.getString('panel_description');
+    o.panel_thumbnail = interaction.options.getString('panel_thumbnail');
+    o.panel_image = interaction.options.getString('panel_image');
+    o.panel_thumbnail_file = (getImageAttachment(interaction, 'panel_thumbnail_file') || {}).url || null;
+    o.panel_image_file = (getImageAttachment(interaction, 'panel_image_file') || {}).url || null;
+    o.category_label = interaction.options.getString('category_label');
+    o.welcome_message = interaction.options.getString('welcome_message');
+    o.welcome_thumbnail = interaction.options.getString('welcome_thumbnail');
+    o.welcome_image = interaction.options.getString('welcome_image');
+    o.welcome_thumbnail_file = (getImageAttachment(interaction, 'welcome_thumbnail_file') || {}).url || null;
+    o.welcome_image_file = (getImageAttachment(interaction, 'welcome_image_file') || {}).url || null;
   }
   return o;
 }
 
-// Builds a db.saveConfig() patch for one of the 8 panel modules from a flat options object `o`.
-// Every field is optional — omit/null means "leave unchanged" — so this doubles as the handler
-// for "just show me the current panel" (call with an empty `o`) and "apply these changes".
 function buildModulePatch(sub, guildId, o) {
   const patch = {};
   const state = o.state;
@@ -161,7 +120,8 @@ function buildModulePatch(sub, guildId, o) {
     if (o.punishment) patch.antinuke.punishment = o.punishment;
     if (o.threshold) Object.assign(patch.antinuke, {
       maxChannelDeletes: o.threshold, maxChannelCreates: o.threshold, maxRoleDeletes: o.threshold,
-      maxRoleCreates: o.threshold, maxBans: o.threshold, maxKicks: o.threshold, maxWebhookCreates: o.threshold, maxRoleUpdates: o.threshold
+      maxRoleCreates: o.threshold, maxBans: o.threshold, maxKicks: o.threshold,
+      maxWebhookCreates: o.threshold, maxRoleUpdates: o.threshold
     });
     if (o.window_seconds) patch.antinuke.windowSeconds = o.window_seconds;
   } else if (sub === 'antilink') {
@@ -192,7 +152,8 @@ function buildModulePatch(sub, guildId, o) {
     if (state) patch.greetmessage.enabled = state === 'enable';
     if (o.channel_id) patch.greetmessage.channelId = o.channel_id;
     if (o.message) patch.greetmessage.message = o.message;
-    if (o.image) patch.greetmessage.image = o.image;
+    if (o.image_file) patch.greetmessage.image = o.image_file;
+    else if (o.image) patch.greetmessage.image = o.image;
   } else if (sub === 'leveling') {
     patch.leveling = {};
     if (state) patch.leveling.enabled = state === 'enable';
@@ -209,83 +170,194 @@ function buildModulePatch(sub, guildId, o) {
     if (o.category_id) patch.ticket.categoryId = o.category_id;
     if (o.support_role_id) patch.ticket.supportRoleId = o.support_role_id;
     if (o.log_channel_id) patch.ticket.logChannelId = o.log_channel_id;
+    if (o.panel_title) patch.ticket.panelTitle = o.panel_title;
+    if (o.panel_description) patch.ticket.panelDescription = o.panel_description;
+    if (o.panel_thumbnail_file) patch.ticket.panelThumbnail = o.panel_thumbnail_file;
+    else if (o.panel_thumbnail) patch.ticket.panelThumbnail = o.panel_thumbnail;
+    if (o.panel_image_file) patch.ticket.panelImage = o.panel_image_file;
+    else if (o.panel_image) patch.ticket.panelImage = o.panel_image;
+    if (o.category_label) patch.ticket.categoryLabel = o.category_label;
+    if (o.welcome_message) patch.ticket.welcomeMessage = o.welcome_message;
+    if (o.welcome_thumbnail_file) patch.ticket.welcomeThumbnail = o.welcome_thumbnail_file;
+    else if (o.welcome_thumbnail) patch.ticket.welcomeThumbnail = o.welcome_thumbnail;
+    if (o.welcome_image_file) patch.ticket.welcomeImage = o.welcome_image_file;
+    else if (o.welcome_image) patch.ticket.welcomeImage = o.welcome_image;
   }
   return patch;
 }
 
+function addStateOption(subcommand) {
+  return subcommand.addStringOption(o => o.setName('state').setDescription('enable or disable').setRequired(false)
+    .addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }));
+}
+
+function panelSetupData(name, description, optionBuilder) {
+  const command = new SlashCommandBuilder()
+    .setName(name)
+    .setDescription(description)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub => {
+      sub.setName('setup').setDescription(`Open the ${name} configuration panel.`);
+      addStateOption(sub);
+      return optionBuilder ? optionBuilder(sub) : sub;
+    });
+  return command;
+}
+
+function panelSetupCommand(name, description, optionBuilder) {
+  return {
+    data: panelSetupData(name, description, optionBuilder),
+    async execute(interaction) {
+      if (!requireAdmin(interaction)) return;
+      const guildId = interaction.guildId;
+      const sub = interaction.options.getSubcommand();
+      if (sub !== 'setup') return;
+      const o = extractModuleOptions(name, interaction);
+      const patch = buildModulePatch(name, guildId, o);
+      const cfg = db.saveConfig(guildId, patch);
+      if (name === 'voicemaster') {
+        return interaction.reply({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+      }
+      return interaction.reply({ embeds: [ui.setupPanelEmbed(name, cfg)], components: [ui.setupPanelRow(name, cfg)] });
+    }
+  };
+}
+
 commands.push({
-  data: setupCmd,
+  data: new SlashCommandBuilder().setName('setup').setDescription('List configurable bot modules.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s => s.setName('list').setDescription('List every configurable module.')),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
-    const sub = interaction.options.getSubcommand();
-    const guildId = interaction.guildId;
-
-    if (sub === 'list') {
-      return interaction.reply({ embeds: [ui.moduleListEmbed(ALL_MODULE_NAMES)], ephemeral: true });
-    }
-
-    if (sub === 'module') {
-      const name = interaction.options.getString('name');
-      const state = interaction.options.getString('state') === 'enable';
-      const channel = interaction.options.getChannel('channel');
-      const currentVal = db.getConfig(guildId)[name];
-      // A few generic modules (e.g. snipeEnabled) store a plain boolean rather than an
-      // { enabled: bool } object — patch the right shape either way.
-      const patch = typeof currentVal === 'boolean'
-        ? { [name]: state }
-        : { [name]: { enabled: state, ...(channel ? { channelId: channel.id } : {}) } };
-      const cfg = db.saveConfig(guildId, patch);
-      const display = typeof cfg[name] === 'boolean' ? { enabled: cfg[name] } : cfg[name];
-      return interaction.reply({ embeds: [ui.configSummaryEmbed(name, display)] });
-    }
-
-    if (sub === 'logs') {
-      const type = interaction.options.getString('type');
-      const channel = interaction.options.getChannel('channel');
-      const cfg = db.saveConfig(guildId, { logs: { [type]: channel.id } });
-      return interaction.reply({ embeds: [ui.configSummaryEmbed('logs', cfg.logs)] });
-    }
-
-    // Every other subcommand is one of the 8 panel modules: apply whatever options were passed
-    // (none of them are required, so `/setup antinuke` alone just opens the panel unchanged),
-    // then always reply with the full interactive panel — never a static, dead-end summary.
-    const o = extractModuleOptions(sub, interaction);
-    const patch = buildModulePatch(sub, guildId, o);
-    const cfg = db.saveConfig(guildId, patch);
-
-    // Voicemaster gets its own dedicated 3-button panel (Category / Voice Channel /
-    // Enable-Disable) instead of the generic edit-modal panel every other module uses.
-    if (sub === 'voicemaster') {
-      return interaction.reply({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
-    }
-    return interaction.reply({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
+    await interaction.reply({ embeds: [ui.moduleListEmbed(ALL_MODULE_NAMES)], ephemeral: true });
   }
 });
 
+commands.push(panelSetupCommand('antinuke', 'Configure antinuke protection.', sub => sub
+  .addStringOption(o => o.setName('punishment').setDescription('ban/kick/strip_roles')
+    .addChoices({ name: 'ban', value: 'ban' }, { name: 'kick', value: 'kick' }, { name: 'strip_roles', value: 'strip_roles' }))
+  .addIntegerOption(o => o.setName('threshold').setDescription('actions allowed before punishment'))
+  .addIntegerOption(o => o.setName('window_seconds').setDescription('time window in seconds'))));
+
+commands.push(panelSetupCommand('antilink', 'Configure antilink.', sub => sub
+  .addStringOption(o => o.setName('mode').setDescription('delete/warn/mute')
+    .addChoices({ name: 'delete', value: 'delete' }, { name: 'warn', value: 'warn' }, { name: 'mute', value: 'mute' }))
+  .addRoleOption(o => o.setName('bypass_role').setDescription('role exempt from antilink'))));
+
+commands.push(panelSetupCommand('antispam', 'Configure antispam.', sub => sub
+  .addIntegerOption(o => o.setName('max_messages').setDescription('messages allowed per window'))
+  .addIntegerOption(o => o.setName('window_seconds').setDescription('window length in seconds'))
+  .addStringOption(o => o.setName('punishment').setDescription('mute/kick/ban')
+    .addChoices({ name: 'mute', value: 'mute' }, { name: 'kick', value: 'kick' }, { name: 'ban', value: 'ban' }))));
+
+commands.push(panelSetupCommand('antiraid', 'Configure antiraid.', sub => sub
+  .addIntegerOption(o => o.setName('join_threshold').setDescription('joins allowed per window'))
+  .addIntegerOption(o => o.setName('window_seconds').setDescription('window length in seconds'))
+  .addIntegerOption(o => o.setName('min_account_age_days').setDescription('min account age to allow join'))
+  .addStringOption(o => o.setName('action').setDescription('lockdown/kick_new')
+    .addChoices({ name: 'lockdown', value: 'lockdown' }, { name: 'kick_new', value: 'kick_new' }))));
+
+commands.push(panelSetupCommand('voicemaster', 'Configure join-to-create voice.', sub => sub
+  .addChannelOption(o => o.setName('hub_channel').setDescription('join-to-create voice channel').addChannelTypes(ChannelType.GuildVoice))
+  .addChannelOption(o => o.setName('category').setDescription('category for new temporary channels').addChannelTypes(ChannelType.GuildCategory))));
+
+commands.push(panelSetupCommand('greetmessage', 'Configure the text welcome message.', sub => sub
+  .addChannelOption(o => o.setName('channel').setDescription('channel to post in').addChannelTypes(ChannelType.GuildText))
+  .addStringOption(o => o.setName('message').setDescription('use {user} and {server}'))
+  .addStringOption(o => o.setName('image').setDescription('image/GIF URL shown with the greet message'))
+  .addAttachmentOption(o => o.setName('image_file').setDescription('upload an image/GIF for the greet message'))));
+
+commands.push(panelSetupCommand('leveling', 'Configure the XP/leveling system.', sub => sub
+  .addChannelOption(o => o.setName('channel').setDescription('level-up announcement channel').addChannelTypes(ChannelType.GuildText))
+  .addIntegerOption(o => o.setName('xp_per_message').setDescription('XP per eligible message'))
+  .addIntegerOption(o => o.setName('cooldown_seconds').setDescription('seconds between XP gains'))
+  .addIntegerOption(o => o.setName('reward_level').setDescription('level for a role reward'))
+  .addRoleOption(o => o.setName('reward_role').setDescription('role granted at reward_level'))));
+
+commands.push(panelSetupCommand('tickets', 'Configure the ticket system.', sub => sub
+  .addChannelOption(o => o.setName('category').setDescription('category tickets are created under').addChannelTypes(ChannelType.GuildCategory))
+  .addRoleOption(o => o.setName('support_role').setDescription('role that can see/claim tickets'))
+  .addChannelOption(o => o.setName('log_channel').setDescription('ticket transcript/log channel').addChannelTypes(ChannelType.GuildText))
+  .addStringOption(o => o.setName('panel_title').setDescription('title of the ticket panel'))
+  .addStringOption(o => o.setName('panel_description').setDescription('message shown on the ticket panel'))
+  .addStringOption(o => o.setName('panel_thumbnail').setDescription('panel thumbnail image/GIF URL'))
+  .addAttachmentOption(o => o.setName('panel_thumbnail_file').setDescription('upload the panel thumbnail image/GIF'))
+  .addStringOption(o => o.setName('panel_image').setDescription('panel banner image/GIF URL'))
+  .addAttachmentOption(o => o.setName('panel_image_file').setDescription('upload the panel banner image/GIF'))
+  .addStringOption(o => o.setName('category_label').setDescription('category shown inside new tickets'))
+  .addStringOption(o => o.setName('welcome_message').setDescription('message shown when a ticket opens'))
+  .addStringOption(o => o.setName('welcome_thumbnail').setDescription('ticket welcome thumbnail image/GIF URL'))
+  .addAttachmentOption(o => o.setName('welcome_thumbnail_file').setDescription('upload the ticket welcome thumbnail image/GIF'))
+  .addStringOption(o => o.setName('welcome_image').setDescription('ticket welcome banner image/GIF URL'))
+  .addAttachmentOption(o => o.setName('welcome_image_file').setDescription('upload the ticket welcome banner image/GIF'))));
+
+commands.push({
+  data: new SlashCommandBuilder().setName('logs').setDescription('Configure logging destinations.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s => s.setName('setup').setDescription('Route a log type to a channel.')
+      .addStringOption(o => o.setName('type').setDescription('log category').setRequired(true).addChoices(
+        { name: 'moderation', value: 'mod' }, { name: 'messages', value: 'message' }, { name: 'members', value: 'member' },
+        { name: 'voice', value: 'voice' }, { name: 'antinuke', value: 'antinuke' }, { name: 'server', value: 'server' },
+        { name: 'tickets', value: 'ticket' }, { name: 'joins/leaves', value: 'join' }))
+      .addChannelOption(o => o.setName('channel').setDescription('channel to send this log type to').setRequired(true).addChannelTypes(ChannelType.GuildText))),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const type = interaction.options.getString('type');
+    const channel = interaction.options.getChannel('channel');
+    const cfg = db.saveConfig(interaction.guildId, { logs: { [type]: channel.id } });
+    await interaction.reply({ embeds: [ui.configSummaryEmbed('logs', cfg.logs)] });
+  }
+});
+
+for (const [commandName, moduleName] of Object.entries(GENERIC_COMMANDS)) {
+  commands.push({
+    data: new SlashCommandBuilder().setName(commandName).setDescription(`Configure ${moduleName}.`)
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .addSubcommand(s => s.setName('setup').setDescription(`Enable or disable ${moduleName}.`)
+        .addStringOption(o => o.setName('state').setDescription('enable or disable').setRequired(true)
+          .addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
+        .addChannelOption(o => o.setName('channel').setDescription('channel this module should use, if any'))),
+    async execute(interaction) {
+      if (!requireAdmin(interaction)) return;
+      const state = interaction.options.getString('state') === 'enable';
+      const channel = interaction.options.getChannel('channel');
+      const currentVal = db.getConfig(interaction.guildId)[moduleName];
+      const patch = typeof currentVal === 'boolean'
+        ? { [moduleName]: state }
+        : { [moduleName]: { enabled: state, ...(channel ? { channelId: channel.id } : {}) } };
+      const cfg = db.saveConfig(interaction.guildId, patch);
+      const display = typeof cfg[moduleName] === 'boolean' ? { enabled: cfg[moduleName] } : cfg[moduleName];
+      await interaction.reply({ embeds: [ui.configSummaryEmbed(moduleName, display)] });
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------------
-// /greetvoice <role> <vc> <ttsprompt>
+// /greetvoice setup
 // ---------------------------------------------------------------------------------
 commands.push({
   data: new SlashCommandBuilder()
     .setName('greetvoice')
-    .setDescription('Set up the role-gated voice greeting system.')
+    .setDescription('Configure the role-gated voice greeting system.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addRoleOption(o => o.setName('role').setDescription('role granted to new members until they complete the greet').setRequired(true))
-    .addChannelOption(o => o.setName('vc').setDescription('the only voice channel the role can see/join').setRequired(true).addChannelTypes(ChannelType.GuildVoice))
-    .addStringOption(o => o.setName('prompt').setDescription('TTS text played when a gated member joins the VC').setRequired(true)),
+    .addSubcommand(s => s.setName('setup').setDescription('Set the role, voice channel and TTS prompt.')
+      .addRoleOption(o => o.setName('role').setDescription('role granted to new members until they complete the greet').setRequired(true))
+      .addChannelOption(o => o.setName('vc').setDescription('the only voice channel the role can see/join').setRequired(true).addChannelTypes(ChannelType.GuildVoice))
+      .addStringOption(o => o.setName('prompt').setDescription('TTS text played when a gated member joins the VC').setRequired(true))),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
+    if (interaction.options.getSubcommand() !== 'setup') return;
     const role = interaction.options.getRole('role');
     const vc = interaction.options.getChannel('vc');
     const prompt = interaction.options.getString('prompt');
 
     db.saveConfig(interaction.guildId, { greetvoice: { enabled: true, roleId: role.id, vcId: vc.id, ttsPrompt: prompt } });
 
-    await interaction.reply({ embeds: [ui.okEmbed('🔊 Greetvoice Configured',
+    await interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('voice')} Greetvoice Configured`,
       `**Role:** ${role}\n**Voice channel:** ${vc}\n**Prompt:** ${prompt}\n\nLocking that role out of every other channel and joining the VC now…`)] });
 
     await sys.lockRoleToSingleChannel(interaction.guild, role, vc.id);
-    await sys.joinAndStayInVC(vc); // bot joins immediately and stays, per spec
+    await sys.joinAndStayInVC(vc);
   }
 });
 
@@ -514,7 +586,7 @@ commands.push({
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction) {
     const cfg = db.getConfig(interaction.guildId).ticket;
-    if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Run `/setup tickets state:enable` first.')], ephemeral: true });
+    if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Run `/tickets setup state:enable` first.')], ephemeral: true });
     await interaction.channel.send({ embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg)], components: [ui.ticketPanelRow()] });
     await interaction.reply({ embeds: [ui.okEmbed('✅ Panel Posted', 'The ticket panel is live.')], ephemeral: true });
   }
@@ -529,11 +601,15 @@ commands.push({
     .addStringOption(o => o.setName('panel_title').setDescription('Title of the "Open Ticket" panel'))
     .addStringOption(o => o.setName('panel_description').setDescription('Body text of the "Open Ticket" panel'))
     .addStringOption(o => o.setName('panel_thumbnail').setDescription('Small image URL for the panel (top-right)'))
+    .addAttachmentOption(o => o.setName('panel_thumbnail_file').setDescription('Upload the panel thumbnail image/GIF'))
     .addStringOption(o => o.setName('panel_image').setDescription('Big banner image/GIF URL for the panel'))
+    .addAttachmentOption(o => o.setName('panel_image_file').setDescription('Upload the panel banner image/GIF'))
     .addStringOption(o => o.setName('category_label').setDescription('Category name shown when a ticket opens, e.g. "General Support"'))
     .addStringOption(o => o.setName('welcome_message').setDescription('Extra line shown under Welcome/Category in a new ticket'))
     .addStringOption(o => o.setName('welcome_thumbnail').setDescription('Small image URL shown in a new ticket (top-right)'))
-    .addStringOption(o => o.setName('welcome_image').setDescription('Big banner image/GIF URL shown in a new ticket')),
+    .addAttachmentOption(o => o.setName('welcome_thumbnail_file').setDescription('Upload the ticket welcome thumbnail image/GIF'))
+    .addStringOption(o => o.setName('welcome_image').setDescription('Big banner image/GIF URL shown in a new ticket'))
+    .addAttachmentOption(o => o.setName('welcome_image_file').setDescription('Upload the ticket welcome banner image/GIF')),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
     const map = {
@@ -546,9 +622,17 @@ commands.push({
       const val = interaction.options.getString(opt);
       if (val !== null) { patch.ticket[key] = val; changed = true; }
     }
+    const fileMap = {
+      panel_thumbnail_file: 'panelThumbnail', panel_image_file: 'panelImage',
+      welcome_thumbnail_file: 'welcomeThumbnail', welcome_image_file: 'welcomeImage'
+    };
+    for (const [opt, key] of Object.entries(fileMap)) {
+      const attachment = getImageAttachment(interaction, opt);
+      if (attachment) { patch.ticket[key] = attachment.url; changed = true; }
+    }
     const cfg = changed ? db.saveConfig(interaction.guildId, patch).ticket : db.getConfig(interaction.guildId).ticket;
     await interaction.reply({
-      content: changed ? '✅ Ticket appearance updated. Previews below:' : 'Current ticket appearance — previews below:',
+      content: changed ? `${ui.emoji('success')} Ticket appearance updated. Previews below:` : 'Current ticket appearance — previews below:',
       embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg), ui.ticketWelcomeEmbed(interaction.user, cfg)],
       ephemeral: true
     });
@@ -688,7 +772,7 @@ commands.push({
     if (targetChannel.id !== interaction.channel.id) {
       await interaction.reply({ embeds: [ui.okEmbed('✅ Preview Sent', `Posted in ${targetChannel}.`)], ephemeral: true });
     } else {
-      await interaction.reply({ content: '✅ Preview posted above (this test does not save the image as your permanent config — use `/setup greetmessage` for that).', ephemeral: true });
+      await interaction.reply({ content: ui.emojify(`${ui.emoji('success')} Preview posted above (this test does not save the image as your permanent config — use /greetmessage setup for that).`), ephemeral: true });
     }
   }
 });
@@ -762,31 +846,34 @@ commands.push({
 });
 commands.push({
   ownerOnly: true,
-  data: new SlashCommandBuilder().setName('emojis').setDescription('[Owner] View or change every emoji the bot uses (buttons, embeds, everywhere).')
-    .addSubcommand(s => s.setName('list').setDescription('show every emoji currently in use'))
-    .addSubcommand(s => s.setName('set').setDescription('override one emoji')
-      .addStringOption(o => o.setName('name').setDescription('which emoji to change').setRequired(true).addChoices(...ui.EMOJI_KEYS.map(k => ({ name: k, value: k }))))
-      .addStringOption(o => o.setName('value').setDescription('new emoji (unicode emoji or <a:name:id> custom emoji)').setRequired(true)))
-    .addSubcommand(s => s.setName('reset').setDescription('revert one emoji to its default')
-      .addStringOption(o => o.setName('name').setDescription('which emoji to reset').setRequired(true).addChoices(...ui.EMOJI_KEYS.map(k => ({ name: k, value: k }))))),
+  data: new SlashCommandBuilder().setName('emoji').setDescription('[Owner] View or change every emoji the bot uses.')
+    .addSubcommand(s => s.setName('list').setDescription('Show every emoji currently used by the bot.'))
+    .addSubcommand(s => s.setName('set').setDescription('Change one emoji everywhere it is used.')
+      .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true))
+      .addStringOption(o => o.setName('value').setDescription('Unicode emoji or custom emoji such as <:name:id>.').setRequired(true)))
+    .addSubcommand(s => s.setName('reset').setDescription('Restore one emoji to its default.')
+      .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true))),
   async execute(interaction) {
     if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
     const sub = interaction.options.getSubcommand();
     if (sub === 'list') {
       return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides())], ephemeral: true });
     }
-    const name = interaction.options.getString('name');
+    const name = interaction.options.getString('name').trim().toLowerCase();
+    if (!ui.EMOJI_KEYS.includes(name)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Unknown Emoji', `**${name}** is not a valid emoji name. Use **/emoji list** first.`)], ephemeral: true });
+    }
     if (sub === 'set') {
-      const value = interaction.options.getString('value');
+      const value = interaction.options.getString('value').trim();
+      if (!value) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Emoji', 'The emoji value cannot be empty.')], ephemeral: true });
       db.setEmojiOverride(name, value);
-      return interaction.reply({ embeds: [ui.okEmbed('✅ Emoji Updated', `**${name}** is now ${value} — every button/embed using it updates immediately, bot-wide.`)] });
+      return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Updated`, `**${name}** is now ${value}. All matching button icons and embed text use it immediately.`)] });
     }
-    if (sub === 'reset') {
-      db.resetEmojiOverride(name);
-      return interaction.reply({ embeds: [ui.okEmbed('✅ Emoji Reset', `**${name}** is back to its default: ${ui.DEFAULT_EMOJIS[name]}`)] });
-    }
+    db.resetEmojiOverride(name);
+    return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Reset`, `**${name}** is back to its default: ${ui.DEFAULT_EMOJIS[name]}`)] });
   }
 });
+
 commands.push({
   ownerOnly: true,
   data: new SlashCommandBuilder().setName('eval').setDescription('[Owner] Run raw JavaScript.')
