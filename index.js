@@ -5,7 +5,7 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
-  StringSelectMenuBuilder, PermissionFlagsBits,
+  StringSelectMenuBuilder, RoleSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent
 } = require('discord.js');
 
@@ -59,6 +59,7 @@ async function registerCommands() {
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  console.log(`Database: ${db.DB_PATH}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
 });
@@ -258,6 +259,62 @@ client.on('interactionCreate', async (interaction) => {
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
       return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
     }
+    // Easy setup panels ------------------------------------------------------------
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('birthday_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const part=interaction.customId.split(':')[1];
+      const patch=part==='panel'?{birthdays:{panelChannelId:interaction.values[0],enabled:true}}:{birthdays:{wishChannelId:interaction.values[0],enabled:true}};
+      const cfg=db.saveConfig(interaction.guildId,patch).birthdays;
+      return interaction.update({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg)});
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const part=interaction.customId.split(':')[1];
+      if(part==='channel') db.saveConfig(interaction.guildId,{honeypot:{channelId:interaction.values[0],enabled:true}});
+      const cfg=db.getConfig(interaction.guildId).honeypot;
+      return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      db.saveConfig(interaction.guildId,{antibadword:{logChannelId:interaction.values[0],enabled:true}});
+      const cfg=db.getConfig(interaction.guildId).antibadword;
+      return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'greetvoice_cfg:voice') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{vcId:interaction.values[0],enabled:true}}).greetvoice;
+      const ch=interaction.guild.channels.cache.get(cfg.vcId); const role=cfg.roleId?interaction.guild.roles.cache.get(cfg.roleId):null;
+      if(role&&ch) await sys.lockRoleToSingleChannel(interaction.guild,role,ch.id).catch(()=>{});
+      return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0],enabled:true}}).greetvoice;
+      const role=interaction.guild.roles.cache.get(cfg.roleId); if(role&&cfg.vcId) await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
+      return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const part=interaction.customId.split(':')[1]; const value=interaction.values[0];
+      db.saveConfig(interaction.guildId,{honeypot:part==='action'?{action:value}:{cleanupWindow:value}});
+      const cfg=db.getConfig(interaction.guildId).honeypot;
+      return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      db.saveConfig(interaction.guildId,{antibadword:{action:interaction.values[0],enabled:true}});
+      const cfg=db.getConfig(interaction.guildId).antibadword;
+      return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
+    }
+    if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:role') {
+      return interaction.reply({content:'Select the role to use as the Greet Voice gate.',components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('greetvoice_cfg:role_select').setPlaceholder('Select gate role'))],ephemeral:true});
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role_select') {
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0],enabled:true}}).greetvoice;
+      const role=interaction.guild.roles.cache.get(cfg.roleId); if(role&&cfg.vcId) await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
+      return interaction.update({content:null,embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+    }
+
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_channel_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
@@ -281,6 +338,23 @@ client.on('interactionCreate', async (interaction) => {
 
 async function handleButton(interaction) {
   const id = interaction.customId;
+
+  if (id === 'birthday_cfg:message') {
+    return interaction.showModal(new ModalBuilder().setCustomId('birthday_cfg_modal').setTitle('Birthday Wish Message').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('Wish message ({user}, {date})').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(db.getConfig(interaction.guildId).birthdays.wishMessage.slice(0,400)))));
+  }
+  if (id === 'birthday_cfg:post') {
+    const cfg=db.getConfig(interaction.guildId).birthdays; const ch=cfg.panelChannelId?interaction.guild.channels.cache.get(cfg.panelChannelId):null;
+    if(!ch?.isTextBased()) return interaction.reply({embeds:[ui.errorEmbed('Panel Channel Missing','Select a panel channel first.')],ephemeral:true});
+    const row=new ActionRowBuilder().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('birthday_set').setLabel('Set Birthday').setStyle(require('discord.js').ButtonStyle.Primary));
+    await ch.send({embeds:[ui.birthdaySetupEmbed(cfg)],components:[row]});
+    return interaction.reply({embeds:[ui.okEmbed('Birthday Panel Posted',`Posted in ${ch}.`)],ephemeral:true});
+  }
+  if (id === 'antibadword_cfg:words') return interaction.showModal(new ModalBuilder().setCustomId('antibadword_cfg_modal').setTitle('Custom Bad Words').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('words').setLabel('Words/phrases separated by commas').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((db.getConfig(interaction.guildId).antibadword.customWords||[]).join(', ').slice(0,400)))));
+  if (id === 'antibadword_cfg:toggle') { const cfg=db.getConfig(interaction.guildId).antibadword; const next=db.saveConfig(interaction.guildId,{antibadword:{enabled:!cfg.enabled}}).antibadword; return interaction.update({embeds:[ui.antiBadwordSetupEmbed(next)],components:ui.antiBadwordSetupRow(next)}); }
+  if (id === 'honeypot_cfg:invite') { const cfg=db.getConfig(interaction.guildId).honeypot; const next=db.saveConfig(interaction.guildId,{honeypot:{createInvite:!cfg.createInvite}}).honeypot; return interaction.update({embeds:[ui.honeypotSetupEmbed(next)],components:ui.honeypotSetupRow(next)}); }
+  if (id === 'honeypot_cfg:dm') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_dm_modal').setTitle('Honeypot Kick DM').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('DM text; use {invite}').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(db.getConfig(interaction.guildId).honeypot.dmMessage.slice(0,400)))));
+  if (id === 'greetvoice_cfg:prompt') return interaction.showModal(new ModalBuilder().setCustomId('greetvoice_cfg_prompt_modal').setTitle('Greet Voice TTS').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prompt').setLabel('Text spoken in the voice channel').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((db.getConfig(interaction.guildId).greetvoice.ttsPrompt||'Welcome!').slice(0,400)))));
+  if (id === 'greetvoice_cfg:test') { const cfg=db.getConfig(interaction.guildId).greetvoice; if(!cfg.vcId||!cfg.ttsPrompt) return interaction.reply({embeds:[ui.errorEmbed('Not Configured','Select a voice channel and set a TTS prompt first.')],ephemeral:true}); await interaction.deferReply({ephemeral:true}); try { await sys.playTTSInChannel(interaction.guild,cfg.vcId,cfg.ttsPrompt); return interaction.editReply({embeds:[ui.okEmbed('Greet Voice Test Complete','The TTS prompt finished playing.')]}); } catch(e) { return interaction.editReply({embeds:[ui.errorEmbed('Greet Voice Failed',String(e.message||e))]}); } }
 
   if (id.startsWith('rolebtn:')) {
     const roleId=id.split(':')[1]; const role=interaction.guild.roles.cache.get(roleId);
@@ -563,6 +637,10 @@ async function openVMModal(interaction, id) {
 }
 
 async function handleModal(interaction) {
+  if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:[ui.birthdaySetupRow(cfg)],ephemeral:true}); }
+  if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words,enabled:true}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:[ui.antiBadwordSetupRow(cfg)],ephemeral:true}); }
+  if (interaction.customId === 'honeypot_cfg_dm_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{honeypot:{dmMessage:msg||'You were removed. {invite}'}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt,enabled:true}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'birthday_modal') {
     const raw=interaction.fields.getTextInputValue('date').trim().replace(/\s+/g,'');
     const m=raw.match(/^(\d{1,2})[-\/.](\d{1,2})$/); if(!m) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','Use a format like `8-8` or `1-9`.')],ephemeral:true});
@@ -770,12 +848,24 @@ client.on('messageCreate', async (message) => {
   const auto = cfgAll.automod;
   const anti = cfgAll.antibadword;
   const builtInBadWords = [
-    'fuck','fucker','fucking','motherfucker','shit','bitch','bastard','asshole','dick','piss','cunt',
-    'idiot','stupid','گالی','گالیوں','حرامی','کمینہ','چوت','چوتیا','بکواس','لعنتی','kurwa','puta','putain',
-    'merde','scheisse','arschloch','cazzo','stronzo','mierda','carajo','joder','blyat','сука','хуй','ебать',
-    'くそ','ばか','死ね','くそったれ','씨발','병신','좆','개새끼','操你','他妈的','妈的'
+    'fuck','fucker','fucking','motherfucker','shit','shitting','bitch','bastard','asshole','dick','piss','cunt','whore','slut','crap','damn',
+    'chutiya','chutiye','chutia','chut','madarchod','madharchod','mc','bc','bhenchod','behenchod','gaand','gand','gandu','randi','harami','haramzada','kamina','kaminey','kamine','bakwas','sala','saala','sali','saali','maa ki chut','ma ki chut','teri maa','teri ma','lund','laude','loda','choot','chod','chodna','chodde','jhant','jhaant','bhosdike','bhosdi','bhosda','benchod','bhen ke lode','behen ke lode','teri behen','teri bahan',
+    'گالی','گالیوں','حرامی','کمینہ','کمینے','چوت','چوتیا','بکواس','لعنتی','گندا','گندی','ماں کی چوت','بہن چود','بھنچود','لنڈ','گاندو',
+    'kurwa','kurwo','puta','putain','merde','scheisse','arschloch','cazzo','stronzo','mierda','carajo','joder','blyat','сука','хуй','ебать','пизда',
+    'くそ','ばか','死ね','くそったれ','씨발','병신','좆','개새끼','操你','他妈的','妈的','草泥马','肏','操'
   ];
+  const normalizeBadWordText = value => String(value || '').normalize('NFKC').toLowerCase()
+    .replace(/[0-9@!$*+_=~`^|\\]/g, ch => ({'0':'o','1':'i','3':'e','4':'a','5':'s','6':'g','7':'t','8':'b','9':'g','@':'a','!':'i','$':'s','*':'','+':'','_':'','=':'','~':'','`':'','^':'','|':'','\\':''}[ch] ?? ch))
+    .replace(/[.\-_,*~`]+/g,' ')
+    .replace(/\s+/g,' ').trim();
+  const textNorm = normalizeBadWordText(message.content);
+  const compact = textNorm.replace(/\s+/g,'');
   const words = [...builtInBadWords, ...(anti.customWords || []), ...(auto.badWords || [])].filter(Boolean);
+  const badHit = words.some(w => {
+    const n = normalizeBadWordText(w); if (!n) return false;
+    const re = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegex(n)}(?:$|[^\\p{L}\\p{N}])`, 'iu');
+    return re.test(textNorm) || (n.length >= 4 && compact.includes(n.replace(/\s+/g,'')));
+  });
   if ((anti.enabled || auto.badWordFilter) && words.some(w => new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegex(w)}(?:$|[^\\p{L}\\p{N}])`, 'iu').test(message.content))) {
     const content = message.content.slice(0, 500);
     await message.delete().catch(() => {});
