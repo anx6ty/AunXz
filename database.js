@@ -4,8 +4,14 @@
 
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
-const db = new Database(path.join(__dirname, 'bot.sqlite'));
+// Railway persistent volume support: DATA_DIR=/data (or /data when it exists).
+// Never store the live database beside the application when a persistent volume is available.
+const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : path.join(__dirname, 'data'));
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_PATH = path.join(DATA_DIR, 'bot.sqlite');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -86,6 +92,12 @@ CREATE TABLE IF NOT EXISTS join_tracker (
 CREATE TABLE IF NOT EXISTS emoji_overrides (
   name TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS emoji_snapshots (
+  code TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  createdAt INTEGER NOT NULL
 );
 `);
 
@@ -312,6 +324,8 @@ const setEmojiStmt = db.prepare(`
 `);
 const deleteEmojiStmt = db.prepare('DELETE FROM emoji_overrides WHERE name = ?');
 const allEmojiStmt = db.prepare('SELECT name, value FROM emoji_overrides');
+const saveEmojiSnapshotStmt = db.prepare('INSERT INTO emoji_snapshots (code, data, createdAt) VALUES (?, ?, ?)');
+const getEmojiSnapshotStmt = db.prepare('SELECT data FROM emoji_snapshots WHERE code = ?');
 
 function getEmojiOverride(name) {
   const row = getEmojiStmt.get(name);
@@ -328,6 +342,22 @@ function getAllEmojiOverrides() {
   for (const row of allEmojiStmt.all()) out[row.name] = row.value;
   return out;
 }
+function randomSnapshotCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  let code = '';
+  do { code = Array.from({length: 12}, () => chars[Math.floor(Math.random()*chars.length)]).join(''); }
+  while (getEmojiSnapshotStmt.get(code));
+  return code;
+}
+function saveEmojiSnapshot(values) {
+  const code = randomSnapshotCode();
+  saveEmojiSnapshotStmt.run(code, JSON.stringify(values || {}), Date.now());
+  return code;
+}
+function getEmojiSnapshot(code) {
+  const row = getEmojiSnapshotStmt.get(String(code || '').trim());
+  return row ? JSON.parse(row.data) : null;
+}
 
 module.exports = {
   db, DEFAULT_CONFIG,
@@ -340,5 +370,6 @@ module.exports = {
   logAction, recentActions,
   getStickyRoles, setStickyRoles,
   bumpSpam, trackJoin, recentJoinCount,
-  getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides
+  getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
+  saveEmojiSnapshot, getEmojiSnapshot, DB_PATH, DATA_DIR
 };
