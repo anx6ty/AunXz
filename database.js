@@ -101,6 +101,37 @@ CREATE TABLE IF NOT EXISTS emoji_overrides (
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS button_role_panels (
+  id TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL,
+  messageId TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'buttons',
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  roles TEXT NOT NULL DEFAULT '[]',
+  createdAt INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS birthdays (
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  month INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  PRIMARY KEY (guildId, userId)
+);
+
+CREATE TABLE IF NOT EXISTS staff_app_sessions (
+  id TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  answers TEXT NOT NULL DEFAULT '[]',
+  questionIndex INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  createdAt INTEGER NOT NULL,
+  updatedAt INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS giveaways (
   id TEXT PRIMARY KEY,
   guildId TEXT NOT NULL,
@@ -157,7 +188,11 @@ const DEFAULT_CONFIG = {
   polls: { enabled: true },
   snipeEnabled: true,
   nsfwFilter: { enabled: false },
-  birthdays: {},
+  birthdays: { enabled: false, panelChannelId: null, wishChannelId: null, message: 'Happy Birthday, {user}! 🎉', title: '🎂 Happy Birthday!' },
+  buttonroles: { enabled: false, panels: [] },
+  staffapplications: { enabled: false, panelChannelId: null, logChannelId: null, supportRoleId: null, title: 'Staff Applications', description: 'Think you would be a great fit? Click Apply to begin.', applyLabel: 'Apply', questions: [] },
+  antibadword: { enabled: false, logChannelId: null, deleteMessage: true, words: [] },
+  honeypot: { enabled: false, channelId: null, action: 'delete', inviteBack: false, deleteUserMessages: true, cleanupMinutes: 1440, message: 'Please do not send messages here.' },
   starboard: { enabled: false, channelId: null, threshold: 3 },
   inviteTracker: { enabled: false },
   maintenance: false,
@@ -362,6 +397,32 @@ function finishGiveaway(id, entrants = null) {
 }
 function setGiveawayMessage(id, messageId) { setGiveawayMessageStmt.run(messageId, id); }
 
+
+// ---------- button roles ----------
+const upsertButtonRolePanelStmt = db.prepare(`INSERT INTO button_role_panels (id,guildId,channelId,messageId,mode,title,description,roles,createdAt) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET channelId=excluded.channelId,messageId=excluded.messageId,mode=excluded.mode,title=excluded.title,description=excluded.description,roles=excluded.roles`);
+const getButtonRolePanelStmt = db.prepare('SELECT * FROM button_role_panels WHERE id = ?');
+function saveButtonRolePanel(row) { upsertButtonRolePanelStmt.run(row.id,row.guildId,row.channelId,row.messageId,row.mode,row.title,row.description,JSON.stringify(row.roles||[]),Date.now()); return getButtonRolePanelStmt.get(row.id); }
+function getButtonRolePanel(id) { return getButtonRolePanelStmt.get(id); }
+
+// ---------- birthdays ----------
+const upsertBirthdayStmt = db.prepare(`INSERT INTO birthdays (guildId,userId,month,day) VALUES (?,?,?,?) ON CONFLICT(guildId,userId) DO UPDATE SET month=excluded.month,day=excluded.day`);
+const getBirthdayStmt = db.prepare('SELECT * FROM birthdays WHERE guildId = ? AND userId = ?');
+const getBirthdayTodayStmt = db.prepare('SELECT * FROM birthdays WHERE guildId = ? AND month = ? AND day = ?');
+function setBirthday(guildId,userId,month,day){ upsertBirthdayStmt.run(guildId,userId,month,day); }
+function getBirthday(guildId,userId){ return getBirthdayStmt.get(guildId,userId); }
+function getBirthdaysToday(guildId,month,day){ return getBirthdayTodayStmt.all(guildId,month,day); }
+
+// ---------- staff applications ----------
+const upsertAppSessionStmt = db.prepare(`INSERT INTO staff_app_sessions (id,guildId,userId,answers,questionIndex,status,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET answers=excluded.answers,questionIndex=excluded.questionIndex,status=excluded.status,updatedAt=excluded.updatedAt`);
+const getAppSessionStmt = db.prepare('SELECT * FROM staff_app_sessions WHERE id = ?');
+const getActiveAppSessionByUserStmt = db.prepare("SELECT * FROM staff_app_sessions WHERE guildId = ? AND userId = ? AND status = 'active' ORDER BY updatedAt DESC LIMIT 1");
+const getAnyActiveAppSessionByUserStmt = db.prepare("SELECT * FROM staff_app_sessions WHERE userId = ? AND status = 'active' ORDER BY updatedAt DESC LIMIT 1");
+function createAppSession(row){ const now=Date.now(); upsertAppSessionStmt.run(row.id,row.guildId,row.userId,JSON.stringify(row.answers||[]),row.questionIndex||0,row.status||'active',now,now); return getAppSessionStmt.get(row.id); }
+function getAppSession(id){ return getAppSessionStmt.get(id); }
+function getActiveAppSessionByUser(guildId,userId){ return getActiveAppSessionByUserStmt.get(guildId,userId); }
+function getAnyActiveAppSessionByUser(userId){ return getAnyActiveAppSessionByUserStmt.get(userId); }
+function updateAppSession(id,answers,questionIndex,status='active'){ const row=getAppSession(id); if(!row) return null; upsertAppSessionStmt.run(row.id,row.guildId,row.userId,JSON.stringify(answers),questionIndex,status,row.createdAt,Date.now()); return getAppSession(id); }
+
 // ---------- emoji overrides (bot-wide, owner-configurable via /emoji) ----------
 const getEmojiStmt = db.prepare('SELECT value FROM emoji_overrides WHERE name = ?');
 const setEmojiStmt = db.prepare(`
@@ -400,5 +461,7 @@ module.exports = {
   getStickyRoles, setStickyRoles,
   bumpSpam, trackJoin, recentJoinCount,
   getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
-  createGiveaway, getGiveaway, getActiveGiveaways, listGiveaways, addGiveawayEntrant, finishGiveaway, setGiveawayMessage
+  createGiveaway, getGiveaway, getActiveGiveaways, listGiveaways, addGiveawayEntrant, finishGiveaway, setGiveawayMessage,
+  saveButtonRolePanel, getButtonRolePanel, setBirthday, getBirthday, getBirthdaysToday,
+  createAppSession, getAppSession, getActiveAppSessionByUser, getAnyActiveAppSessionByUser, updateAppSession
 };
