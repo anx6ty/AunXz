@@ -280,7 +280,7 @@ async function handleButton(interaction) {
   // ---- Tickets ----
   if (id === 'ticket_open') {
     const cfg = db.getConfig(interaction.guildId).ticket;
-    if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Ask an admin to run `/setup tickets`.')], ephemeral: true });
+    if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Ask an admin to run `/tickets setup`.')], ephemeral: true });
     const existing = db.openTicketForUser(interaction.guildId, interaction.user.id);
     if (existing) return interaction.reply({ embeds: [ui.warnEmbed('Ticket Exists', `You already have an open ticket: <#${existing.channelId}>`)], ephemeral: true });
 
@@ -350,7 +350,7 @@ async function handleButton(interaction) {
     return;
   }
 
-  // ---- Voicemaster: dedicated setup panel (admin-only, from /setup voicemaster) ----
+  // ---- Voicemaster: dedicated setup panel (admin-only, from /voicemaster setup) ----
   if (id === 'vm_setup_category' || id === 'vm_setup_channel' || id === 'vm_setup_toggle') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
