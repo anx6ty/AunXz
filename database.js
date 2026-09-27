@@ -146,6 +146,8 @@ const DEFAULT_CONFIG = {
   buttonRoles: { enabled: false, channelId: null, title: 'Choose your roles', description: 'Press a button to get or remove a role.', image: null, embedType: 'embed', buttons: [] },
   staffApplications: { enabled: false, panelChannelId: null, logChannelId: null, title: 'Staff Applications', description: 'Click Apply to start your application.', questions: [], dmIntro: 'Are you ready to start your staff application?', acceptingRoleId: null },
   antibadword: { enabled: false, logChannelId: null, customWords: [], action: 'delete' },
+  autoresponder: { enabled: false, ignoreCase: true, triggers: [] },
+  autoreactor: { enabled: false, ignoreCase: true, triggers: [] },
   honeypot: { enabled: false, channelId: null, action: 'kick', logChannelId: null, createInvite: true, dmMessage: 'You were removed for posting in the honeypot channel. Here is an invite back: {invite}', cleanupWindow: 'none' },
   starboard: { enabled: false, channelId: null, threshold: 3 },
   inviteTracker: { enabled: false },
