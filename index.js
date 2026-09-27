@@ -74,9 +74,34 @@ async function registerCommands() {
   }
 }
 
+
+async function finishScheduledGiveaway(row) {
+  const fresh = db.getGiveaway(row.id);
+  if (!fresh || fresh.ended) return;
+  if (Date.now() < fresh.endsAt) { scheduleGiveaway(fresh); return; }
+  const entrants = JSON.parse(fresh.entrants || '[]');
+  const pool = [...entrants];
+  const winners = [];
+  while (pool.length && winners.length < fresh.winners) winners.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  db.finishGiveaway(fresh.id, entrants);
+  const channel = client.channels.cache.get(fresh.channelId);
+  if (!channel?.isTextBased()) return;
+  const msg = await channel.messages.fetch(fresh.messageId).catch(() => null);
+  if (!msg) return;
+  const winnerText = winners.length ? winners.map(id => `<@${id}>`).join(', ') : 'No valid entrants.';
+  await msg.edit({ embeds: [ui.giveawayEmbed({ id: fresh.id, prize: fresh.prize, winners: fresh.winners, host: `<@${fresh.hostId}>`, endsAt: fresh.endsAt, entrants: entrants.length, ended: true, winnerIds: winners })], components: [] }).catch(() => {});
+  channel.send({ embeds: [ui.okEmbed('🎉 Giveaway Ended', `**${fresh.prize}**\n**Winners:** ${winnerText}\n**Giveaway:** ${fresh.id}`)] }).catch(() => {});
+}
+function scheduleGiveaway(row) {
+  const delay = Math.max(1000, row.endsAt - Date.now());
+  setTimeout(() => finishScheduledGiveaway(row).catch(e => console.error('Giveaway finish failed:', e)), Math.min(delay, 2 ** 31 - 1));
+}
+
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   client.user.setActivity('/help');
+  for (const giveaway of db.getActiveGiveaways()) scheduleGiveaway(giveaway);
+  console.log(`Database: ${db.DB_PATH}`);
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
 });
 
@@ -216,13 +241,23 @@ function stripEphemeral(payload) {
   return rest;
 }
 
+const PREFIX_ALIASES = {
+  i: 'invites', invite: 'invites', invites: 'invites',
+  mc: 'membercount', membercount: 'membercount',
+  si: 'serverinfo', serverinfo: 'serverinfo',
+  ui: 'userinfo', userinfo: 'userinfo',
+  avatar: 'avatar', pfp: 'avatar',
+  banner: 'banner'
+};
+
 async function handlePrefixCommand(message) {
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
   if (!message.content.startsWith(prefix)) return false;
   const tokens = tokenize(message.content.slice(prefix.length).trim());
-  const cmdName = (tokens.shift() || '').toLowerCase();
-  if (!cmdName) return false;
+  const typedName = (tokens.shift() || '').toLowerCase();
+  if (!typedName) return false;
+  const cmdName = PREFIX_ALIASES[typedName] || typedName;
   const cmd = commands.find(c => c.data.name === cmdName);
   if (!cmd) return false;
 
@@ -431,6 +466,23 @@ async function handleButton(interaction) {
       if (log) log.send({ embeds: [ui.base('🎫 Ticket Closed').setDescription(`Ticket by <@${ticket?.userId}> closed by ${interaction.user}.`)] }).catch(() => {});
     }
     setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+    return;
+  }
+
+
+  // ---- Giveaways ----
+  if (id.startsWith('giveaway_enter:')) {
+    const giveawayId = id.split(':')[1];
+    const row = db.getGiveaway(giveawayId);
+    if (!row || row.ended || Date.now() >= row.endsAt) return interaction.reply({ embeds: [ui.warnEmbed('Giveaway Ended', 'This giveaway is no longer accepting entries.')], ephemeral: true });
+    const entrants = JSON.parse(row.entrants || '[]');
+    if (entrants.includes(interaction.user.id)) return interaction.reply({ embeds: [ui.warnEmbed('Already Entered', 'You are already entered in this giveaway.')], ephemeral: true });
+    db.addGiveawayEntrant(giveawayId, interaction.user.id);
+    const updated = db.getGiveaway(giveawayId);
+    await interaction.reply({ embeds: [ui.okEmbed('🎉 Entry Added', `You are entered in **${row.prize}**! Good luck.`)], ephemeral: true });
+    const channel = interaction.guild.channels.cache.get(row.channelId);
+    const msg = channel ? await channel.messages.fetch(row.messageId).catch(() => null) : null;
+    if (msg) msg.edit({ embeds: [ui.giveawayEmbed({ id: row.id, prize: row.prize, winners: row.winners, host: `<@${row.hostId}>`, endsAt: row.endsAt, entrants: JSON.parse(updated.entrants || '[]').length })], components: [ui.giveawayButtonRow(row.id)] }).catch(() => {});
     return;
   }
 
@@ -659,7 +711,10 @@ client.on('guildMemberAdd', async (member) => {
     } else
     if (ch?.isTextBased()) ch.send({ embeds: [ui.okEmbed('👋 Welcome', text)] }).catch(() => {});
   }
-  if (cfg.autorole.enabled && cfg.autorole.roleId) member.roles.add(cfg.autorole.roleId).catch(() => {});
+  if (cfg.autorole.enabled) {
+    const roleId = member.user.bot ? (cfg.autorole.botRoleId || cfg.autorole.roleId) : (cfg.autorole.humanRoleId || cfg.autorole.roleId);
+    if (roleId) member.roles.add(roleId).catch(() => {});
+  }
 
   const sticky = db.getStickyRoles(member.guild.id, member.id);
   if (sticky.length) member.roles.add(sticky).catch(() => {});
