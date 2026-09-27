@@ -7,7 +7,8 @@
 
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, PermissionFlagsBits
+  StringSelectMenuBuilder, ChannelSelectMenuBuilder, UserSelectMenuBuilder,
+  ChannelType, PermissionFlagsBits
 } = require('discord.js');
 const db = require('./database');
 
@@ -130,9 +131,14 @@ function confirmRow(idBase) {
 }
 
 // ---------------- TICKET PANEL ----------------
-function ticketPanelEmbed(guildName) {
-  return base(`${emoji('ticket_open')} ${guildName} Support`)
-    .setDescription('Need help? Click **Open Ticket** below and our team will assist you shortly.');
+// `cfg` is the guild's `ticket` config — panelTitle/panelDescription/panelThumbnail/panelImage
+// let /ticketconfig fully customize the picture + message shown before a ticket is even opened.
+function ticketPanelEmbed(guildName, cfg = {}) {
+  const e = base(cfg.panelTitle || `${emoji('ticket_open')} ${guildName} Support`)
+    .setDescription(cfg.panelDescription || 'Need help? Click **Open Ticket** below and our team will assist you shortly.');
+  if (cfg.panelThumbnail) e.setThumbnail(cfg.panelThumbnail);
+  if (cfg.panelImage) e.setImage(cfg.panelImage);
+  return e;
 }
 function ticketPanelRow() {
   return new ActionRowBuilder().addComponents(
@@ -209,6 +215,66 @@ function vmControlRows(vc, overrides = {}) {
       new ButtonBuilder().setCustomId('vm_transfer').setLabel('Transfer').setStyle(ButtonStyle.Danger).setEmoji('🔁')
     )
   ];
+}
+
+// ---------------- VOICEMASTER: DEDICATED SETUP PANEL ----------------
+// A themed embed + a row of exactly 3 buttons: pick the join-to-create category, pick the
+// "join to create" hub voice channel, and flip the module on/off. Each of the first two opens
+// a native Discord channel-select menu (ephemeral) so the admin picks from every category /
+// every voice channel in the server instead of typing an ID.
+function vmSetupEmbed(cfg) {
+  const vm = cfg.voicemaster;
+  const status = vm.enabled ? '🟢 Enabled' : '🔴 Disabled';
+  return base('🔊 Voicemaster — Join to Create')
+    .setDescription(
+      `Give members their own temporary voice channel the moment they join a hub VC.\n\n` +
+      `**Status:** ${status}\n` +
+      `**📁 Category:** ${vm.categoryId ? `<#${vm.categoryId}>` : '*not set*'} — new temp channels are created here.\n` +
+      `**🎙️ Join-to-Create Channel:** ${vm.hubChannelId ? `<#${vm.hubChannelId}>` : '*not set*'} — joining this VC spins up a fresh temp channel.\n\n` +
+      `Use the buttons below to configure each piece, or flip the whole module on/off.`
+    );
+}
+function vmSetupRow(cfg) {
+  const enabled = cfg.voicemaster.enabled;
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('vm_setup_category').setLabel('Category').setStyle(ButtonStyle.Secondary).setEmoji('📁'),
+    new ButtonBuilder().setCustomId('vm_setup_channel').setLabel('Voice Channel').setStyle(ButtonStyle.Secondary).setEmoji('🎙️'),
+    new ButtonBuilder().setCustomId('vm_setup_toggle').setLabel(enabled ? 'Disable' : 'Enable')
+      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? '🔴' : '🟢')
+  );
+}
+function vmCategoryPromptEmbed() {
+  return base('📁 Pick a Category').setDescription('Choose the category temp voice channels should be created under.');
+}
+function vmCategorySelectRow() {
+  const menu = new ChannelSelectMenuBuilder().setCustomId('vm_setup_category_select')
+    .setPlaceholder('Choose a category…').addChannelTypes(ChannelType.GuildCategory);
+  return new ActionRowBuilder().addComponents(menu);
+}
+function vmChannelPromptEmbed() {
+  return base('🎙️ Pick a Voice Channel').setDescription('Choose the voice channel members join to get their own temp channel.');
+}
+function vmChannelSelectRow() {
+  const menu = new ChannelSelectMenuBuilder().setCustomId('vm_setup_channel_select')
+    .setPlaceholder('Choose a voice channel…').addChannelTypes(ChannelType.GuildVoice);
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+// ---------------- TICKET: ADD/REMOVE MEMBER PICKER ----------------
+function ticketMemberPromptEmbed(action) {
+  return base(`${action === 'add' ? emoji('add_member') : emoji('remove_member')} ${action === 'add' ? 'Add' : 'Remove'} Member`)
+    .setDescription(`Pick the member to ${action === 'add' ? 'add to' : 'remove from'} this ticket.`);
+}
+function ticketMemberSelectRow(action) {
+  const menu = new UserSelectMenuBuilder().setCustomId(`ticket_${action}member_select`).setPlaceholder('Choose a member…');
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+// ---------------- OWNER: /emojis ----------------
+function emojisListEmbed(overrides) {
+  const lines = EMOJI_KEYS.map(k => `**${k}:** ${overrides[k] || DEFAULT_EMOJIS[k]}${overrides[k] ? ' *(custom)*' : ''}`);
+  return base('😀 Bot Emoji Registry')
+    .setDescription(lines.join('\n') + '\n\nEvery button/embed icon in the bot is looked up by these names. Use `/emojis set` to override one, `/emojis reset` to go back to default.');
 }
 
 // ---------------- LEVELING ----------------
@@ -304,14 +370,17 @@ function vmKickedEmbed(tag) {
 }
 
 module.exports = {
-  THEME, OK, WARN, DANGER,
+  THEME, OK, WARN, DANGER, emoji, EMOJI_KEYS, DEFAULT_EMOJIS,
   base, okEmbed, warnEmbed, errorEmbed,
   HELP_CATEGORIES, helpHomeEmbed, helpCategoryEmbed, helpSelectRow,
   confirmRow,
   ticketPanelEmbed, ticketPanelRow, ticketControlRow, ticketWelcomeEmbed,
+  staffControlsEmbed, staffControlsRow,
+  ticketMemberPromptEmbed, ticketMemberSelectRow,
   vmControlEmbed, vmControlRows,
+  vmSetupEmbed, vmSetupRow, vmCategoryPromptEmbed, vmCategorySelectRow, vmChannelPromptEmbed, vmChannelSelectRow,
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
-  configSummaryEmbed, moduleListEmbed,
+  configSummaryEmbed, moduleListEmbed, emojisListEmbed,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
