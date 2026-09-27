@@ -441,15 +441,34 @@ const SETUP_MODULE_META = {
   antilink: { emojiKey: 'link', title: 'Antilink', cfgKey: 'antilink' },
   antispam: { emojiKey: 'spam', title: 'Antispam', cfgKey: 'antispam' },
   antiraid: { emojiKey: 'raid', title: 'Antiraid', cfgKey: 'antiraid' },
+  automod: { emojiKey: 'shield', title: 'Automod', cfgKey: 'automod' },
   voicemaster: { emojiKey: 'voice', title: 'Voicemaster', cfgKey: 'voicemaster' },
   greetmessage: { emojiKey: 'wave', title: 'Greet Message', cfgKey: 'greetmessage' },
   leveling: { emojiKey: 'level', title: 'Leveling', cfgKey: 'leveling' },
   tickets: { emojiKey: 'ticket', title: 'Tickets', cfgKey: 'ticket' }
 };
 
+// Dedicated setup modules. They all use the same panel so every /<feature> setup
+// command has a consistent enable/disable + settings UI.
+const EXTRA_SETUP_META = {
+  sticky:'Sticky Messages', counters:'Counters', reminders:'Reminders', customcommands:'Custom Commands',
+  autoresponder:'Autoresponder', verification:'Verification', tempchannels:'Temporary Channels', messagefilter:'Message Filter',
+  wordfilter:'Word Filter', capsfilter:'Caps Filter', mentionguard:'Mention Guard', raidmode:'Raid Mode',
+  serverstats:'Server Stats', memberlogs:'Member Logs', rolelogs:'Role Logs', channellogs:'Channel Logs',
+  voicelogs:'Voice Logs', mediaonly:'Media Only', linkfilter:'Link Filter', antiemoji:'Anti Emoji Spam',
+  antimention:'Anti Mention Spam', nicknameguard:'Nickname Guard', ghostping:'Ghost Ping Protection', selfroles:'Self Roles',
+  reactionrolesplus:'Reaction Roles Plus', suggestionbox:'Suggestion Box', confessions:'Confessions', applications:'Applications',
+  forms:'Forms', feedback:'Feedback', serverbackup:'Server Backup', autorename:'Auto Rename', autothread:'Auto Thread',
+  threadguard:'Thread Guard', activityroles:'Activity Roles', inactivity:'Inactivity', commandlogs:'Command Logs',
+  moderatorroles:'Moderator Roles', staffnotify:'Staff Notifications', welcomeimages:'Welcome Images', goodbyeimages:'Goodbye Images'
+};
+for (const [key, title] of Object.entries(EXTRA_SETUP_META)) {
+  SETUP_MODULE_META[key] = { emojiKey: 'settings', title, cfgKey: key };
+}
+
 function setupPanelEmbed(sub, cfg) {
   const meta = SETUP_MODULE_META[sub];
-  const modcfg = cfg[meta.cfgKey];
+  const modcfg = (cfg[meta.cfgKey] && typeof cfg[meta.cfgKey] === 'object') ? cfg[meta.cfgKey] : { enabled: false };
   const status = modcfg.enabled ? `${emoji('enabled')} Enabled` : `${emoji('disabled')} Disabled`;
   const lines = Object.entries(modcfg).filter(([k]) => k !== 'enabled').map(([k, v]) => {
     let val = v;
@@ -478,6 +497,13 @@ const SETUP_SETTING_OPTIONS = {
     ['window_seconds', 'Time window', 'Choose the detection window'],
     ['punishment', 'Spam action', 'Choose mute, kick or ban']
   ],
+  automod: [
+    ['bad_word_filter', 'Bad-word filter', 'Enable or disable bad-word filtering'],
+    ['bad_words', 'Blocked words', 'Edit the comma-separated blocked-word list'],
+    ['caps_filter', 'Caps filter', 'Enable or disable excessive-caps filtering'],
+    ['caps_threshold', 'Caps threshold', 'Set the caps percentage threshold'],
+    ['invite_filter', 'Invite filter', 'Enable or disable Discord invite filtering']
+  ],
   antiraid: [
     ['join_threshold', 'Join limit', 'Choose joins allowed in the window'],
     ['window_seconds', 'Time window', 'Choose the detection window'],
@@ -496,6 +522,7 @@ const SETUP_SETTING_OPTIONS = {
   leveling: [
     ['channel', 'Level-up channel', 'Select where level-ups are posted'],
     ['xp_per_message', 'XP per message', 'Choose XP earned per message'],
+    ['level_up_message', 'Level-up message', 'Customize the message sent when someone levels up'],
     ['cooldown_seconds', 'XP cooldown', 'Choose seconds between XP gains']
   ],
   tickets: [
@@ -508,6 +535,14 @@ const SETUP_SETTING_OPTIONS = {
     ['welcome_media', 'Welcome media', 'Set welcome thumbnail/banner URLs']
   ]
 };
+
+for (const key of Object.keys(EXTRA_SETUP_META)) {
+  SETUP_SETTING_OPTIONS[key] = [
+    ['channel', 'Channel', 'Select the channel used by this module'],
+    ['role', 'Role', 'Select the role used by this module'],
+    ['message', 'Message', "Customize this module's message"]
+  ];
+}
 
 function setupPanelRow(sub, cfg) {
   const meta = SETUP_MODULE_META[sub];
