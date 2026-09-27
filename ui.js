@@ -567,6 +567,82 @@ function vmKickedEmbed(tag) {
   return okEmbed(`${emoji('kick')} Member Removed`, `**${tag}** has been disconnected from the voice channel. ${emoji('wave')}`);
 }
 
+
+// ---------------- SERVER / MEMBER INFO ----------------
+function requestedFooter(footer) {
+  return footer || { text: BRAND_FOOTER };
+}
+
+function serverInfoEmbed(guild, stats = {}) {
+  const owner = stats.owner ? `${stats.owner.user}` : guild.ownerId ? `<@${guild.ownerId}>` : 'Unknown';
+  const humanCount = stats.humans ?? guild.members.cache.filter(m => !m.user.bot).size;
+  const botCount = stats.bots ?? guild.members.cache.filter(m => m.user.bot).size;
+  const boostLevel = guild.premiumTier ? String(guild.premiumTier).replace('TIER_', 'Level ') : 'Level 0';
+  return base(`📊 Server Information`)
+    .setAuthor({ name: guild.name, iconURL: guild.iconURL({ size: 64 }) || undefined })
+    .setDescription(guild.description || 'No server description has been set.')
+    .setThumbnail(guild.iconURL({ size: 256 }) || null)
+    .addFields(
+      { name: '🌙 General Info', value: `**Name:** ${guild.name}\n**Server ID:** ${guild.id}\n**Owner:** ${owner}\n**Created:** <t:${Math.floor(guild.createdTimestamp / 1000)}:F>`, inline: false },
+      { name: '👥 Members & Roles', value: `**Members:** ${guild.memberCount}\n**Humans:** ${humanCount}\n**Bots:** ${botCount}\n**Roles:** ${guild.roles.cache.size - 1}\n**Verification Level:** ${guild.verificationLevel}`, inline: false },
+      { name: '💎 Boost Status', value: `**Level:** ${boostLevel}\n**Boosts:** ${guild.premiumSubscriptionCount || 0}\n**AFK Timeout:** ${guild.afkTimeout || 0} sec`, inline: false },
+      { name: '📁 Channels', value: `**Text:** ${stats.text ?? guild.channels.cache.filter(c => c.type === ChannelType.GuildText).size}\n**Voice:** ${stats.voice ?? guild.channels.cache.filter(c => c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice).size}\n**Categories:** ${stats.categories ?? guild.channels.cache.filter(c => c.type === ChannelType.GuildCategory).size}\n**Threads:** ${stats.threads ?? guild.channels.cache.filter(c => c.isThread?.()).size}`, inline: false },
+      { name: '✨ Server Assets', value: `**Emojis:** ${guild.emojis.cache.size}\n**Stickers:** ${guild.stickers.cache.size}\n**Features:** ${guild.features.length ? guild.features.slice(0, 8).join(', ') : 'None'}`, inline: false }
+    )
+    .setFooter(requestedFooter(stats.footer));
+}
+
+function memberCountEmbed(guild, humans, bots, footer, type = 'all') {
+  const total = humans + bots;
+  const lines = type === 'humans' ? `**Humans:** ${humans}` : type === 'bots' ? `**Bots:** ${bots}` : `**Total:** ${total}\n**Humans:** ${humans}\n**Bots:** ${bots}`;
+  return base(`👥 ${guild.name} Members`)
+    .setThumbnail(guild.iconURL({ size: 256 }) || null)
+    .setDescription(lines)
+    .setFooter(requestedFooter(footer));
+}
+
+function userInfoEmbed(user, member, footer) {
+  const roles = member ? member.roles.cache.filter(r => r.id !== member.guild.id).map(r => r).slice(0, 15).join(' ') : 'Not in this server';
+  return base(`👤 ${user.tag}`)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .addFields(
+      { name: 'General', value: `**User ID:** ${user.id}\n**Bot:** ${user.bot ? 'Yes' : 'No'}\n**Created:** <t:${Math.floor(user.createdTimestamp / 1000)}:F>`, inline: false },
+      { name: 'Server', value: member ? `**Joined:** <t:${Math.floor(member.joinedTimestamp / 1000)}:F>\n**Nickname:** ${member.nickname || 'None'}\n**Roles:** ${roles || 'None'}` : 'Not a member of this server.', inline: false }
+    )
+    .setFooter(requestedFooter(footer));
+}
+
+function avatarEmbed(user, footer) {
+  return base(`🖼️ ${user.tag}'s Avatar`).setImage(user.displayAvatarURL({ size: 1024, extension: 'png' })).setFooter(requestedFooter(footer));
+}
+function bannerEmbed(user, footer) {
+  return base(`🖼️ ${user.tag}'s Banner`).setImage(user.bannerURL({ size: 1024, extension: 'png' })).setFooter(requestedFooter(footer));
+}
+function invitesEmbed(guild, user, uses, codes, active, footer) {
+  return base(`✉️ Invites — ${user.tag}`)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setDescription(`**Total invite uses:** ${uses}\n**Invite codes:** ${codes}\n**Active codes:** ${active}\n\nCalculated from the server's currently visible invite codes.`)
+    .setFooter(requestedFooter(footer));
+}
+
+// ---------------- GIVEAWAYS ----------------
+function giveawayEmbed({ id, prize, winners, host, endsAt, entrants = 0, ended = false, winnerIds = [] }) {
+  const status = ended ? 'Ended' : 'Ends';
+  const winnerText = winnerIds.length ? winnerIds.map(id => `<@${id}>`).join(', ') : 'Not drawn yet';
+  return base(`🎉 Giveaway • ${prize}`)
+    .setDescription(`**Prize:** ${prize}\n**Winners:** ${winners}\n**Host:** ${host}\n**Entrants:** ${entrants}\n\n**${status}:** <t:${Math.floor(endsAt / 1000)}:R>${ended ? `\n\n**Winners:** ${winnerText}` : '\n\nClick the button below to enter.'}`)
+    .setFooter({ text: `Giveaway ID: ${id} • ${BRAND_FOOTER}` });
+}
+function giveawayButtonRow(id) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`giveaway_enter:${id}`).setLabel('Enter Giveaway').setStyle(ButtonStyle.Success).setEmoji('🎉')
+  );
+}
+function giveawayListEmbed(rows) {
+  if (!rows.length) return base('🎉 Giveaways').setDescription('No giveaways have been created yet.');
+  return base('🎉 Recent Giveaways').setDescription(rows.map(r => `**${r.id}** — ${r.prize} — ${r.ended ? 'Ended' : `<t:${Math.floor(r.endsAt / 1000)}:R>`} — ${r.winners} winner(s)`).join('\n'));
+}
+
 module.exports = {
   THEME, OK, WARN, DANGER, emoji, emojify, EMOJI_KEYS, DEFAULT_EMOJIS,
   base, okEmbed, warnEmbed, errorEmbed,
@@ -580,6 +656,8 @@ module.exports = {
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
+  serverInfoEmbed, memberCountEmbed, userInfoEmbed, avatarEmbed, bannerEmbed, invitesEmbed,
+  giveawayEmbed, giveawayButtonRow, giveawayListEmbed,
   SETUP_MODULE_META, SETUP_SETTING_OPTIONS, setupPanelEmbed, setupPanelRow,
   ticketConfigPanelEmbed, ticketConfigRow,
   toComponentsV2, COMPONENTS_V2_FLAG
