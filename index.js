@@ -289,12 +289,19 @@ async function handlePrefixCommand(message) {
 }
 
 const SETUP_MODAL_SPECS = {
+  automod: {
+    bad_word_filter:[{id:'value',label:'Bad-word filter (true/false)',value:c=>String(c.automod.badWordFilter)}],
+    bad_words:[{id:'value',label:'Blocked words (comma separated)',style:TextInputStyle.Paragraph,value:c=>(c.automod.badWords||[]).join(', ')}],
+    caps_filter:[{id:'value',label:'Caps filter (true/false)',value:c=>String(c.automod.capsFilter)}],
+    caps_threshold:[{id:'value',label:'Caps threshold (1-100)',value:c=>String(c.automod.capsThreshold)}],
+    invite_filter:[{id:'value',label:'Invite filter (true/false)',value:c=>String(c.automod.inviteFilter)}]
+  },
   antinuke: { punishment: [{ id:'value', label:'Punishment', value:c=>c.antinuke.punishment }], threshold:[{id:'value',label:'Action threshold',value:c=>String(c.antinuke.maxBans)}], window_seconds:[{id:'value',label:'Time window (seconds)',value:c=>String(c.antinuke.windowSeconds)}] },
   antilink: { mode:[{id:'value',label:'Link action',value:c=>c.antilink.mode}] },
   antispam: { max_messages:[{id:'value',label:'Max messages',value:c=>String(c.antispam.maxMessages)}], window_seconds:[{id:'value',label:'Window seconds',value:c=>String(c.antispam.windowSeconds)}], punishment:[{id:'value',label:'Spam action',value:c=>c.antispam.punishment}] },
   antiraid: { join_threshold:[{id:'value',label:'Join threshold',value:c=>String(c.antiraid.joinThreshold)}], window_seconds:[{id:'value',label:'Window seconds',value:c=>String(c.antiraid.windowSeconds)}], min_account_age_days:[{id:'value',label:'Minimum account age (days)',value:c=>String(c.antiraid.minAccountAgeDays)}], action:[{id:'value',label:'Raid action',value:c=>c.antiraid.action}] },
   greetmessage: { message:[{id:'value',label:'Welcome message',style:TextInputStyle.Paragraph,value:c=>c.greetmessage.message||''}], image:[{id:'value',label:'Image/GIF URL',value:c=>c.greetmessage.image||''}] },
-  leveling: { xp_per_message:[{id:'value',label:'XP per message',value:c=>String(c.leveling.xpPerMessage)}], cooldown_seconds:[{id:'value',label:'Cooldown seconds',value:c=>String(c.leveling.cooldownSeconds)}] },
+  leveling: { xp_per_message:[{id:'value',label:'XP per message',value:c=>String(c.leveling.xpPerMessage)}], cooldown_seconds:[{id:'value',label:'Cooldown seconds',value:c=>String(c.leveling.cooldownSeconds)}], level_up_message:[{id:'value',label:'Level-up message',style:TextInputStyle.Paragraph,value:c=>c.leveling.levelUpMessage||''}] },
   tickets: {
     panel_text:[{id:'title',label:'Panel title',value:c=>c.ticket.panelTitle||''},{id:'description',label:'Panel message',style:TextInputStyle.Paragraph,value:c=>c.ticket.panelDescription||''}],
     panel_media:[{id:'thumbnail',label:'Panel thumbnail URL',value:c=>c.ticket.panelThumbnail||''},{id:'image',label:'Panel banner URL',value:c=>c.ticket.panelImage||''}],
@@ -362,13 +369,13 @@ client.on('interactionCreate', async (rawInteraction) => {
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_channel_pick:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
       const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0];
-      const map={hub_channel:{key:'voicemaster',prop:'hubChannelId'},category:sub==='voicemaster'?{key:'voicemaster',prop:'categoryId'}:sub==='tickets'?{key:'ticket',prop:'categoryId'}:null,channel:{key:sub,prop:sub==='leveling'?'channel':'channelId'},log_channel:{key:'ticket',prop:'logChannelId'}}; const target=map[field];
+      const map={hub_channel:{key:'voicemaster',prop:'hubChannelId'},category:sub==='voicemaster'?{key:'voicemaster',prop:'categoryId'}:sub==='tickets'?{key:'ticket',prop:'categoryId'}:null,channel:{key:sub,prop:sub==='leveling'?'channel':'channelId'},log_channel:{key:'ticket',prop:'logChannelId'}}; const target=map[field] || (ui.SETUP_MODULE_META[sub] && field==='channel' ? {key:ui.SETUP_MODULE_META[sub].cfgKey,prop:'channelId'} : null);
       if(!target) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That channel setting is not available.')],ephemeral:true});
       const cfg=db.saveConfig(interaction.guildId,{[target.key]:{[target.prop]:id}}); return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('setup_role_pick:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
-      const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0]; const map={bypass_role:{key:'antilink',prop:'bypassRoleId'},support_role:{key:'ticket',prop:'supportRoleId'}}; const target=map[field];
+      const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0]; const map={bypass_role:{key:'antilink',prop:'bypassRoleId'},support_role:{key:'ticket',prop:'supportRoleId'}}; const target=map[field] || (ui.SETUP_MODULE_META[sub] && field==='role' ? {key:ui.SETUP_MODULE_META[sub].cfgKey,prop:'roleId'} : null);
       if(!target) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That role setting is not available.')],ephemeral:true});
       const cfg=db.saveConfig(interaction.guildId,{[target.key]:{[target.prop]:id}}); return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
     }
@@ -589,6 +596,13 @@ async function handleTicketMemberSelect(interaction, action) {
 // buildModulePatch() (in commands.js) expects; `parse` turns the raw text field into that
 // shape (IDs are stored as plain strings, buildModulePatch only ever needs `.id`).
 const SETUP_EDIT_FIELDS = {
+  automod: [
+    { key: 'bad_word_filter', oKey: 'bad_word_filter', label: 'Bad-word filter true/false', parse: v => /^true$/i.test(v), get: cfg => String(cfg.automod.badWordFilter) },
+    { key: 'bad_words', oKey: 'bad_words', label: 'Blocked words comma separated', parse: v => v, get: cfg => (cfg.automod.badWords || []).join(', ') },
+    { key: 'caps_filter', oKey: 'caps_filter', label: 'Caps filter true/false', parse: v => /^true$/i.test(v), get: cfg => String(cfg.automod.capsFilter) },
+    { key: 'caps_threshold', oKey: 'caps_threshold', label: 'Caps threshold 1-100', parse: v => parseInt(v,10) || 70, get: cfg => String(cfg.automod.capsThreshold) },
+    { key: 'invite_filter', oKey: 'invite_filter', label: 'Invite filter true/false', parse: v => /^true$/i.test(v), get: cfg => String(cfg.automod.inviteFilter) }
+  ],
   antinuke: [
     { key: 'punishment', oKey: 'punishment', label: 'Punishment: ban / kick / strip_roles', parse: v => v, get: cfg => cfg.antinuke.punishment },
     { key: 'threshold', oKey: 'threshold', label: 'Action threshold (number)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.antinuke.maxBans) },
@@ -621,7 +635,8 @@ const SETUP_EDIT_FIELDS = {
   leveling: [
     { key: 'channel', oKey: 'channel_id', label: 'Level-up announcement channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.leveling.channel || '' },
     { key: 'xp_per_message', oKey: 'xp_per_message', label: 'XP per eligible message', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.leveling.xpPerMessage) },
-    { key: 'cooldown_seconds', oKey: 'cooldown_seconds', label: 'Cooldown between XP gains (seconds)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.leveling.cooldownSeconds) }
+    { key: 'cooldown_seconds', oKey: 'cooldown_seconds', label: 'Cooldown between XP gains (seconds)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.leveling.cooldownSeconds) },
+    { key: 'level_up_message', oKey: 'level_up_message', label: 'Level-up message', parse: v => v, get: cfg => cfg.leveling.levelUpMessage || '' }
   ],
   tickets: [
     { key: 'category', oKey: 'category_id', label: 'Ticket category ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.ticket.categoryId || '' },
@@ -633,6 +648,7 @@ const SETUP_EDIT_FIELDS = {
 async function openSetupModal(interaction, sub) {
   const cfg = db.getConfig(interaction.guildId);
   const fields = SETUP_EDIT_FIELDS[sub];
+  if (!fields) return interaction.reply({ embeds: [ui.errorEmbed('Unavailable', 'Use the settings dropdown to configure this module.')], ephemeral: true });
   const modal = new ModalBuilder().setCustomId(`setup_modal:${sub}`).setTitle(`Edit ${ui.SETUP_MODULE_META[sub].title}`);
   for (const f of fields) {
     const current = f.get(cfg);
@@ -662,7 +678,17 @@ async function handleModal(interaction) {
     if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator to change setup settings.')],ephemeral:true});
     const values={}; for(const key of ['value','title','description','thumbnail','image','category','message']){try{const v=interaction.fields.getTextInputValue(key).trim();if(v)values[key]=v;}catch{}}
     let o={}; if(sub==='tickets'){const map={panel_text:{panel_title:values.title,panel_description:values.description},panel_media:{panel_thumbnail:values.thumbnail,panel_image:values.image},welcome_text:{category_label:values.category,welcome_message:values.message},welcome_media:{welcome_thumbnail:values.thumbnail,welcome_image:values.image}};o=map[setting]||{};} else {const k=setting;if(values.value)o[k]=values.value;if(['threshold','window_seconds','max_messages','join_threshold','min_account_age_days','xp_per_message','cooldown_seconds'].includes(setting))o[k]=parseInt(values.value,10);}
-    const patch=buildModulePatch(sub,interaction.guildId,o); const cfg=db.saveConfig(interaction.guildId,patch);
+    let patch=buildModulePatch(sub,interaction.guildId,o);
+    if (!Object.keys(patch).length && ui.SETUP_MODULE_META[sub]) {
+      const value = o[setting];
+      patch = { [ui.SETUP_MODULE_META[sub].cfgKey]: { [setting]: value } };
+    }
+    if (sub==='automod' && ['bad_word_filter','caps_filter','invite_filter'].includes(setting)) {
+      patch = { automod: { [setting === 'bad_word_filter' ? 'badWordFilter' : setting === 'caps_filter' ? 'capsFilter' : 'inviteFilter']: String(o[setting]).toLowerCase() === 'true' } };
+    }
+    if (sub==='automod' && setting==='caps_threshold') patch = { automod: { capsThreshold: parseInt(o[setting],10) || 70 } };
+    if (sub==='automod' && setting==='bad_words') patch = { automod: { badWords: String(o[setting]).split(',').map(x=>x.trim()).filter(Boolean).slice(0,100) } };
+    const cfg=db.saveConfig(interaction.guildId,patch);
     if(interaction.message) return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
     return interaction.reply({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg),ephemeral:true});
   }
@@ -768,8 +794,20 @@ client.on('messageCreate', async (message) => {
   await sys.handleLevelingMessage(message).catch(() => {});
 
   const cfg = db.getConfig(message.guild.id).automod;
-  if (cfg.badWordFilter && cfg.badWords.some(w => message.content.toLowerCase().includes(w.toLowerCase()))) {
-    await message.delete().catch(() => {});
+  if (cfg.enabled) {
+    const lower = message.content.toLowerCase();
+    const hasBadWord = cfg.badWordFilter && cfg.badWords.some(w => w && lower.includes(String(w).toLowerCase()));
+    const inviteRegex = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord\.com\/invite)\/[A-Za-z0-9-]+/i;
+    const hasInvite = cfg.inviteFilter && inviteRegex.test(message.content);
+    const letters = message.content.replace(/[^A-Za-z]/g, '');
+    const caps = letters.length ? (letters.replace(/[^A-Z]/g, '').length / letters.length) * 100 : 0;
+    const tooManyCaps = cfg.capsFilter && letters.length >= 6 && caps >= Number(cfg.capsThreshold || 70);
+    if (hasBadWord || hasInvite || tooManyCaps) {
+      await message.delete().catch(() => {});
+      const reason = hasBadWord ? 'blocked word' : hasInvite ? 'Discord invite' : 'excessive caps';
+      const log = await sys.getLogChannel(message.guild, 'mod');
+      if (log) log.send({ embeds: [ui.warnEmbed(`${ui.emoji('warning')} Automod`, `${message.author} message removed (${reason}).`)] }).catch(() => {});
+    }
   }
 });
 
