@@ -451,9 +451,28 @@ commands.push({
 });
 
 // ---------------------------------------------------------------------------------
+// /prefix — configure the text-command prefix ("<prefix> <cmd> ...")
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder()
+    .setName('prefix')
+    .setDescription('Set this server\'s prefix for text commands (e.g. !ban @user spamming).')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('prefix').setDescription('new prefix, e.g. ! or ? or >').setRequired(true)),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const prefix = interaction.options.getString('prefix').trim().slice(0, 5);
+    if (!prefix) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Prefix', 'Prefix can\'t be empty.')], ephemeral: true });
+    db.saveConfig(interaction.guildId, { prefix });
+    await interaction.reply({ embeds: [ui.okEmbed('✅ Prefix Updated', `Text commands now use \`${prefix}\`. Example: \`${prefix}help\``)] });
+  }
+});
+
+// ---------------------------------------------------------------------------------
 // Owner-only
 // ---------------------------------------------------------------------------------
 commands.push({
+  ownerOnly: true,
   data: new SlashCommandBuilder().setName('maintenance').setDescription('[Owner] Toggle maintenance mode.')
     .addStringOption(o => o.setName('state').setDescription('on/off').setRequired(true).addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' })),
   async execute(interaction) {
@@ -464,6 +483,7 @@ commands.push({
   }
 });
 commands.push({
+  ownerOnly: true,
   data: new SlashCommandBuilder().setName('blacklist').setDescription('[Owner] Block a user from using the bot.')
     .addSubcommand(s => s.setName('add').setDescription('block a user').addUserOption(o => o.setName('user').setDescription('user').setRequired(true)))
     .addSubcommand(s => s.setName('remove').setDescription('unblock a user').addUserOption(o => o.setName('user').setDescription('user').setRequired(true))),
@@ -478,6 +498,7 @@ commands.push({
   }
 });
 commands.push({
+  ownerOnly: true,
   data: new SlashCommandBuilder().setName('eval').setDescription('[Owner] Run raw JavaScript.')
     .addStringOption(o => o.setName('code').setDescription('code to run').setRequired(true)),
   async execute(interaction) {
