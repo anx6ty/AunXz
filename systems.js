@@ -399,6 +399,45 @@ async function handleVoicemasterJoin(oldState, newState) {
   }
 }
 
+// ---------------------------------------------------------------------------------
+// autoresponder / autoreactor — simple keyword-triggered text replies and emoji reactions.
+// Both share the same trigger shape: { id, match, mode: 'exact'|'contains' }.
+// ---------------------------------------------------------------------------------
+function triggerMatches(content, trigger, ignoreCase) {
+  const text = ignoreCase ? content.toLowerCase() : content;
+  const match = ignoreCase ? String(trigger.match || '').toLowerCase() : String(trigger.match || '');
+  if (!match) return false;
+  if (trigger.mode === 'exact') return text.trim() === match.trim();
+  return text.includes(match);
+}
+
+async function handleAutoresponder(message) {
+  const cfg = db.getConfig(message.guild.id).autoresponder;
+  if (!cfg.enabled || !cfg.triggers.length) return;
+  const trigger = cfg.triggers.find(t => triggerMatches(message.content, t, cfg.ignoreCase));
+  if (!trigger) return;
+  const response = String(trigger.response || '')
+    .replace(/\{user\}/g, `${message.author}`)
+    .replace(/\{server\}/g, message.guild.name);
+  if (!response) return;
+  await message.channel.send({ content: response.slice(0, 2000), allowedMentions: { repliedUser: false } }).catch(() => {});
+}
+
+async function handleAutoreactor(message) {
+  const cfg = db.getConfig(message.guild.id).autoreactor;
+  if (!cfg.enabled || !cfg.triggers.length) return;
+  for (const trigger of cfg.triggers) {
+    if (!triggerMatches(message.content, trigger, cfg.ignoreCase)) continue;
+    for (const em of (trigger.emojis || []).slice(0, 5)) {
+      await message.react(em).catch(() => {});
+    }
+  }
+}
+
+// In-memory draft state for /embedbuilder — keyed by userId, cleared once posted.
+// Not persisted: an in-progress draft is meant to be finished in one sitting.
+const embedBuilderSessions = new Map();
+
 module.exports = {
   joinAndStayInVC, playTTSInChannel,
   antinukeStrike, findAuditExecutor, getLogChannel,
@@ -407,5 +446,7 @@ module.exports = {
   handleAntispam,
   lockRoleToSingleChannel, onChannelCreateGreetvoiceSync, onMemberJoinGreetvoice, onVoiceJoinGreetvoice,
   xpForLevel, handleLevelingMessage,
-  handleVoicemasterJoin
+  handleVoicemasterJoin,
+  handleAutoresponder, handleAutoreactor,
+  embedBuilderSessions
 };
