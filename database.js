@@ -4,8 +4,21 @@
 
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
-const db = new Database(path.join(__dirname, 'bot.sqlite'));
+// Railway (and other hosts) should mount a persistent volume at /data.
+// Locally, fall back to the project directory when /data is unavailable.
+const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : __dirname);
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_PATH = path.join(DATA_DIR, 'bot.sqlite');
+
+// One-time migration for existing local installs.
+const legacyDbPath = path.join(__dirname, 'bot.sqlite');
+if (DB_PATH !== legacyDbPath && !fs.existsSync(DB_PATH) && fs.existsSync(legacyDbPath)) {
+  fs.copyFileSync(legacyDbPath, DB_PATH);
+}
+
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -326,6 +339,7 @@ function getAllEmojiOverrides() {
 }
 
 module.exports = {
+  DB_PATH, DATA_DIR,
   db, DEFAULT_CONFIG,
   getConfig, saveConfig,
   getLevel, setLevel, topLevels,
