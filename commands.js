@@ -424,65 +424,43 @@ commands.push({
 });
 
 commands.push({
-  data:new SlashCommandBuilder().setName('birthdaysetup').setDescription('Configure the birthday panel and daily wishes.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption(o=>o.setName('panel_channel').setDescription('Channel for the birthday setup panel').setRequired(true).addChannelTypes(ChannelType.GuildText))
-    .addChannelOption(o=>o.setName('wish_channel').setDescription('Channel where birthday wishes are sent').setRequired(true).addChannelTypes(ChannelType.GuildText))
-    .addStringOption(o=>o.setName('message').setDescription('Wish message; use {user} and {date}')),
+  data:new SlashCommandBuilder().setName('birthdaysetup').setDescription('Open the easy Birthday setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction){
     if(!requireAdmin(interaction))return;
-    const cfg=db.saveConfig(interaction.guildId,{birthdays:{enabled:true,panelChannelId:interaction.options.getChannel('panel_channel').id,wishChannelId:interaction.options.getChannel('wish_channel').id,wishMessage:interaction.options.getString('message')||'Happy Birthday {user}! 🎂'}});
-    const ch=interaction.options.getChannel('panel_channel');
-    await ch.send({embeds:[ui.birthdaySetupEmbed(cfg.birthdays)],components:[new (require('discord.js').ActionRowBuilder)().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('birthday_set').setLabel('Set Birthday').setStyle(require('discord.js').ButtonStyle.Primary))]});
-    await interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg.birthdays)],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId).birthdays;
+    await interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:[ui.birthdaySetupRow(cfg)],ephemeral:true});
   }
 });
 
 commands.push({
-  data:new SlashCommandBuilder().setName('antibadwordsetup').setDescription('Delete bad-word messages in any language and log them.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption(o=>o.setName('log_channel').setDescription('Logging channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
-    .addStringOption(o=>o.setName('extra_words').setDescription('Optional extra words/phrases, comma separated'))
-    .addStringOption(o=>o.setName('action').setDescription('Action after detection').addChoices({name:'Delete only',value:'delete'},{name:'Delete + timeout',value:'timeout'})),
+  data:new SlashCommandBuilder().setName('antibadwordsetup').setDescription('Open the multilingual Anti Bad Word setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction){
     if(!requireAdmin(interaction))return;
-    const words=(interaction.options.getString('extra_words')||'').split(',').map(x=>x.trim()).filter(Boolean).slice(0,200);
-    const cfg=db.saveConfig(interaction.guildId,{antibadword:{enabled:true,logChannelId:interaction.options.getChannel('log_channel').id,customWords:words,action:interaction.options.getString('action')||'delete'}});
-    await interaction.reply({embeds:[ui.featureSetupEmbed('Anti Bad Word','The bot will detect configured profanity/bad-word patterns, delete the message, and log the event.',[{name:'Log',value:`<#${cfg.antibadword.logChannelId}>`,inline:true},{name:'Action',value:cfg.antibadword.action,inline:true}])],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId).antibadword;
+    await interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:[ui.antiBadwordSetupRow(cfg)],ephemeral:true});
   }
 });
 
 commands.push({
-  data:new SlashCommandBuilder().setName('honeypotsetup').setDescription('Turn one channel into a no-message honeypot.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption(o=>o.setName('channel').setDescription('The honeypot channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
-    .addStringOption(o=>o.setName('action').setDescription('What happens to a user who posts there').addChoices({name:'Kick',value:'kick'},{name:'Ban',value:'ban'},{name:'Timeout',value:'timeout'},{name:'Delete only',value:'delete'}))
-    .addChannelOption(o=>o.setName('log_channel').setDescription('Honeypot log channel').addChannelTypes(ChannelType.GuildText))
-    .addBooleanOption(o=>o.setName('create_invite').setDescription('When kicking, create an invite and DM it'))
-    .addStringOption(o=>o.setName('cleanup_window').setDescription('Delete the trigger user\'s recent messages across accessible channels').addChoices({name:'None',value:'none'},{name:'Last 10 minutes',value:'10m'},{name:'Last 1 hour',value:'1h'},{name:'Last 24 hours',value:'24h'}))
-    .addStringOption(o=>o.setName('dm_message').setDescription('DM after kick; use {invite}')),
+  data:new SlashCommandBuilder().setName('honeypotsetup').setDescription('Open the easy Honeypot setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction){
     if(!requireAdmin(interaction))return;
-    const ch=interaction.options.getChannel('channel');
-    const cfg=db.saveConfig(interaction.guildId,{honeypot:{enabled:true,channelId:ch.id,action:interaction.options.getString('action')||'kick',logChannelId:(interaction.options.getChannel('log_channel')||ch).id,createInvite:interaction.options.getBoolean('create_invite') ?? true,cleanupWindow:interaction.options.getString('cleanup_window')||'none',dmMessage:interaction.options.getString('dm_message')||'You were removed for posting in the honeypot channel. Here is an invite back: {invite}'}});
-    await interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg.honeypot)],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId).honeypot;
+    await interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:[ui.honeypotSetupRow(cfg)],ephemeral:true});
   }
 });
 
 
 commands.push({
-  data:new SlashCommandBuilder().setName('greetvoicesetup').setDescription('Easy direct setup for the role-gated voice greeting.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addRoleOption(o=>o.setName('role').setDescription('Gate role given to new members').setRequired(true))
-    .addChannelOption(o=>o.setName('voice_channel').setDescription('Only voice channel the gate role can access').setRequired(true).addChannelTypes(ChannelType.GuildVoice))
-    .addStringOption(o=>o.setName('prompt').setDescription('Text spoken when the member joins').setRequired(true)),
+  data:new SlashCommandBuilder().setName('greetvoicesetup').setDescription('Open the easy Greet Voice setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction){
     if(!requireAdmin(interaction))return;
-    const role=interaction.options.getRole('role'), vc=interaction.options.getChannel('voice_channel'), prompt=interaction.options.getString('prompt');
-    const cfg=db.saveConfig(interaction.guildId,{greetvoice:{enabled:true,roleId:role.id,vcId:vc.id,ttsPrompt:prompt}});
-    await sys.lockRoleToSingleChannel(interaction.guild,role,vc.id);
-    await interaction.reply({embeds:[ui.featureSetupEmbed('Greet Voice','New members receive the gate role, join the selected VC, hear the TTS prompt, then are disconnected and released.',[{name:'Role',value:`${role}`,inline:true},{name:'Voice',value:`${vc}`,inline:true},{name:'Prompt',value:prompt,inline:false}])],ephemeral:true});
-    sys.joinAndStayInVC(vc).catch(e=>console.error('greetvoice join failed:',e));
+    const cfg=db.getConfig(interaction.guildId).greetvoice;
+    await interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:[ui.greetVoiceSetupRow(cfg)],ephemeral:true});
   }
 });
 
@@ -977,12 +955,34 @@ commands.push({
       .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true))
       .addStringOption(o => o.setName('value').setDescription('Unicode emoji or custom emoji such as <:name:id>.').setRequired(true)))
     .addSubcommand(s => s.setName('reset').setDescription('Restore one emoji to its default.')
-      .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true))),
+      .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true)))
+    .addSubcommand(s => s.setName('save').setDescription('Save a snapshot of every bot emoji and return a random restore code.'))
+    .addSubcommand(s => s.setName('load').setDescription('Load an emoji snapshot using its random code.')
+      .addStringOption(o => o.setName('code').setDescription('Snapshot code from /emoji save').setRequired(true))),
   async execute(interaction) {
     if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
     const sub = interaction.options.getSubcommand();
     if (sub === 'list') {
       return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides())], ephemeral: true });
+    }
+    if (sub === 'save') {
+      const values = {};
+      for (const key of ui.EMOJI_KEYS) values[key] = ui.emoji(key);
+      const code = db.saveEmojiSnapshot(values);
+      return interaction.reply({ embeds: [ui.okEmbed('💾 Emoji Snapshot Saved', `Snapshot saved.
+
+**Code:** \`${code}\`\n
+Use **/emoji load** with this code to restore these emojis later.`)], ephemeral: true });
+    }
+    if (sub === 'load') {
+      const code = interaction.options.getString('code').trim();
+      const snapshot = db.getEmojiSnapshot(code);
+      if (!snapshot) return interaction.reply({ embeds: [ui.errorEmbed('Snapshot Not Found', `No emoji snapshot exists for \`${code}\`.`)], ephemeral: true });
+      for (const key of ui.EMOJI_KEYS) {
+        const value = snapshot[key];
+        if (value) db.setEmojiOverride(key, value);
+      }
+      return interaction.reply({ embeds: [ui.okEmbed('📥 Emoji Snapshot Loaded', `Restored **${Object.keys(snapshot).length}** emoji values from snapshot \`${code}\`.`)] });
     }
     const name = interaction.options.getString('name').trim().toLowerCase();
     if (!ui.EMOJI_KEYS.includes(name)) {
