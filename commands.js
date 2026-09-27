@@ -102,6 +102,114 @@ const setupCmd = new SlashCommandBuilder()
     .addStringOption(o => o.setName('state').setDescription('enable/disable').setRequired(true).addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
     .addChannelOption(o => o.setName('channel').setDescription('channel this module should use, if any')));
 
+// The 8 dedicated modules that get the full interactive setup panel (embed + toggle/edit
+// buttons). Pulls values out of a slash interaction's options into a flat, source-agnostic
+// object `o`, so the same buildModulePatch() below can also be driven by the setup-panel's
+// edit modal in index.js (which only has raw text field values, not resolved User/Role/Channel
+// objects).
+const PANEL_MODULES = ['antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetmessage', 'leveling', 'tickets'];
+
+function extractModuleOptions(sub, interaction) {
+  const o = { state: interaction.options.getString('state') };
+  if (sub === 'antinuke') {
+    o.punishment = interaction.options.getString('punishment');
+    o.threshold = interaction.options.getInteger('threshold');
+    o.window_seconds = interaction.options.getInteger('window_seconds');
+  } else if (sub === 'antilink') {
+    o.mode = interaction.options.getString('mode');
+    const r = interaction.options.getRole('bypass_role'); o.bypass_role_id = r ? r.id : null;
+  } else if (sub === 'antispam') {
+    o.max_messages = interaction.options.getInteger('max_messages');
+    o.window_seconds = interaction.options.getInteger('window_seconds');
+    o.punishment = interaction.options.getString('punishment');
+  } else if (sub === 'antiraid') {
+    o.join_threshold = interaction.options.getInteger('join_threshold');
+    o.window_seconds = interaction.options.getInteger('window_seconds');
+    o.min_account_age_days = interaction.options.getInteger('min_account_age_days');
+    o.action = interaction.options.getString('action');
+  } else if (sub === 'voicemaster') {
+    const h = interaction.options.getChannel('hub_channel'); o.hub_channel_id = h ? h.id : null;
+    const c = interaction.options.getChannel('category'); o.category_id = c ? c.id : null;
+  } else if (sub === 'greetmessage') {
+    const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
+    o.message = interaction.options.getString('message');
+  } else if (sub === 'leveling') {
+    const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
+    o.xp_per_message = interaction.options.getInteger('xp_per_message');
+    o.cooldown_seconds = interaction.options.getInteger('cooldown_seconds');
+    o.reward_level = interaction.options.getInteger('reward_level');
+    const r = interaction.options.getRole('reward_role'); o.reward_role_id = r ? r.id : null;
+  } else if (sub === 'tickets') {
+    const c = interaction.options.getChannel('category'); o.category_id = c ? c.id : null;
+    const r = interaction.options.getRole('support_role'); o.support_role_id = r ? r.id : null;
+    const l = interaction.options.getChannel('log_channel'); o.log_channel_id = l ? l.id : null;
+  }
+  return o;
+}
+
+// Builds a db.saveConfig() patch for one of the 8 panel modules from a flat options object `o`.
+// Every field is optional — omit/null means "leave unchanged" — so this doubles as the handler
+// for "just show me the current panel" (call with an empty `o`) and "apply these changes".
+function buildModulePatch(sub, guildId, o) {
+  const patch = {};
+  const state = o.state;
+  if (sub === 'antinuke') {
+    patch.antinuke = {};
+    if (state) patch.antinuke.enabled = state === 'enable';
+    if (o.punishment) patch.antinuke.punishment = o.punishment;
+    if (o.threshold) Object.assign(patch.antinuke, {
+      maxChannelDeletes: o.threshold, maxChannelCreates: o.threshold, maxRoleDeletes: o.threshold,
+      maxRoleCreates: o.threshold, maxBans: o.threshold, maxKicks: o.threshold, maxWebhookCreates: o.threshold, maxRoleUpdates: o.threshold
+    });
+    if (o.window_seconds) patch.antinuke.windowSeconds = o.window_seconds;
+  } else if (sub === 'antilink') {
+    patch.antilink = {};
+    if (state) patch.antilink.enabled = state === 'enable';
+    if (o.mode) patch.antilink.mode = o.mode;
+    if (o.bypass_role_id) patch.antilink.bypassRoleId = o.bypass_role_id;
+  } else if (sub === 'antispam') {
+    patch.antispam = {};
+    if (state) patch.antispam.enabled = state === 'enable';
+    if (o.max_messages) patch.antispam.maxMessages = o.max_messages;
+    if (o.window_seconds) patch.antispam.windowSeconds = o.window_seconds;
+    if (o.punishment) patch.antispam.punishment = o.punishment;
+  } else if (sub === 'antiraid') {
+    patch.antiraid = {};
+    if (state) patch.antiraid.enabled = state === 'enable';
+    if (o.join_threshold) patch.antiraid.joinThreshold = o.join_threshold;
+    if (o.window_seconds) patch.antiraid.windowSeconds = o.window_seconds;
+    if (o.min_account_age_days !== null && o.min_account_age_days !== undefined) patch.antiraid.minAccountAgeDays = o.min_account_age_days;
+    if (o.action) patch.antiraid.action = o.action;
+  } else if (sub === 'voicemaster') {
+    patch.voicemaster = {};
+    if (state) patch.voicemaster.enabled = state === 'enable';
+    if (o.hub_channel_id) patch.voicemaster.hubChannelId = o.hub_channel_id;
+    if (o.category_id) patch.voicemaster.categoryId = o.category_id;
+  } else if (sub === 'greetmessage') {
+    patch.greetmessage = {};
+    if (state) patch.greetmessage.enabled = state === 'enable';
+    if (o.channel_id) patch.greetmessage.channelId = o.channel_id;
+    if (o.message) patch.greetmessage.message = o.message;
+  } else if (sub === 'leveling') {
+    patch.leveling = {};
+    if (state) patch.leveling.enabled = state === 'enable';
+    if (o.channel_id) patch.leveling.channel = o.channel_id;
+    if (o.xp_per_message) patch.leveling.xpPerMessage = o.xp_per_message;
+    if (o.cooldown_seconds) patch.leveling.cooldownSeconds = o.cooldown_seconds;
+    if (o.reward_level && o.reward_role_id) {
+      const current = db.getConfig(guildId).leveling.roleRewards;
+      patch.leveling.roleRewards = { ...current, [String(o.reward_level)]: o.reward_role_id };
+    }
+  } else if (sub === 'tickets') {
+    patch.ticket = {};
+    if (state) patch.ticket.enabled = state === 'enable';
+    if (o.category_id) patch.ticket.categoryId = o.category_id;
+    if (o.support_role_id) patch.ticket.supportRoleId = o.support_role_id;
+    if (o.log_channel_id) patch.ticket.logChannelId = o.log_channel_id;
+  }
+  return patch;
+}
+
 commands.push({
   data: setupCmd,
   async execute(interaction) {
@@ -117,78 +225,31 @@ commands.push({
       const name = interaction.options.getString('name');
       const state = interaction.options.getString('state') === 'enable';
       const channel = interaction.options.getChannel('channel');
-      const patch = { [name]: { enabled: state } };
-      if (channel) patch[name].channelId = channel.id;
+      const currentVal = db.getConfig(guildId)[name];
+      // A few generic modules (e.g. snipeEnabled) store a plain boolean rather than an
+      // { enabled: bool } object — patch the right shape either way.
+      const patch = typeof currentVal === 'boolean'
+        ? { [name]: state }
+        : { [name]: { enabled: state, ...(channel ? { channelId: channel.id } : {}) } };
       const cfg = db.saveConfig(guildId, patch);
-      return interaction.reply({ embeds: [ui.configSummaryEmbed(name, cfg[name])] });
+      const display = typeof cfg[name] === 'boolean' ? { enabled: cfg[name] } : cfg[name];
+      return interaction.reply({ embeds: [ui.configSummaryEmbed(name, display)] });
     }
 
-    const patch = {};
-    const state = interaction.options.getString('state');
-    if (sub === 'antinuke') {
-      patch.antinuke = {};
-      if (state) patch.antinuke.enabled = state === 'enable';
-      const punishment = interaction.options.getString('punishment'); if (punishment) patch.antinuke.punishment = punishment;
-      const threshold = interaction.options.getInteger('threshold');
-      if (threshold) Object.assign(patch.antinuke, {
-        maxChannelDeletes: threshold, maxChannelCreates: threshold, maxRoleDeletes: threshold,
-        maxRoleCreates: threshold, maxBans: threshold, maxKicks: threshold, maxWebhookCreates: threshold, maxRoleUpdates: threshold
-      });
-      const win = interaction.options.getInteger('window_seconds'); if (win) patch.antinuke.windowSeconds = win;
-    } else if (sub === 'antilink') {
-      patch.antilink = {};
-      if (state) patch.antilink.enabled = state === 'enable';
-      const mode = interaction.options.getString('mode'); if (mode) patch.antilink.mode = mode;
-      const role = interaction.options.getRole('bypass_role'); if (role) patch.antilink.bypassRoleId = role.id;
-    } else if (sub === 'antispam') {
-      patch.antispam = {};
-      if (state) patch.antispam.enabled = state === 'enable';
-      const mm = interaction.options.getInteger('max_messages'); if (mm) patch.antispam.maxMessages = mm;
-      const win = interaction.options.getInteger('window_seconds'); if (win) patch.antispam.windowSeconds = win;
-      const p = interaction.options.getString('punishment'); if (p) patch.antispam.punishment = p;
-    } else if (sub === 'antiraid') {
-      patch.antiraid = {};
-      if (state) patch.antiraid.enabled = state === 'enable';
-      const jt = interaction.options.getInteger('join_threshold'); if (jt) patch.antiraid.joinThreshold = jt;
-      const win = interaction.options.getInteger('window_seconds'); if (win) patch.antiraid.windowSeconds = win;
-      const age = interaction.options.getInteger('min_account_age_days'); if (age !== null) patch.antiraid.minAccountAgeDays = age;
-      const act = interaction.options.getString('action'); if (act) patch.antiraid.action = act;
-    } else if (sub === 'voicemaster') {
-      patch.voicemaster = {};
-      if (state) patch.voicemaster.enabled = state === 'enable';
-      const hub = interaction.options.getChannel('hub_channel'); if (hub) patch.voicemaster.hubChannelId = hub.id;
-      const cat = interaction.options.getChannel('category'); if (cat) patch.voicemaster.categoryId = cat.id;
-    } else if (sub === 'greetmessage') {
-      patch.greetmessage = {};
-      if (state) patch.greetmessage.enabled = state === 'enable';
-      const ch = interaction.options.getChannel('channel'); if (ch) patch.greetmessage.channelId = ch.id;
-      const msg = interaction.options.getString('message'); if (msg) patch.greetmessage.message = msg;
-    } else if (sub === 'leveling') {
-      patch.leveling = {};
-      if (state) patch.leveling.enabled = state === 'enable';
-      const ch = interaction.options.getChannel('channel'); if (ch) patch.leveling.channel = ch.id;
-      const xp = interaction.options.getInteger('xp_per_message'); if (xp) patch.leveling.xpPerMessage = xp;
-      const cd = interaction.options.getInteger('cooldown_seconds'); if (cd) patch.leveling.cooldownSeconds = cd;
-      const rl = interaction.options.getInteger('reward_level'); const rr = interaction.options.getRole('reward_role');
-      if (rl && rr) {
-        const current = db.getConfig(guildId).leveling.roleRewards;
-        patch.leveling.roleRewards = { ...current, [String(rl)]: rr.id };
-      }
-    } else if (sub === 'tickets') {
-      patch.ticket = {};
-      if (state) patch.ticket.enabled = state === 'enable';
-      const cat = interaction.options.getChannel('category'); if (cat) patch.ticket.categoryId = cat.id;
-      const role = interaction.options.getRole('support_role'); if (role) patch.ticket.supportRoleId = role.id;
-      const log = interaction.options.getChannel('log_channel'); if (log) patch.ticket.logChannelId = log.id;
-    } else if (sub === 'logs') {
+    if (sub === 'logs') {
       const type = interaction.options.getString('type');
       const channel = interaction.options.getChannel('channel');
-      patch.logs = { [type]: channel.id };
+      const cfg = db.saveConfig(guildId, { logs: { [type]: channel.id } });
+      return interaction.reply({ embeds: [ui.configSummaryEmbed('logs', cfg.logs)] });
     }
 
+    // Every other subcommand is one of the 8 panel modules: apply whatever options were passed
+    // (none of them are required, so `/setup antinuke` alone just opens the panel unchanged),
+    // then always reply with the full interactive panel — never a static, dead-end summary.
+    const o = extractModuleOptions(sub, interaction);
+    const patch = buildModulePatch(sub, guildId, o);
     const cfg = db.saveConfig(guildId, patch);
-    const moduleKey = sub === 'logs' ? 'logs' : (sub === 'tickets' ? 'ticket' : sub);
-    return interaction.reply({ embeds: [ui.configSummaryEmbed(sub, cfg[moduleKey])] });
+    return interaction.reply({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
   }
 });
 
@@ -513,4 +574,4 @@ commands.push({
   }
 });
 
-module.exports = { commands, isOwner };
+module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
