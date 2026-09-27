@@ -247,6 +247,23 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'vm_kick_pick') return handleVMKickPick(interaction);
 
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_category_select') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
+      }
+      const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
+      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_channel_select') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
+      }
+      const cfg = db.saveConfig(interaction.guildId, { voicemaster: { hubChannelId: interaction.values[0] } });
+      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+    }
+    if (interaction.isUserSelectMenu() && interaction.customId === 'ticket_addmember_select') return handleTicketMemberSelect(interaction, 'add');
+    if (interaction.isUserSelectMenu() && interaction.customId === 'ticket_removemember_select') return handleTicketMemberSelect(interaction, 'remove');
+
     if (interaction.isButton()) return handleButton(interaction);
     if (interaction.isModalSubmit()) return handleModal(interaction);
   } catch (err) {
@@ -281,13 +298,44 @@ async function handleButton(interaction) {
       permissionOverwrites: overwrites
     });
     db.createTicket(channel.id, interaction.guildId, interaction.user.id);
-    await channel.send({ embeds: [ui.ticketWelcomeEmbed(interaction.user)], components: [ui.ticketControlRow(false)] });
+    await channel.send({ embeds: [ui.ticketWelcomeEmbed(interaction.user, cfg)], components: [ui.ticketControlRow()] });
     return interaction.reply({ embeds: [ui.okEmbed('🎫 Ticket Created', `Opened ${channel}.`)], ephemeral: true });
   }
-  if (id === 'ticket_claim') {
-    db.setTicketStatus(interaction.channel.id, 'claimed', interaction.user.id);
-    await interaction.update({ components: [ui.ticketControlRow(true)] });
-    return interaction.followUp({ embeds: [ui.okEmbed('🙋 Ticket Claimed', `${interaction.user} claimed this ticket.`)] });
+  if (id === 'staff_controls') {
+    const ticket = db.getTicket(interaction.channel.id);
+    if (!ticket) return interaction.reply({ embeds: [ui.errorEmbed('Not a Ticket', 'This only works inside a ticket channel.')], ephemeral: true });
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+    const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
+    if (!isAdmin && !hasRole) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator.')], ephemeral: true });
+    return interaction.reply({ embeds: [ui.staffControlsEmbed(ticket)], components: ui.staffControlsRow(!!ticket.claimedBy), ephemeral: true });
+  }
+  if (id === 'staff_claim' || id === 'staff_unclaim') {
+    const ticket = db.getTicket(interaction.channel.id);
+    if (!ticket) return interaction.reply({ embeds: [ui.errorEmbed('Not a Ticket', 'This only works inside a ticket channel.')], ephemeral: true });
+    const claiming = !ticket.claimedBy;
+    db.setTicketStatus(interaction.channel.id, ticket.status, claiming ? interaction.user.id : null);
+    // "unclaim" clears claimedBy explicitly since setTicketStatus's COALESCE won't null it out.
+    if (!claiming) db.db.prepare('UPDATE tickets SET claimedBy = NULL WHERE channelId = ?').run(interaction.channel.id);
+    const updated = db.getTicket(interaction.channel.id);
+    await interaction.update({ embeds: [ui.staffControlsEmbed(updated)], components: ui.staffControlsRow(!!updated.claimedBy) });
+    return interaction.followUp({ embeds: [ui.okEmbed(claiming ? '🙋 Ticket Claimed' : '↩️ Ticket Unclaimed', claiming ? `${interaction.user} claimed this ticket.` : `${interaction.user} unclaimed this ticket.`)] });
+  }
+  if (id === 'staff_addmember' || id === 'staff_removemember') {
+    const action = id === 'staff_addmember' ? 'add' : 'remove';
+    return interaction.reply({ embeds: [ui.ticketMemberPromptEmbed(action)], components: [ui.ticketMemberSelectRow(action)], ephemeral: true });
+  }
+  if (id === 'staff_delete') {
+    const ticket = db.getTicket(interaction.channel.id);
+    db.setTicketStatus(interaction.channel.id, 'closed');
+    await interaction.reply({ embeds: [ui.warnEmbed('🗑️ Deleting Ticket', 'This channel is being deleted now.')] });
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    if (ticketCfg.logChannelId) {
+      const log = interaction.guild.channels.cache.get(ticketCfg.logChannelId);
+      if (log) log.send({ embeds: [ui.base('🗑️ Ticket Deleted').setDescription(`Ticket by <@${ticket?.userId}> deleted by ${interaction.user}.`)] }).catch(() => {});
+    }
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 1500);
+    return;
   }
   if (id === 'ticket_close') {
     const ticket = db.getTicket(interaction.channel.id);
@@ -302,7 +350,20 @@ async function handleButton(interaction) {
     return;
   }
 
-  // ---- Voicemaster ----
+  // ---- Voicemaster: dedicated setup panel (admin-only, from /setup voicemaster) ----
+  if (id === 'vm_setup_category' || id === 'vm_setup_channel' || id === 'vm_setup_toggle') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
+    }
+    if (id === 'vm_setup_category') return interaction.reply({ embeds: [ui.vmCategoryPromptEmbed()], components: [ui.vmCategorySelectRow()], ephemeral: true });
+    if (id === 'vm_setup_channel') return interaction.reply({ embeds: [ui.vmChannelPromptEmbed()], components: [ui.vmChannelSelectRow()], ephemeral: true });
+    // toggle
+    const current = db.getConfig(interaction.guildId).voicemaster.enabled;
+    const cfg = db.saveConfig(interaction.guildId, { voicemaster: { enabled: !current } });
+    return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+  }
+
+  // ---- Voicemaster: per-channel owner controls (Lock/Hide/Rename/Limit/Kick/Transfer) ----
   if (id.startsWith('vm_')) {
     const vc = interaction.member.voice.channel;
     if (!vc || !db.getVMChannel(vc.id)) return interaction.reply({ embeds: [ui.errorEmbed('No Channel', 'Join a voicemaster channel first.')], ephemeral: true });
@@ -367,6 +428,20 @@ async function handleVMKickPick(interaction) {
   return interaction.update({ embeds: [ui.vmKickedEmbed(member.user.tag)], components: [] });
 }
 
+// Handles the UserSelectMenu opened by the Staff Controls "Add Member" / "Remove Member"
+// buttons — grants or revokes that member's view/send access on the ticket channel.
+async function handleTicketMemberSelect(interaction, action) {
+  const ticket = db.getTicket(interaction.channel.id);
+  if (!ticket) return interaction.update({ embeds: [ui.errorEmbed('Not a Ticket', 'This only works inside a ticket channel.')], components: [] });
+  const userId = interaction.values[0];
+  if (action === 'add') {
+    await interaction.channel.permissionOverwrites.edit(userId, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+    return interaction.update({ embeds: [ui.okEmbed('➕ Member Added', `<@${userId}> can now see this ticket.`)], components: [] });
+  }
+  await interaction.channel.permissionOverwrites.delete(userId).catch(() => {});
+  return interaction.update({ embeds: [ui.okEmbed('➖ Member Removed', `<@${userId}> can no longer see this ticket.`)], components: [] });
+}
+
 // Field spec for each panel module's "Edit Settings" modal. `oKey` matches the flat key
 // buildModulePatch() (in commands.js) expects; `parse` turns the raw text field into that
 // shape (IDs are stored as plain strings, buildModulePatch only ever needs `.id`).
@@ -397,7 +472,8 @@ const SETUP_EDIT_FIELDS = {
   ],
   greetmessage: [
     { key: 'channel', oKey: 'channel_id', label: 'Welcome channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.greetmessage.channelId || '' },
-    { key: 'message', oKey: 'message', label: 'Message (use {user} and {server})', parse: v => v, get: cfg => cfg.greetmessage.message || '' }
+    { key: 'message', oKey: 'message', label: 'Message (use {user} and {server})', parse: v => v, get: cfg => cfg.greetmessage.message || '' },
+    { key: 'image', oKey: 'image', label: 'Image/GIF URL (optional)', parse: v => v, get: cfg => cfg.greetmessage.image || '' }
   ],
   leveling: [
     { key: 'channel', oKey: 'channel_id', label: 'Level-up announcement channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.leveling.channel || '' },
@@ -483,6 +559,10 @@ client.on('guildMemberAdd', async (member) => {
   if (cfg.greetmessage.enabled && cfg.greetmessage.channelId) {
     const ch = member.guild.channels.cache.get(cfg.greetmessage.channelId);
     const text = cfg.greetmessage.message.replace('{user}', `${member}`).replace('{server}', member.guild.name);
+    if (cfg.greetmessage.image) {
+      const embed = ui.okEmbed('👋 Welcome!', text).setImage(cfg.greetmessage.image);
+      if (ch?.isTextBased()) ch.send({ embeds: [embed] }).catch(() => {});
+    } else
     if (ch?.isTextBased()) ch.send({ embeds: [ui.okEmbed('👋 Welcome', text)] }).catch(() => {});
   }
   if (cfg.autorole.enabled && cfg.autorole.roleId) member.roles.add(cfg.autorole.roleId).catch(() => {});
