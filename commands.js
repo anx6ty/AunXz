@@ -77,7 +77,8 @@ const setupCmd = new SlashCommandBuilder()
   .addSubcommand(s => s.setName('greetmessage').setDescription('Configure the text welcome message.')
     .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
     .addChannelOption(o => o.setName('channel').setDescription('channel to post in').addChannelTypes(ChannelType.GuildText))
-    .addStringOption(o => o.setName('message').setDescription('use {user} and {server}')))
+    .addStringOption(o => o.setName('message').setDescription('use {user} and {server}'))
+    .addStringOption(o => o.setName('image').setDescription('image/GIF URL shown with the greet message')))
   .addSubcommand(s => s.setName('leveling').setDescription('Configure the XP/leveling system.')
     .addStringOption(o => o.setName('state').setDescription('enable/disable').addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }))
     .addChannelOption(o => o.setName('channel').setDescription('level-up announcement channel').addChannelTypes(ChannelType.GuildText))
@@ -133,6 +134,7 @@ function extractModuleOptions(sub, interaction) {
   } else if (sub === 'greetmessage') {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.message = interaction.options.getString('message');
+    o.image = interaction.options.getString('image');
   } else if (sub === 'leveling') {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.xp_per_message = interaction.options.getInteger('xp_per_message');
@@ -190,6 +192,7 @@ function buildModulePatch(sub, guildId, o) {
     if (state) patch.greetmessage.enabled = state === 'enable';
     if (o.channel_id) patch.greetmessage.channelId = o.channel_id;
     if (o.message) patch.greetmessage.message = o.message;
+    if (o.image) patch.greetmessage.image = o.image;
   } else if (sub === 'leveling') {
     patch.leveling = {};
     if (state) patch.leveling.enabled = state === 'enable';
@@ -249,6 +252,12 @@ commands.push({
     const o = extractModuleOptions(sub, interaction);
     const patch = buildModulePatch(sub, guildId, o);
     const cfg = db.saveConfig(guildId, patch);
+
+    // Voicemaster gets its own dedicated 3-button panel (Category / Voice Channel /
+    // Enable-Disable) instead of the generic edit-modal panel every other module uses.
+    if (sub === 'voicemaster') {
+      return interaction.reply({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+    }
     return interaction.reply({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
   }
 });
@@ -506,8 +515,134 @@ commands.push({
   async execute(interaction) {
     const cfg = db.getConfig(interaction.guildId).ticket;
     if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Run `/setup tickets state:enable` first.')], ephemeral: true });
-    await interaction.channel.send({ embeds: [ui.ticketPanelEmbed(interaction.guild.name)], components: [ui.ticketPanelRow()] });
+    await interaction.channel.send({ embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg)], components: [ui.ticketPanelRow()] });
     await interaction.reply({ embeds: [ui.okEmbed('✅ Panel Posted', 'The ticket panel is live.')], ephemeral: true });
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /ticketconfig — the picture + message shown on the panel and inside every new ticket
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder().setName('ticketconfig').setDescription('Customize the ticket panel and welcome embed (images + text).')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('panel_title').setDescription('Title of the "Open Ticket" panel'))
+    .addStringOption(o => o.setName('panel_description').setDescription('Body text of the "Open Ticket" panel'))
+    .addStringOption(o => o.setName('panel_thumbnail').setDescription('Small image URL for the panel (top-right)'))
+    .addStringOption(o => o.setName('panel_image').setDescription('Big banner image/GIF URL for the panel'))
+    .addStringOption(o => o.setName('category_label').setDescription('Category name shown when a ticket opens, e.g. "General Support"'))
+    .addStringOption(o => o.setName('welcome_message').setDescription('Extra line shown under Welcome/Category in a new ticket'))
+    .addStringOption(o => o.setName('welcome_thumbnail').setDescription('Small image URL shown in a new ticket (top-right)'))
+    .addStringOption(o => o.setName('welcome_image').setDescription('Big banner image/GIF URL shown in a new ticket')),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const map = {
+      panel_title: 'panelTitle', panel_description: 'panelDescription', panel_thumbnail: 'panelThumbnail', panel_image: 'panelImage',
+      category_label: 'categoryLabel', welcome_message: 'welcomeMessage', welcome_thumbnail: 'welcomeThumbnail', welcome_image: 'welcomeImage'
+    };
+    const patch = { ticket: {} };
+    let changed = false;
+    for (const [opt, key] of Object.entries(map)) {
+      const val = interaction.options.getString(opt);
+      if (val !== null) { patch.ticket[key] = val; changed = true; }
+    }
+    const cfg = changed ? db.saveConfig(interaction.guildId, patch).ticket : db.getConfig(interaction.guildId).ticket;
+    await interaction.reply({
+      content: changed ? '✅ Ticket appearance updated. Previews below:' : 'Current ticket appearance — previews below:',
+      embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg), ui.ticketWelcomeEmbed(interaction.user, cfg)],
+      ephemeral: true
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// Dedicated ticket-action commands — usable inside a ticket channel by staff/admins,
+// as an alternative to the Staff Controls buttons.
+// ---------------------------------------------------------------------------------
+function requireTicketStaff(interaction, ticketCfg) {
+  const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+  const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
+  if (!isAdmin && !hasRole) {
+    interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator to manage tickets.')], ephemeral: true });
+    return false;
+  }
+  return true;
+}
+function requireInTicket(interaction) {
+  const ticket = db.getTicket(interaction.channel.id);
+  if (!ticket) {
+    interaction.reply({ embeds: [ui.errorEmbed('Not a Ticket', 'This command only works inside a ticket channel.')], ephemeral: true });
+    return null;
+  }
+  return ticket;
+}
+
+commands.push({
+  data: new SlashCommandBuilder().setName('claim').setDescription('Claim this ticket.'),
+  async execute(interaction) {
+    const ticket = requireInTicket(interaction); if (!ticket) return;
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    if (!requireTicketStaff(interaction, ticketCfg)) return;
+    if (ticket.claimedBy) return interaction.reply({ embeds: [ui.warnEmbed('Already Claimed', `Already claimed by <@${ticket.claimedBy}>.`)], ephemeral: true });
+    db.setTicketStatus(interaction.channel.id, 'claimed', interaction.user.id);
+    await interaction.reply({ embeds: [ui.okEmbed('🙋 Ticket Claimed', `${interaction.user} claimed this ticket.`)] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('close').setDescription('Close this ticket (deletes it shortly after).'),
+  async execute(interaction) {
+    const ticket = requireInTicket(interaction); if (!ticket) return;
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    if (!requireTicketStaff(interaction, ticketCfg) && interaction.user.id !== ticket.userId) return;
+    db.setTicketStatus(interaction.channel.id, 'closed');
+    await interaction.reply({ embeds: [ui.warnEmbed('🔒 Closing Ticket', `Closed by ${interaction.user}. This channel will be deleted in 5 seconds.`)] });
+    if (ticketCfg.logChannelId) {
+      const log = interaction.guild.channels.cache.get(ticketCfg.logChannelId);
+      if (log) log.send({ embeds: [ui.base('🎫 Ticket Closed').setDescription(`Ticket by <@${ticket.userId}> closed by ${interaction.user}.`)] }).catch(() => {});
+    }
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('delete').setDescription('Immediately delete this ticket, no grace period.'),
+  async execute(interaction) {
+    const ticket = requireInTicket(interaction); if (!ticket) return;
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    if (!requireTicketStaff(interaction, ticketCfg)) return;
+    await interaction.reply({ embeds: [ui.warnEmbed('🗑️ Deleting Ticket', 'This channel is being deleted now.')] });
+    if (ticketCfg.logChannelId) {
+      const log = interaction.guild.channels.cache.get(ticketCfg.logChannelId);
+      if (log) log.send({ embeds: [ui.base('🗑️ Ticket Deleted').setDescription(`Ticket by <@${ticket.userId}> deleted by ${interaction.user}.`)] }).catch(() => {});
+    }
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 1500);
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('addmembertoticket').setDescription('Add a member to this ticket.')
+    .addUserOption(o => o.setName('user').setDescription('member to add').setRequired(true)),
+  async execute(interaction) {
+    const ticket = requireInTicket(interaction); if (!ticket) return;
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    if (!requireTicketStaff(interaction, ticketCfg)) return;
+    const user = interaction.options.getUser('user');
+    await interaction.channel.permissionOverwrites.edit(user.id, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+    await interaction.reply({ embeds: [ui.okEmbed('➕ Member Added', `${user} can now see this ticket.`)] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('removemembertoticket').setDescription('Remove a member from this ticket.')
+    .addUserOption(o => o.setName('user').setDescription('member to remove').setRequired(true)),
+  async execute(interaction) {
+    const ticket = requireInTicket(interaction); if (!ticket) return;
+    const ticketCfg = db.getConfig(interaction.guildId).ticket;
+    if (!requireTicketStaff(interaction, ticketCfg)) return;
+    const user = interaction.options.getUser('user');
+    await interaction.channel.permissionOverwrites.delete(user.id).catch(() => {});
+    await interaction.reply({ embeds: [ui.okEmbed('➖ Member Removed', `${user} can no longer see this ticket.`)] });
   }
 });
 
@@ -526,6 +661,73 @@ commands.push({
     if (!prefix) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Prefix', 'Prefix can\'t be empty.')], ephemeral: true });
     db.saveConfig(interaction.guildId, { prefix });
     await interaction.reply({ embeds: [ui.okEmbed('✅ Prefix Updated', `Text commands now use \`${prefix}\`. Example: \`${prefix}help\``)] });
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /testgreet — preview the greet message (supports a picture/GIF) without a real member join
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder().setName('testgreet').setDescription('Preview the greet message, optionally with a custom image or GIF.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('message').setDescription('override text, use {user} and {server} (defaults to the configured message)'))
+    .addStringOption(o => o.setName('image').setDescription('image/GIF URL to attach (defaults to the configured one, if any)'))
+    .addAttachmentOption(o => o.setName('attachment').setDescription('upload an image/GIF directly instead of a URL'))
+    .addChannelOption(o => o.setName('channel').setDescription('post the preview here instead of this channel').addChannelTypes(ChannelType.GuildText)),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const cfg = db.getConfig(interaction.guildId).greetmessage;
+    const attachment = interaction.options.getAttachment('attachment');
+    const imageUrl = attachment ? attachment.url : (interaction.options.getString('image') || cfg.image || null);
+    const text = (interaction.options.getString('message') || cfg.message || 'Welcome {user}!')
+      .replace('{user}', `${interaction.user}`).replace('{server}', interaction.guild.name);
+    const embed = ui.okEmbed('👋 Welcome! (Test)', text);
+    if (imageUrl) embed.setImage(imageUrl);
+    const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+    await targetChannel.send({ embeds: [embed] });
+    if (targetChannel.id !== interaction.channel.id) {
+      await interaction.reply({ embeds: [ui.okEmbed('✅ Preview Sent', `Posted in ${targetChannel}.`)], ephemeral: true });
+    } else {
+      await interaction.reply({ content: '✅ Preview posted above (this test does not save the image as your permanent config — use `/setup greetmessage` for that).', ephemeral: true });
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /xp — admin XP management
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder().setName('xp').setDescription('Manage a member\'s XP/level.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addSubcommand(s => s.setName('add').setDescription('add XP to a member')
+      .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('XP to add').setRequired(true)))
+    .addSubcommand(s => s.setName('remove').setDescription('remove XP from a member')
+      .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('XP to remove').setRequired(true)))
+    .addSubcommand(s => s.setName('set').setDescription('set a member\'s XP directly')
+      .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('new XP total').setRequired(true)))
+    .addSubcommand(s => s.setName('setlevel').setDescription('set a member\'s level directly')
+      .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))
+      .addIntegerOption(o => o.setName('level').setDescription('new level').setRequired(true)))
+    .addSubcommand(s => s.setName('reset').setDescription('reset a member\'s XP and level to 0')
+      .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))),
+  async execute(interaction) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Moderate Members** or **Administrator**.')], ephemeral: true });
+    }
+    const sub = interaction.options.getSubcommand();
+    const user = interaction.options.getUser('user');
+    const rec = db.getLevel(interaction.guildId, user.id);
+    let xp = rec.xp, level = rec.level;
+    if (sub === 'add') xp = Math.max(0, xp + interaction.options.getInteger('amount'));
+    else if (sub === 'remove') xp = Math.max(0, xp - interaction.options.getInteger('amount'));
+    else if (sub === 'set') xp = Math.max(0, interaction.options.getInteger('amount'));
+    else if (sub === 'setlevel') level = Math.max(0, interaction.options.getInteger('level'));
+    else if (sub === 'reset') { xp = 0; level = 0; }
+    db.setLevel(interaction.guildId, user.id, xp, level, rec.lastMessage);
+    await interaction.reply({ embeds: [ui.okEmbed('📈 XP Updated', `${user} — **Level:** ${level} **XP:** ${xp}`)] });
   }
 });
 
@@ -556,6 +758,33 @@ commands.push({
     const list = sub === 'add' ? [...new Set([...cfg.blacklist, user.id])] : cfg.blacklist.filter(id => id !== user.id);
     db.saveConfig(interaction.guildId, { blacklist: list });
     await interaction.reply({ embeds: [ui.okEmbed('✅ Blacklist Updated', `${user} ${sub === 'add' ? 'blocked' : 'unblocked'}.`)] });
+  }
+});
+commands.push({
+  ownerOnly: true,
+  data: new SlashCommandBuilder().setName('emojis').setDescription('[Owner] View or change every emoji the bot uses (buttons, embeds, everywhere).')
+    .addSubcommand(s => s.setName('list').setDescription('show every emoji currently in use'))
+    .addSubcommand(s => s.setName('set').setDescription('override one emoji')
+      .addStringOption(o => o.setName('name').setDescription('which emoji to change').setRequired(true).addChoices(...ui.EMOJI_KEYS.map(k => ({ name: k, value: k }))))
+      .addStringOption(o => o.setName('value').setDescription('new emoji (unicode emoji or <a:name:id> custom emoji)').setRequired(true)))
+    .addSubcommand(s => s.setName('reset').setDescription('revert one emoji to its default')
+      .addStringOption(o => o.setName('name').setDescription('which emoji to reset').setRequired(true).addChoices(...ui.EMOJI_KEYS.map(k => ({ name: k, value: k }))))),
+  async execute(interaction) {
+    if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'list') {
+      return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides())], ephemeral: true });
+    }
+    const name = interaction.options.getString('name');
+    if (sub === 'set') {
+      const value = interaction.options.getString('value');
+      db.setEmojiOverride(name, value);
+      return interaction.reply({ embeds: [ui.okEmbed('✅ Emoji Updated', `**${name}** is now ${value} — every button/embed using it updates immediately, bot-wide.`)] });
+    }
+    if (sub === 'reset') {
+      db.resetEmojiOverride(name);
+      return interaction.reply({ embeds: [ui.okEmbed('✅ Emoji Reset', `**${name}** is back to its default: ${ui.DEFAULT_EMOJIS[name]}`)] });
+    }
   }
 });
 commands.push({
