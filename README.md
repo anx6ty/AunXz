@@ -47,8 +47,38 @@ pile of unrelated buttons."
 - `/setup antinuke state:enable punishment:ban` (then repeat per module: antilink, antispam,
   antiraid, voicemaster, leveling, tickets, greetmessage; `/setup logs` to route log channels;
   `/setup module` for the other 12+ smaller toggles; `/setup list` to see all module names).
+  `/setup voicemaster` replies with a dedicated 3-button panel — **Category** and **Voice
+  Channel** each open a native Discord channel picker (every category / every voice channel in
+  the server), **Enable/Disable** flips the module.
 - `/greetvoice role:<@role> vc:<#channel> prompt:<text>` — locks the role to that VC everywhere
   (updates automatically on new channels), joins the VC immediately and stays connected, and on
   every future join by a gated member plays the TTS prompt, then disconnects them and removes
   the role.
-- `/ticketpanel` — after `/setup tickets`, posts the Open Ticket button.
+- `/setup greetmessage` (or `/testgreet` to preview first) — the text welcome message, now with
+  an optional `image` URL/GIF attached to the embed.
+- `/ticketpanel` — after `/setup tickets`, posts the Open Ticket button (matches the screenshot
+  layout: one embed, buttons attached directly beneath it in the same message).
+- `/ticketconfig` — fully customize that panel and the embed posted inside every new ticket:
+  title, description, thumbnail, banner image/GIF, and the "Category: ..." label — no code
+  changes needed.
+- Inside a ticket channel: `/claim`, `/close`, `/delete`, `/addmembertoticket`,
+  `/removemembertoticket` — the same actions as the "Staff Controls" button, as standalone
+  commands.
+- `/emojis list` / `/emojis set name:<key> value:<emoji>` / `/emojis reset name:<key>` —
+  **[Owner only]** every emoji used anywhere in the bot (buttons, embeds) is looked up by a
+  name (e.g. `ticket_open`, `claim`, `lock`); this lets you restyle all of them without touching
+  code.
+- `/xp add|remove|set|setlevel|reset` — admin XP management for the leveling system.
+
+## A note on "500 commands"
+Discord's API hard-caps every bot at **100 global slash commands** (200 if scoped to a single
+server) — this is a platform limit, not something any bot can raise. What *can* go arbitrarily
+deep is **subcommands**: one top-level command like `/setup` can hold up to 25 subcommands, and
+with subcommand *groups* a single command can expose up to 25 groups × 25 subcommands (625)
+distinct actions, each still typed and validated by Discord like its own command. This bot
+currently ships ~33 top-level commands with room to spare under the 100 cap, and modules like
+`/setup` already use subcommands per module. If the goal is "every module option reachable as
+its own typed command," the sustainable path is converting `/setup <module> <option>` into
+`/setup <module>` subcommand *groups* (e.g. `/setup antinuke punishment`, `/setup antinuke
+threshold`, `/setup antinuke state`) rather than literal separate top-level commands — happy to
+do that pass module-by-module on request.
