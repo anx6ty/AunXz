@@ -18,6 +18,66 @@ const WARN = 0xfee75c;
 const DANGER = 0xed4245;
 const BRAND_FOOTER = 'AIO • all-in-one';
 
+
+// ---------------- DISCORD COMPONENTS V2 PANELS ----------------
+// Classic Discord embeds cannot contain buttons. Components V2 containers can render
+// the embed-like content and its buttons/select menus as one unified bordered panel.
+const COMPONENTS_V2_FLAG = 1 << 15;
+
+function componentJson(value) {
+  return value && typeof value.toJSON === 'function' ? value.toJSON() : value;
+}
+
+function embedToV2Parts(embed) {
+  const e = componentJson(embed) || {};
+  const parts = [];
+  const lines = [];
+  if (e.author?.name) lines.push(`-# ${e.author.name}`);
+  if (e.title) lines.push(`## ${e.title}`);
+  if (e.description) lines.push(e.description);
+  if (e.fields?.length) {
+    for (const field of e.fields) lines.push(`**${field.name || ''}**\n${field.value || ''}`);
+  }
+  if (e.footer?.text) lines.push(`-# ${e.footer.text}`);
+  if (lines.length) parts.push({ type: 10, content: lines.join('\n\n') });
+
+  const media = [];
+  if (e.image?.url) media.push({ media: { url: e.image.url }, description: e.title || 'Image' });
+  if (e.thumbnail?.url) media.push({ media: { url: e.thumbnail.url }, description: e.title || 'Thumbnail' });
+  if (media.length) parts.push({ type: 12, items: media });
+  return parts;
+}
+
+function toComponentsV2(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (payload.flags && (Number(payload.flags) & COMPONENTS_V2_FLAG)) return payload;
+  if (!Array.isArray(payload.embeds) || !payload.embeds.length) return payload;
+  if (!Array.isArray(payload.components) || !payload.components.length) return payload;
+
+  const panel = [];
+  for (let i = 0; i < payload.embeds.length; i++) {
+    panel.push(...embedToV2Parts(payload.embeds[i]));
+    if (i < payload.embeds.length - 1) panel.push({ type: 14, spacing: 1 });
+  }
+  if (payload.content) panel.unshift({ type: 10, content: String(payload.content) });
+  if (panel.length) panel.push({ type: 14, spacing: 1 });
+
+  for (const row of payload.components) panel.push(componentJson(row));
+
+  const container = { type: 17, components: panel.slice(0, 10) };
+  const first = componentJson(payload.embeds[0]) || {};
+  if (first.color != null) container.accent_color = first.color;
+
+  const out = {
+    ...payload,
+    components: [container],
+    flags: (Number(payload.flags) || 0) | COMPONENTS_V2_FLAG
+  };
+  delete out.embeds;
+  delete out.content;
+  return out;
+}
+
 // ---------------- EMOJI REGISTRY ----------------
 // Every distinct emoji found in the bot UI has one canonical key. The override is stored
 // in SQLite, so changing an emoji takes effect immediately without a restart.
@@ -435,5 +495,6 @@ module.exports = {
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
-  SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
+  SETUP_MODULE_META, setupPanelEmbed, setupPanelRow,
+  toComponentsV2, COMPONENTS_V2_FLAG
 };
