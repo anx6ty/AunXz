@@ -53,7 +53,9 @@ function toComponentsV2(payload, force = false) {
   if (payload.flags && (Number(payload.flags) & COMPONENTS_V2_FLAG)) return payload;
 
   const embeds = Array.isArray(payload.embeds) ? payload.embeds.filter(Boolean) : [];
-  const rawComponents = Array.isArray(payload.components) ? payload.components.flat(Infinity).filter(Boolean) : [];
+  const rawComponents = payload.components
+    ? (Array.isArray(payload.components) ? payload.components.flat(Infinity).filter(Boolean) : [payload.components])
+    : [];
   const hasInteractiveComponents = rawComponents.length > 0;
   if (!force && !embeds.length && !hasInteractiveComponents) return payload;
   if (!embeds.length && !hasInteractiveComponents) return payload;
@@ -239,7 +241,7 @@ function helpSelectRow() {
     .addOptions(Object.entries(HELP_CATEGORIES).map(([value, c]) => ({
       label: c.name, value, emoji: emoji(c.emojiKey)
     })));
-  return new ActionRowBuilder().addComponents(menu);
+  return [new ActionRowBuilder().addComponents(menu)];
 }
 
 // ---------------- GENERIC CONFIRM / TOGGLE BUTTONS ----------------
