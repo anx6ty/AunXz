@@ -3,9 +3,12 @@
 // system testable/readable on its own.
 
 const { PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 const {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
-  AudioPlayerStatus, VoiceConnectionStatus, entersState, getVoiceConnection
+  AudioPlayerStatus, VoiceConnectionStatus, entersState, getVoiceConnection,
+  StreamType
 } = require('@discordjs/voice');
 const googleTTS = require('google-tts-api');
 const db = require('./database');
@@ -40,26 +43,87 @@ async function joinAndStayInVC(voiceChannel) {
   return connection;
 }
 
-// Plays a TTS prompt in the given VC and resolves once playback finishes.
+// Plays a TTS prompt in the given VC and resolves when playback finishes.
+// Google TTS returns MP3. We explicitly decode it through the bundled FFmpeg binary
+// into raw 48 kHz stereo PCM so Discord's voice player can reliably play it.
 async function playTTSInChannel(guild, vcId, prompt) {
   const channel = guild.channels.cache.get(vcId);
-  if (!channel) return;
+  if (!channel || !channel.isVoiceBased?.()) throw new Error('Configured greetvoice channel was not found.');
+
+  const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+  if (!me) throw new Error('Could not resolve the bot member.');
+  const perms = channel.permissionsFor(me);
+  if (perms && (!perms.has(PermissionFlagsBits.Connect) || !perms.has(PermissionFlagsBits.Speak))) {
+    throw new Error('The bot needs Connect and Speak permissions in the greetvoice channel.');
+  }
+  if (!ffmpegPath) throw new Error('ffmpeg-static is not available. Run npm install.');
+
   const connection = await joinAndStayInVC(channel);
+  await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+
+  const text = String(prompt || 'Welcome!').trim().slice(0, 500);
+  if (!text) throw new Error('The greetvoice TTS prompt is empty.');
+
+  const url = googleTTS.getAudioUrl(text, {
+    lang: 'en',
+    slow: false,
+    host: 'https://translate.google.com'
+  });
+
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 AunXz-GreetVoice' }
+  });
+  if (!response.ok) throw new Error(`Google TTS returned HTTP ${response.status}.`);
+  const audioBuffer = Buffer.from(await response.arrayBuffer());
+  if (!audioBuffer.length) throw new Error('Google TTS returned an empty audio file.');
+
+  const ffmpeg = spawn(ffmpegPath, [
+    '-hide_banner', '-loglevel', 'error',
+    '-i', 'pipe:0',
+    '-f', 's16le', '-ar', '48000', '-ac', '2',
+    'pipe:1'
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  let ffmpegError = '';
+  ffmpeg.stderr.on('data', chunk => { ffmpegError += chunk.toString(); });
+  ffmpeg.stdin.end(audioBuffer);
+
   const player = createAudioPlayer();
   connection.subscribe(player);
+  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
 
-  const text = (prompt || 'Welcome!').slice(0, 200);
-  const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
-  const resource = createAudioResource(url);
-  player.play(resource);
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err); else resolve();
+    };
 
-  await new Promise((resolve) => {
-    player.once(AudioPlayerStatus.Idle, resolve);
-    player.once('error', resolve);
-    setTimeout(resolve, 15000); // safety timeout so a bad TTS response can't hang the flow forever
+    const timer = setTimeout(() => {
+      try { player.stop(true); } catch {}
+      try { ffmpeg.kill('SIGKILL'); } catch {}
+      finish(new Error('TTS playback timed out after 30 seconds.'));
+    }, 30000);
+
+    player.once(AudioPlayerStatus.Playing, () => {});
+    player.once(AudioPlayerStatus.Idle, () => finish());
+    player.once('error', err => finish(err));
+    ffmpeg.once('error', err => finish(err));
+    ffmpeg.once('close', code => {
+      if (code !== 0 && !settled) {
+        finish(new Error(`FFmpeg exited with code ${code}: ${ffmpegError.trim() || 'unknown error'}`));
+      }
+    });
+
+    player.play(resource);
+  }).finally(() => {
+    try { ffmpeg.kill('SIGKILL'); } catch {}
   });
-}
 
+  return true;
+}
 // ===================================================================================
 // ANTINUKE
 // ===================================================================================
@@ -273,8 +337,9 @@ async function onMemberJoinGreetvoice(member) {
 async function onVoiceJoinGreetvoice(oldState, newState) {
   const guild = newState.guild;
   const cfg = db.getConfig(guild.id).greetvoice;
-  if (!cfg.enabled || !cfg.vcId || newState.channelId !== cfg.vcId) return;
+  if (!cfg.enabled || !cfg.vcId || newState.channelId !== cfg.vcId || oldState.channelId === newState.channelId) return;
   const member = newState.member;
+  if (!member || member.user?.bot) return;
   const role = guild.roles.cache.get(cfg.roleId);
   if (!role || !member.roles.cache.has(role.id)) return; // only gate members still holding the role
 
