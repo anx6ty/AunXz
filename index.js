@@ -5,7 +5,7 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
-  StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, PermissionFlagsBits,
+  StringSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent
 } = require('discord.js');
 
@@ -13,6 +13,9 @@ const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
 const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
+
+const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
+const birthdayWishesSent = new Set();
 
 const client = new Client({
   intents: [
@@ -26,26 +29,6 @@ const client = new Client({
   ],
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
 });
-
-
-
-function wrapInteraction(interaction) {
-  const methods = new Set(['reply', 'update', 'followUp', 'editReply']);
-  return new Proxy(interaction, {
-    get(target, prop, receiver) {
-      if (methods.has(prop)) {
-        return (...args) => {
-          if (args.length && args[0] && typeof args[0] === 'object') {
-            args[0] = ui.toComponentsV2(args[0], prop === 'update' || prop === 'editReply');
-          }
-          return target[prop](...args);
-        };
-      }
-      const value = Reflect.get(target, prop, receiver);
-      return typeof value === 'function' ? value.bind(target) : value;
-    }
-  });
-}
 
 // ---------------------------------------------------------------------------------
 // Slash command registration
@@ -74,36 +57,9 @@ async function registerCommands() {
   }
 }
 
-
-async function finishScheduledGiveaway(row) {
-  const fresh = db.getGiveaway(row.id);
-  if (!fresh || fresh.ended) return;
-  if (Date.now() < fresh.endsAt) { scheduleGiveaway(fresh); return; }
-  const entrants = JSON.parse(fresh.entrants || '[]');
-  const pool = [...entrants];
-  const winners = [];
-  while (pool.length && winners.length < fresh.winners) winners.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
-  db.finishGiveaway(fresh.id, entrants);
-  const channel = client.channels.cache.get(fresh.channelId);
-  if (!channel?.isTextBased()) return;
-  const msg = await channel.messages.fetch(fresh.messageId).catch(() => null);
-  if (!msg) return;
-  const winnerText = winners.length ? winners.map(id => `<@${id}>`).join(', ') : 'No valid entrants.';
-  await msg.edit({ embeds: [ui.giveawayEmbed({ id: fresh.id, prize: fresh.prize, winners: fresh.winners, host: `<@${fresh.hostId}>`, endsAt: fresh.endsAt, entrants: entrants.length, ended: true, winnerIds: winners })], components: [] }).catch(() => {});
-  channel.send({ embeds: [ui.okEmbed('🎉 Giveaway Ended', `**${fresh.prize}**\n**Winners:** ${winnerText}\n**Giveaway:** ${fresh.id}`)] }).catch(() => {});
-}
-function scheduleGiveaway(row) {
-  const delay = Math.max(1000, row.endsAt - Date.now());
-  setTimeout(() => finishScheduledGiveaway(row).catch(e => console.error('Giveaway finish failed:', e)), Math.min(delay, 2 ** 31 - 1));
-}
-
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   client.user.setActivity('/help');
-  for (const giveaway of db.getActiveGiveaways()) scheduleGiveaway(giveaway);
-  await runBirthdayWishes().catch(e=>console.error('Birthday check failed:',e));
-  setInterval(() => runBirthdayWishes().catch(e=>console.error('Birthday check failed:',e)), 60 * 60 * 1000);
-  console.log(`Database: ${db.DB_PATH}`);
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
 });
 
@@ -186,7 +142,7 @@ function parseLeafArgs(leafOptions, tokens) {
   return raw;
 }
 
-function usageLines(trigger, json) {
+function usageLines(prefix, json) {
   function walk(options, pathParts) {
     if (!options || !options.length) {
       return [`${prefix}${json.name}${pathParts.length ? ' ' + pathParts.join(' ') : ''}`];
@@ -229,9 +185,9 @@ function buildFakeInteraction(message, json, tokens) {
       getUser: getter, getRole: getter, getChannel: getter, getMentionable: getter,
       getSubcommand: () => schema.subcommand
     },
-    reply: async (payload) => { fake.replied = true; return message.reply(stripEphemeral(ui.toComponentsV2(payload))); },
-    followUp: async (payload) => message.channel.send(stripEphemeral(ui.toComponentsV2(payload))),
-    editReply: async (payload) => message.channel.send(stripEphemeral(ui.toComponentsV2(payload))),
+    reply: async (payload) => { fake.replied = true; return message.reply(stripEphemeral(payload)); },
+    followUp: async (payload) => message.channel.send(stripEphemeral(payload)),
+    editReply: async (payload) => message.channel.send(stripEphemeral(payload)),
     deferReply: async () => { fake.deferred = true; },
     showModal: async () => message.reply({ embeds: [ui.warnEmbed('Slash Command Needed', 'That action opens a popup form — use the `/' + json.name + '` slash command instead.')] })
   };
@@ -243,30 +199,13 @@ function stripEphemeral(payload) {
   return rest;
 }
 
-const PREFIX_ALIASES = {
-  i: 'invites', invite: 'invites', invites: 'invites',
-  mc: 'membercount', membercount: 'membercount',
-  si: 'serverinfo', serverinfo: 'serverinfo',
-  ui: 'userinfo', userinfo: 'userinfo',
-  avatar: 'avatar', pfp: 'avatar',
-  banner: 'banner'
-};
-
 async function handlePrefixCommand(message) {
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
-  const botId = message.client.user?.id;
-  const mentionTriggers = botId ? [`<@${botId}>`, `<@!${botId}>`] : [];
-  const mentionTrigger = mentionTriggers.find(trigger => message.content.startsWith(trigger));
-  const trigger = mentionTrigger || (message.content.startsWith(prefix) ? prefix : null);
-  if (!trigger) return false;
-
-  // Both the configured prefix and a direct bot mention work as command triggers:
-  // !help, <@BOT_ID> help, and <@!BOT_ID> help.
-  const tokens = tokenize(message.content.slice(trigger.length).trim());
-  const typedName = (tokens.shift() || '').toLowerCase();
-  if (!typedName) return false;
-  const cmdName = PREFIX_ALIASES[typedName] || typedName;
+  if (!message.content.startsWith(prefix)) return false;
+  const tokens = tokenize(message.content.slice(prefix.length).trim());
+  const cmdName = (tokens.shift() || '').toLowerCase();
+  if (!cmdName) return false;
   const cmd = commands.find(c => c.data.name === cmdName);
   if (!cmd) return false;
 
@@ -278,114 +217,22 @@ async function handlePrefixCommand(message) {
   const json = cmd.data.toJSON();
   const fake = buildFakeInteraction(message, json, tokens);
   if (!fake) {
-    message.reply(ui.toComponentsV2({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(trigger, json).map(l => `\`${l}\``).join('\n'))] })).catch(() => {});
+    message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
     return true;
   }
   try {
     await cmd.execute(fake);
   } catch (e) {
     console.error(e);
-    message.reply(ui.toComponentsV2({ embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')] })).catch(() => {});
+    message.reply({ embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')] }).catch(() => {});
   }
   return true;
-}
-
-const SETUP_MODAL_SPECS = {
-  automod: {
-    bad_word_filter:[{id:'value',label:'Bad-word filter (true/false)',value:c=>String(c.automod.badWordFilter)}],
-    bad_words:[{id:'value',label:'Blocked words (comma separated)',style:TextInputStyle.Paragraph,value:c=>(c.automod.badWords||[]).join(', ')}],
-    caps_filter:[{id:'value',label:'Caps filter (true/false)',value:c=>String(c.automod.capsFilter)}],
-    caps_threshold:[{id:'value',label:'Caps threshold (1-100)',value:c=>String(c.automod.capsThreshold)}],
-    invite_filter:[{id:'value',label:'Invite filter (true/false)',value:c=>String(c.automod.inviteFilter)}]
-  },
-  antinuke: { punishment: [{ id:'value', label:'Punishment', value:c=>c.antinuke.punishment }], threshold:[{id:'value',label:'Action threshold',value:c=>String(c.antinuke.maxBans)}], window_seconds:[{id:'value',label:'Time window (seconds)',value:c=>String(c.antinuke.windowSeconds)}] },
-  antilink: { mode:[{id:'value',label:'Link action',value:c=>c.antilink.mode}] },
-  antispam: { max_messages:[{id:'value',label:'Max messages',value:c=>String(c.antispam.maxMessages)}], window_seconds:[{id:'value',label:'Window seconds',value:c=>String(c.antispam.windowSeconds)}], punishment:[{id:'value',label:'Spam action',value:c=>c.antispam.punishment}] },
-  antiraid: { join_threshold:[{id:'value',label:'Join threshold',value:c=>String(c.antiraid.joinThreshold)}], window_seconds:[{id:'value',label:'Window seconds',value:c=>String(c.antiraid.windowSeconds)}], min_account_age_days:[{id:'value',label:'Minimum account age (days)',value:c=>String(c.antiraid.minAccountAgeDays)}], action:[{id:'value',label:'Raid action',value:c=>c.antiraid.action}] },
-  greetmessage: { message:[{id:'value',label:'Welcome message',style:TextInputStyle.Paragraph,value:c=>c.greetmessage.message||''}], image:[{id:'value',label:'Image/GIF URL',value:c=>c.greetmessage.image||''}] },
-  leveling: { xp_per_message:[{id:'value',label:'XP per message',value:c=>String(c.leveling.xpPerMessage)}], cooldown_seconds:[{id:'value',label:'Cooldown seconds',value:c=>String(c.leveling.cooldownSeconds)}], level_up_message:[{id:'value',label:'Level-up message',style:TextInputStyle.Paragraph,value:c=>c.leveling.levelUpMessage||''}] },
-  tickets: {
-    panel_text:[{id:'title',label:'Panel title',value:c=>c.ticket.panelTitle||''},{id:'description',label:'Panel message',style:TextInputStyle.Paragraph,value:c=>c.ticket.panelDescription||''}],
-    panel_media:[{id:'thumbnail',label:'Panel thumbnail URL',value:c=>c.ticket.panelThumbnail||''},{id:'image',label:'Panel banner URL',value:c=>c.ticket.panelImage||''}],
-    welcome_text:[{id:'category',label:'Ticket category label',value:c=>c.ticket.categoryLabel||''},{id:'message',label:'Welcome message',style:TextInputStyle.Paragraph,value:c=>c.ticket.welcomeMessage||''}],
-    welcome_media:[{id:'thumbnail',label:'Welcome thumbnail URL',value:c=>c.ticket.welcomeThumbnail||''},{id:'image',label:'Welcome banner URL',value:c=>c.ticket.welcomeImage||''}]
-  }
-};
-
-function setupChannelSelect(interaction, sub, field) {
-  const menu=new ChannelSelectMenuBuilder().setCustomId(`setup_channel_pick:${sub}:${field}`).setPlaceholder('Select a channel…');
-  if(field==='hub_channel') menu.setChannelTypes(ChannelType.GuildVoice);
-  else if(field==='category') menu.setChannelTypes(ChannelType.GuildCategory);
-  else menu.setChannelTypes(ChannelType.GuildText);
-  return interaction.reply({embeds:[ui.base(`${ui.emoji('settings')} Select ${field.replace(/_/g,' ')}`).setDescription('Pick the Discord channel below. No IDs to copy or paste.')],components:[new ActionRowBuilder().addComponents(menu)],ephemeral:true});
-}
-function setupRoleSelect(interaction, sub, field) {
-  const menu=new RoleSelectMenuBuilder().setCustomId(`setup_role_pick:${sub}:${field}`).setPlaceholder('Select a role…');
-  return interaction.reply({embeds:[ui.base(`${ui.emoji('settings')} Select role`).setDescription('Pick the role below. No role IDs to copy or paste.')],components:[new ActionRowBuilder().addComponents(menu)],ephemeral:true});
-}
-async function openSimpleSetupSetting(interaction,sub,setting){
-  if(['hub_channel','category','channel','log_channel'].includes(setting)) return setupChannelSelect(interaction,sub,setting);
-  if(['bypass_role','support_role'].includes(setting)) return setupRoleSelect(interaction,sub,setting);
-  const spec=SETUP_MODAL_SPECS[sub]?.[setting];
-  if(!spec) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That setting is not available here.')],ephemeral:true});
-  const cfg=db.getConfig(interaction.guildId); const modal=new ModalBuilder().setCustomId(`setup_setting_modal:${sub}:${setting}`).setTitle(`Edit ${ui.SETUP_MODULE_META[sub].title}`);
-  for(const f of spec){const input=new TextInputBuilder().setCustomId(f.id).setLabel(f.label.slice(0,45)).setStyle(f.style||TextInputStyle.Short).setRequired(false);const v=f.value(cfg);if(v)input.setValue(String(v).slice(0,4000));modal.addComponents(new ActionRowBuilder().addComponents(input));}
-  return interaction.showModal(modal);
-}
-async function openTicketConfigSetting(interaction,setting){
-  if(setting==='preview'){const cfg=db.getConfig(interaction.guildId).ticket;return interaction.update({embeds:[ui.ticketPanelEmbed(interaction.guild.name,cfg),ui.ticketWelcomeEmbed(interaction.user,cfg)],components:ui.ticketConfigRow()});}
-  return openSimpleSetupSetting(interaction,'tickets',setting);
-}
-
-// ---------------------------------------------------------------------------------
-// New interactive systems
-// ---------------------------------------------------------------------------------
-async function handleButtonRoleToggle(interaction, panelId, roleId) {
-  const row=db.getButtonRolePanel(panelId); if(!row || row.guildId!==interaction.guildId) return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','This role panel is no longer configured.')],ephemeral:true});
-  const role=interaction.guild.roles.cache.get(roleId); if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Missing','That role no longer exists.')],ephemeral:true});
-  const member=interaction.member; const has=member.roles.cache.has(role.id);
-  try { if(has) await member.roles.remove(role,'Self-role toggle'); else await member.roles.add(role,'Self-role toggle'); }
-  catch(e){ return interaction.reply({embeds:[ui.errorEmbed('Role Update Failed',`I could not update ${role}. Make sure my role is above it.`)],ephemeral:true}); }
-  return interaction.reply({embeds:[ui.okEmbed(has?'Role Removed':'Role Claimed',has?`Removed ${role} from you.`:`You now have ${role}.`)],ephemeral:true});
-}
-
-async function startStaffApplication(interaction, guildId) {
-  const guild=client.guilds.cache.get(guildId); const cfg=guild ? db.getConfig(guildId).staffapplications : null;
-  if(!guild || !cfg?.enabled) return interaction.reply({content:'This application panel is no longer active.',ephemeral:true});
-  if(!cfg.questions?.length) return interaction.reply({content:'The server has not configured any application questions yet.',ephemeral:true});
-  const existing=db.getActiveAppSessionByUser(guildId,interaction.user.id); if(existing) return interaction.reply({content:'You already have an application in progress. Please finish it first.',ephemeral:true});
-  const id=`${guildId}-${interaction.user.id}-${Date.now()}`; db.createAppSession({id,guildId,userId:interaction.user.id,answers:[],questionIndex:0,status:'active'});
-  try { await interaction.user.send({embeds:[ui.base('📋 Staff Application').setDescription(`Welcome! Are you ready to start your **${cfg.title}** application?\n\nYou will answer **${cfg.questions.length}** questions one at a time.`)],components:ui.staffApplicationReadyRow(id)});
-    return interaction.reply({content:'Check your DMs — I sent you the application start message.',ephemeral:true});
-  } catch { db.updateAppSession(id,[],0,'cancelled'); return interaction.reply({content:'I could not DM you. Please enable DMs from server members and try again.',ephemeral:true}); }
-}
-
-async function submitStaffApplicationAnswer(message, session) {
-  const guild=client.guilds.cache.get(session.guildId); if(!guild) return;
-  const cfg=db.getConfig(session.guildId).staffapplications; const answers=JSON.parse(session.answers||'[]'); answers.push(message.content || (message.attachments.size ? `[Attachment: ${message.attachments.first().url}]` : '[No text]'));
-  const nextIndex=session.questionIndex+1;
-  if(nextIndex < cfg.questions.length){ db.updateAppSession(session.id,answers,nextIndex,'active'); return message.channel.send({embeds:[ui.base(`Question ${nextIndex+1}/${cfg.questions.length}`).setDescription(cfg.questions[nextIndex])]}); }
-  const finished=db.updateAppSession(session.id,answers,nextIndex,'submitted');
-  await message.channel.send({embeds:[ui.okEmbed('✅ Application Submitted','Your application has been sent to the server staff for review. You will receive a DM when a decision is made.')]});
-  const log=guild.channels.cache.get(cfg.logChannelId); if(log?.isTextBased()) await log.send({embeds:[ui.staffApplicationReviewEmbed(finished,cfg.questions)],components:ui.staffApplicationReviewRow(finished.id)}).catch(()=>{});
-}
-
-async function runBirthdayWishes() {
-  const now=new Date(); const month=now.getUTCMonth()+1, day=now.getUTCDate(); const stamp=`${now.getUTCFullYear()}-${month}-${day}`;
-  for(const guild of client.guilds.cache.values()){
-    const cfg=db.getConfig(guild.id).birthdays; if(!cfg.enabled || !cfg.wishChannelId) continue;
-    if(cfg.lastWishedDate===stamp) continue;
-    const rows=db.getBirthdaysToday(guild.id,month,day); const ch=guild.channels.cache.get(cfg.wishChannelId); if(!ch?.isTextBased()) continue;
-    for(const row of rows){ const user=await client.users.fetch(row.userId).catch(()=>null); if(!user) continue; const text=(cfg.message||'Happy Birthday, {user}! 🎉').replace('{user}',`${user}`).replace('{date}',`${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`); await ch.send({embeds:[ui.okEmbed(cfg.title||'🎂 Happy Birthday!',text)]}).catch(()=>{}); }
-    db.saveConfig(guild.id,{birthdays:{lastWishedDate:stamp}});
-  }
 }
 
 // ---------------------------------------------------------------------------------
 // interactionCreate — slash commands, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
-client.on('interactionCreate', async (rawInteraction) => {
-  const interaction = wrapInteraction(rawInteraction);
+client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       if (db.getConfig(interaction.guildId).blacklist.includes(interaction.user.id) && !isOwner(interaction.user.id)) {
@@ -396,79 +243,27 @@ client.on('interactionCreate', async (rawInteraction) => {
       return;
     }
 
-    // Self-role buttons/dropdowns
-    if (interaction.isButton() && interaction.customId.startsWith('buttonrole_toggle:')) {
-      const [,panelId,roleId]=interaction.customId.split(':');
-      return handleButtonRoleToggle(interaction,panelId,roleId);
-    }
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('buttonrole_select:')) {
-      const panelId=interaction.customId.split(':')[1]; const roleId=interaction.values[0];
-      return handleButtonRoleToggle(interaction,panelId,roleId);
-    }
-
-    // Birthday registration
-    if (interaction.isButton() && interaction.customId==='birthday_register') {
-      const modal=new ModalBuilder().setCustomId('birthday_modal').setTitle('Birthday');
-      modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('birthday').setLabel('Birthday (MM-DD)').setPlaceholder('08-08').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(5)));
-      return interaction.showModal(modal);
-    }
-
-    // Staff application DM start / ready / cancel / review
-    if (interaction.isButton() && interaction.customId.startsWith('staffapp_apply:')) return startStaffApplication(interaction,interaction.customId.split(':')[1]);
-    if (interaction.isButton() && (interaction.customId.startsWith('staffapp_ready:') || interaction.customId.startsWith('staffapp_notready:'))) {
-      const [kind,id]=interaction.customId.split(':'); const session=db.getAppSession(id); if(!session || session.userId!==interaction.user.id || session.status!=='active') return interaction.reply({content:'This application session is no longer active.',ephemeral:true});
-      if(kind==='staffapp_notready'){db.updateAppSession(id,[],0,'cancelled'); return interaction.update({embeds:[ui.warnEmbed('Application Paused','No problem. Your application was not started. You can apply again later.')],components:[]});}
-      const cfg=db.getConfig(session.guildId).staffapplications; db.updateAppSession(id,[],0,'active'); return interaction.update({embeds:[ui.base(`Question 1/${cfg.questions.length}`).setDescription(cfg.questions[0])],components:[]});
-    }
-    if (interaction.isButton() && (interaction.customId.startsWith('staffapp_accept:') || interaction.customId.startsWith('staffapp_reject:'))) {
-      const [kind,id]=interaction.customId.split(':'); const session=db.getAppSession(id); if(!session || !interaction.guild || session.guildId!==interaction.guildId || session.status!=='submitted') return interaction.reply({embeds:[ui.errorEmbed('Unavailable','This application is no longer awaiting review.')],ephemeral:true});
-      const cfg=db.getConfig(interaction.guildId).staffapplications; const allowed=interaction.member.permissions.has(PermissionFlagsBits.Administrator)||(cfg.supportRoleId&&interaction.member.roles.cache.has(cfg.supportRoleId)); if(!allowed) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator or the configured staff role.')],ephemeral:true});
-      const modal=new ModalBuilder().setCustomId(`staffapp_decide:${id}:${kind==='staffapp_accept'?'accepted':'rejected'}`).setTitle(kind==='staffapp_accept'?'Accept Application':'Reject Application'); modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason / message').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000))); return interaction.showModal(modal);
-    }
-
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
       const key = interaction.values[0];
-      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: ui.helpSelectRow() });
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_setting:')) {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
-      return openSimpleSetupSetting(interaction, interaction.customId.split(':')[1], interaction.values[0]);
-    }
-    if (interaction.isStringSelectMenu() && interaction.customId === 'ticketconfig_setting') {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change ticket settings.')], ephemeral: true });
-      return openTicketConfigSetting(interaction, interaction.values[0]);
+      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'vm_kick_pick') return handleVMKickPick(interaction);
-
-    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_channel_pick:')) {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
-      const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0];
-      const map={hub_channel:{key:'voicemaster',prop:'hubChannelId'},category:sub==='voicemaster'?{key:'voicemaster',prop:'categoryId'}:sub==='tickets'?{key:'ticket',prop:'categoryId'}:null,channel:{key:sub,prop:sub==='leveling'?'channel':'channelId'},log_channel:{key:'ticket',prop:'logChannelId'}}; const target=map[field] || (ui.SETUP_MODULE_META[sub] && field==='channel' ? {key:ui.SETUP_MODULE_META[sub].cfgKey,prop:'channelId'} : null);
-      if(!target) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That channel setting is not available.')],ephemeral:true});
-      const cfg=db.saveConfig(interaction.guildId,{[target.key]:{[target.prop]:id}}); return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
-    }
-    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('setup_role_pick:')) {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need Administrator to change setup settings.')], ephemeral: true });
-      const [,sub,field]=interaction.customId.split(':'); const id=interaction.values[0]; const map={bypass_role:{key:'antilink',prop:'bypassRoleId'},support_role:{key:'ticket',prop:'supportRoleId'}}; const target=map[field] || (ui.SETUP_MODULE_META[sub] && field==='role' ? {key:ui.SETUP_MODULE_META[sub].cfgKey,prop:'roleId'} : null);
-      if(!target) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','That role setting is not available.')],ephemeral:true});
-      const cfg=db.saveConfig(interaction.guildId,{[target.key]:{[target.prop]:id}}); return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
-    }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_category_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
       }
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
-      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
+      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
     }
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_channel_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
       }
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { hubChannelId: interaction.values[0] } });
-      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
+      return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
     }
     if (interaction.isUserSelectMenu() && interaction.customId === 'ticket_addmember_select') return handleTicketMemberSelect(interaction, 'add');
     if (interaction.isUserSelectMenu() && interaction.customId === 'ticket_removemember_select') return handleTicketMemberSelect(interaction, 'remove');
@@ -483,8 +278,53 @@ client.on('interactionCreate', async (rawInteraction) => {
   }
 });
 
+
 async function handleButton(interaction) {
   const id = interaction.customId;
+
+  if (id.startsWith('rolebtn:')) {
+    const roleId=id.split(':')[1]; const role=interaction.guild.roles.cache.get(roleId);
+    if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Missing','That role no longer exists.')],ephemeral:true});
+    const member=interaction.member;
+    if(member.roles.cache.has(role.id)){ await member.roles.remove(role).catch(()=>{}); return interaction.reply({embeds:[ui.okEmbed('Role Removed',`${role} removed from you.`)],ephemeral:true}); }
+    await member.roles.add(role).catch(()=>{}); return interaction.reply({embeds:[ui.okEmbed('Role Added',`${role} added to you.`)],ephemeral:true});
+  }
+  if (id==='role_select') {
+    const roleId=interaction.values[0]; const role=interaction.guild.roles.cache.get(roleId); if(!role) return interaction.reply({content:'Role missing.',ephemeral:true});
+    if(interaction.member.roles.cache.has(role.id)) await interaction.member.roles.remove(role).catch(()=>{}); else await interaction.member.roles.add(role).catch(()=>{});
+    return interaction.reply({embeds:[ui.okEmbed('Role Updated',`${role} has been toggled.`)],ephemeral:true});
+  }
+  if (id==='staffapp_apply') {
+    const cfg=db.getConfig(interaction.guildId).staffApplications;
+    if(!cfg.enabled || !cfg.questions?.length) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','Applications are not configured yet.')],ephemeral:true});
+    if(applicationSessions.has(interaction.user.id)) return interaction.reply({embeds:[ui.warnEmbed('Application In Progress','You already have an application in progress in your DMs.')],ephemeral:true});
+    applicationSessions.set(interaction.user.id,{guildId:interaction.guildId,index:0,answers:[],waiting:false});
+    const dm=await interaction.user.createDM();
+    await dm.send({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.dmIntro)],components:[new ActionRowBuilder().addComponents(
+      new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_ready').setLabel('Ready').setStyle(require('discord.js').ButtonStyle.Success),
+      new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_notready').setLabel('Not Ready').setStyle(require('discord.js').ButtonStyle.Secondary)
+    )]});
+    return interaction.reply({embeds:[ui.okEmbed('Check your DMs','I sent you the application start message.')],ephemeral:true});
+  }
+  if(id==='staffapp_ready') {
+    const session=applicationSessions.get(interaction.user.id); if(!session) return interaction.reply({embeds:[ui.errorEmbed('No Application','Press Apply in the server first.')],ephemeral:true});
+    const cfg=db.getConfig(session.guildId).staffApplications; session.waiting=true; session.index=0;
+    await interaction.update({embeds:[ui.okEmbed('Application Started','Answer each question in this DM. I will send the next one after every answer.')],components:[]});
+    return interaction.followUp({content:`**Question 1/${cfg.questions.length}:**\n${cfg.questions[0]}`});
+  }
+  if(id==='staffapp_notready') { applicationSessions.delete(interaction.user.id); return interaction.update({embeds:[ui.warnEmbed('Not Started','No application was started. You can press Apply again when ready.')],components:[]}); }
+  if(id.startsWith('staffapp_decide:')) {
+    if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server to review applications.')],ephemeral:true});
+    const [,decision,userId]=id.split(':');
+    const modal=new ModalBuilder().setCustomId(`staffapp_reason:${decision}:${userId}`).setTitle(decision==='accept'?'Accept Application':'Reject Application');
+    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)));
+    return interaction.showModal(modal);
+  }
+  if(id==='birthday_set') {
+    const modal=new ModalBuilder().setCustomId('birthday_modal').setTitle('Set Birthday');
+    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('Birthday (DD-MM or D-M)').setPlaceholder('8-8').setStyle(TextInputStyle.Short).setRequired(true)));
+    return interaction.showModal(modal);
+  }
 
   // ---- Tickets ----
   if (id === 'ticket_open') {
@@ -559,23 +399,6 @@ async function handleButton(interaction) {
     return;
   }
 
-
-  // ---- Giveaways ----
-  if (id.startsWith('giveaway_enter:')) {
-    const giveawayId = id.split(':')[1];
-    const row = db.getGiveaway(giveawayId);
-    if (!row || row.ended || Date.now() >= row.endsAt) return interaction.reply({ embeds: [ui.warnEmbed('Giveaway Ended', 'This giveaway is no longer accepting entries.')], ephemeral: true });
-    const entrants = JSON.parse(row.entrants || '[]');
-    if (entrants.includes(interaction.user.id)) return interaction.reply({ embeds: [ui.warnEmbed('Already Entered', 'You are already entered in this giveaway.')], ephemeral: true });
-    db.addGiveawayEntrant(giveawayId, interaction.user.id);
-    const updated = db.getGiveaway(giveawayId);
-    await interaction.reply({ embeds: [ui.okEmbed('🎉 Entry Added', `You are entered in **${row.prize}**! Good luck.`)], ephemeral: true });
-    const channel = interaction.guild.channels.cache.get(row.channelId);
-    const msg = channel ? await channel.messages.fetch(row.messageId).catch(() => null) : null;
-    if (msg) msg.edit({ embeds: [ui.giveawayEmbed({ id: row.id, prize: row.prize, winners: row.winners, host: `<@${row.hostId}>`, endsAt: row.endsAt, entrants: JSON.parse(updated.entrants || '[]').length })], components: [ui.giveawayButtonRow(row.id)] }).catch(() => {});
-    return;
-  }
-
   // ---- Voicemaster: dedicated setup panel (admin-only, from /voicemaster setup) ----
   if (id === 'vm_setup_category' || id === 'vm_setup_channel' || id === 'vm_setup_toggle') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -586,7 +409,7 @@ async function handleButton(interaction) {
     // toggle
     const current = db.getConfig(interaction.guildId).voicemaster.enabled;
     const cfg = db.saveConfig(interaction.guildId, { voicemaster: { enabled: !current } });
-    return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
+    return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
   }
 
   // ---- Voicemaster: per-channel owner controls (Lock/Hide/Rename/Limit/Kick/Transfer) ----
@@ -636,7 +459,7 @@ async function handleButton(interaction) {
     const moduleKey = ui.SETUP_MODULE_META[sub].cfgKey;
     const enabled = !db.getConfig(interaction.guildId)[moduleKey].enabled;
     const cfg = db.saveConfig(interaction.guildId, { [moduleKey]: { enabled } });
-    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: ui.setupPanelRow(sub, cfg) });
+    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
   }
 }
 
@@ -672,13 +495,6 @@ async function handleTicketMemberSelect(interaction, action) {
 // buildModulePatch() (in commands.js) expects; `parse` turns the raw text field into that
 // shape (IDs are stored as plain strings, buildModulePatch only ever needs `.id`).
 const SETUP_EDIT_FIELDS = {
-  automod: [
-    { key: 'bad_word_filter', oKey: 'bad_word_filter', label: 'Bad-word filter true/false', parse: v => /^true$/i.test(v), get: cfg => String(cfg.automod.badWordFilter) },
-    { key: 'bad_words', oKey: 'bad_words', label: 'Blocked words comma separated', parse: v => v, get: cfg => (cfg.automod.badWords || []).join(', ') },
-    { key: 'caps_filter', oKey: 'caps_filter', label: 'Caps filter true/false', parse: v => /^true$/i.test(v), get: cfg => String(cfg.automod.capsFilter) },
-    { key: 'caps_threshold', oKey: 'caps_threshold', label: 'Caps threshold 1-100', parse: v => parseInt(v,10) || 70, get: cfg => String(cfg.automod.capsThreshold) },
-    { key: 'invite_filter', oKey: 'invite_filter', label: 'Invite filter true/false', parse: v => /^true$/i.test(v), get: cfg => String(cfg.automod.inviteFilter) }
-  ],
   antinuke: [
     { key: 'punishment', oKey: 'punishment', label: 'Punishment: ban / kick / strip_roles', parse: v => v, get: cfg => cfg.antinuke.punishment },
     { key: 'threshold', oKey: 'threshold', label: 'Action threshold (number)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.antinuke.maxBans) },
@@ -711,8 +527,7 @@ const SETUP_EDIT_FIELDS = {
   leveling: [
     { key: 'channel', oKey: 'channel_id', label: 'Level-up announcement channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.leveling.channel || '' },
     { key: 'xp_per_message', oKey: 'xp_per_message', label: 'XP per eligible message', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.leveling.xpPerMessage) },
-    { key: 'cooldown_seconds', oKey: 'cooldown_seconds', label: 'Cooldown between XP gains (seconds)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.leveling.cooldownSeconds) },
-    { key: 'level_up_message', oKey: 'level_up_message', label: 'Level-up message', parse: v => v, get: cfg => cfg.leveling.levelUpMessage || '' }
+    { key: 'cooldown_seconds', oKey: 'cooldown_seconds', label: 'Cooldown between XP gains (seconds)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.leveling.cooldownSeconds) }
   ],
   tickets: [
     { key: 'category', oKey: 'category_id', label: 'Ticket category ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.ticket.categoryId || '' },
@@ -724,7 +539,6 @@ const SETUP_EDIT_FIELDS = {
 async function openSetupModal(interaction, sub) {
   const cfg = db.getConfig(interaction.guildId);
   const fields = SETUP_EDIT_FIELDS[sub];
-  if (!fields) return interaction.reply({ embeds: [ui.errorEmbed('Unavailable', 'Use the settings dropdown to configure this module.')], ephemeral: true });
   const modal = new ModalBuilder().setCustomId(`setup_modal:${sub}`).setTitle(`Edit ${ui.SETUP_MODULE_META[sub].title}`);
   for (const f of fields) {
     const current = f.get(cfg);
@@ -750,42 +564,20 @@ async function openVMModal(interaction, id) {
 
 async function handleModal(interaction) {
   if (interaction.customId === 'birthday_modal') {
-    if(!interaction.guild) return interaction.reply({content:'Birthday registration must be done from the server panel.',ephemeral:true});
-    const raw=interaction.fields.getTextInputValue('birthday').trim(); const m=raw.match(/^(\d{1,2})[-\/](\d{1,2})$/); if(!m) return interaction.reply({embeds:[ui.errorEmbed('Invalid Birthday','Use **MM-DD**, for example `08-08` or `01-09`.')],ephemeral:true});
-    const month=Number(m[1]),day=Number(m[2]); const max=new Date(Date.UTC(2000,month,0)).getUTCDate(); if(month<1||month>12||day<1||day>max) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','That is not a valid month/day.')],ephemeral:true});
-    db.setBirthday(interaction.guildId,interaction.user.id,month,day); return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Saved',`Your birthday is saved as **${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}**.`)],ephemeral:true});
+    const raw=interaction.fields.getTextInputValue('date').trim().replace(/\s+/g,'');
+    const m=raw.match(/^(\d{1,2})[-\/.](\d{1,2})$/); if(!m) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','Use a format like `8-8` or `1-9`.')],ephemeral:true});
+    const day=Number(m[1]), month=Number(m[2]);
+    const d=new Date(Date.UTC(2000,month-1,day)); if(d.getUTCMonth()+1!==month || d.getUTCDate()!==day) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','That date is not valid.')],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId); db.saveConfig(interaction.guildId,{birthdays:{entries:{...(cfg.birthdays.entries||{}),[interaction.user.id]:`${month}-${day}`}}});
+    return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Saved',`Your birthday is set to **${day}-${month}**.`)],ephemeral:true});
   }
-  if (interaction.customId.startsWith('staffapp_decide:')) {
-    const [,id,decision]=interaction.customId.split(':'); const session=db.getAppSession(id); if(!session || session.status!=='submitted') return interaction.reply({embeds:[ui.errorEmbed('Unavailable','This application is no longer awaiting review.')],ephemeral:true});
-    const cfg=db.getConfig(interaction.guildId).staffapplications; const allowed=interaction.member.permissions.has(PermissionFlagsBits.Administrator)||(cfg.supportRoleId&&interaction.member.roles.cache.has(cfg.supportRoleId)); if(!allowed) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator or the configured staff role.')],ephemeral:true});
-    const reason=interaction.fields.getTextInputValue('reason').trim()||'No reason provided.'; db.updateAppSession(id,JSON.parse(session.answers||'[]'),session.questionIndex,decision); const user=await client.users.fetch(session.userId).catch(()=>null);
-    if(user) await user.send({embeds:[ui.okEmbed(decision==='accepted'?'✅ Application Accepted':'❌ Application Rejected',`Your staff application in **${interaction.guild.name}** was **${decision}**.
-
-**Message:** ${reason}`)]}).catch(()=>{});
-    if(decision==='accepted'&&cfg.supportRoleId){const member=await interaction.guild.members.fetch(session.userId).catch(()=>null); if(member) await member.roles.add(cfg.supportRoleId,'Staff application accepted').catch(()=>{});}
-    return interaction.update({embeds:[ui.okEmbed(decision==='accepted'?'Application Accepted':'Application Rejected',`Reviewed by ${interaction.user}.
-**Message:** ${reason}`)],components:[]});
+  if (interaction.customId.startsWith('staffapp_reason:')) {
+    if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server.')],ephemeral:true});
+    const [,decision,userId]=interaction.customId.split(':'); const reason=interaction.fields.getTextInputValue('reason').trim()||'No reason provided.';
+    const user=await client.users.fetch(userId).catch(()=>null); if(!user) return interaction.reply({embeds:[ui.errorEmbed('User Not Found','Could not DM the applicant.')],ephemeral:true});
+    await user.send({embeds:[decision==='accept'?ui.okEmbed('Application Accepted',reason):ui.errorEmbed('Application Rejected',reason)]}).catch(()=>{});
+    return interaction.reply({embeds:[ui.okEmbed('Decision Recorded',`${decision==='accept'?'Accepted':'Rejected'} <@${userId}>. Reason: ${reason}`)]});
   }
-  if (interaction.customId.startsWith('setup_setting_modal:')) {
-    const [,sub,setting]=interaction.customId.split(':');
-    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator to change setup settings.')],ephemeral:true});
-    const values={}; for(const key of ['value','title','description','thumbnail','image','category','message']){try{const v=interaction.fields.getTextInputValue(key).trim();if(v)values[key]=v;}catch{}}
-    let o={}; if(sub==='tickets'){const map={panel_text:{panel_title:values.title,panel_description:values.description},panel_media:{panel_thumbnail:values.thumbnail,panel_image:values.image},welcome_text:{category_label:values.category,welcome_message:values.message},welcome_media:{welcome_thumbnail:values.thumbnail,welcome_image:values.image}};o=map[setting]||{};} else {const k=setting;if(values.value)o[k]=values.value;if(['threshold','window_seconds','max_messages','join_threshold','min_account_age_days','xp_per_message','cooldown_seconds'].includes(setting))o[k]=parseInt(values.value,10);}
-    let patch=buildModulePatch(sub,interaction.guildId,o);
-    if (!Object.keys(patch).length && ui.SETUP_MODULE_META[sub]) {
-      const value = o[setting];
-      patch = { [ui.SETUP_MODULE_META[sub].cfgKey]: { [setting]: value } };
-    }
-    if (sub==='automod' && ['bad_word_filter','caps_filter','invite_filter'].includes(setting)) {
-      patch = { automod: { [setting === 'bad_word_filter' ? 'badWordFilter' : setting === 'caps_filter' ? 'capsFilter' : 'inviteFilter']: String(o[setting]).toLowerCase() === 'true' } };
-    }
-    if (sub==='automod' && setting==='caps_threshold') patch = { automod: { capsThreshold: parseInt(o[setting],10) || 70 } };
-    if (sub==='automod' && setting==='bad_words') patch = { automod: { badWords: String(o[setting]).split(',').map(x=>x.trim()).filter(Boolean).slice(0,100) } };
-    const cfg=db.saveConfig(interaction.guildId,patch);
-    if(interaction.message) return interaction.update({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg)});
-    return interaction.reply({embeds:[ui.setupPanelEmbed(sub,cfg)],components:ui.setupPanelRow(sub,cfg),ephemeral:true});
-  }
-
   if (interaction.customId.startsWith('setup_modal:')) {
     const sub = interaction.customId.split(':')[1];
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -798,7 +590,7 @@ async function handleModal(interaction) {
     }
     const patch = buildModulePatch(sub, interaction.guildId, o);
     const cfg = db.saveConfig(interaction.guildId, patch);
-    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: ui.setupPanelRow(sub, cfg) });
+    return interaction.update({ embeds: [ui.setupPanelEmbed(sub, cfg)], components: [ui.setupPanelRow(sub, cfg)] });
   }
 
   const vc = interaction.member.voice.channel;
@@ -837,10 +629,7 @@ client.on('guildMemberAdd', async (member) => {
     } else
     if (ch?.isTextBased()) ch.send({ embeds: [ui.okEmbed('👋 Welcome', text)] }).catch(() => {});
   }
-  if (cfg.autorole.enabled) {
-    const roleId = member.user.bot ? (cfg.autorole.botRoleId || cfg.autorole.roleId) : (cfg.autorole.humanRoleId || cfg.autorole.roleId);
-    if (roleId) member.roles.add(roleId).catch(() => {});
-  }
+  if (cfg.autorole.enabled && cfg.autorole.roleId) member.roles.add(cfg.autorole.roleId).catch(() => {});
 
   const sticky = db.getStickyRoles(member.guild.id, member.id);
   if (sticky.length) member.roles.add(sticky).catch(() => {});
@@ -875,39 +664,128 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   }
 });
 
+
+function escapeRegex(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+async function handleApplicationDM(message) {
+  const session = applicationSessions.get(message.author.id);
+  if (!session || !session.waiting) return;
+  if (message.content.trim().length === 0 && message.attachments.size === 0) return;
+  const guild = client.guilds.cache.get(session.guildId);
+  if (!guild) { applicationSessions.delete(message.author.id); return; }
+  const cfg = db.getConfig(guild.id).staffApplications;
+  session.answers.push(message.content.slice(0, 1500));
+  session.index += 1;
+  if (session.index < cfg.questions.length) {
+    return message.author.send(`**Question ${session.index + 1}/${cfg.questions.length}:**\n${cfg.questions[session.index]}`).catch(()=>{});
+  }
+  session.waiting = false;
+  const log = cfg.logChannelId ? guild.channels.cache.get(cfg.logChannelId) : null;
+  if (log?.isTextBased()) {
+    const embed = ui.base('📝 Staff Application').setDescription(`Application from ${message.author} (<@${message.author.id}>)`);
+    cfg.questions.slice(0, 25).forEach((q,i)=>embed.addFields({name:`${i+1}. ${q}`.slice(0,256),value:(session.answers[i]||'No answer').slice(0,1024),inline:false}));
+    await log.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(
+      new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:accept:${message.author.id}`).setLabel('Accept').setStyle(require('discord.js').ButtonStyle.Success),
+      new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:reject:${message.author.id}`).setLabel('Reject').setStyle(require('discord.js').ButtonStyle.Danger)
+    )]}).catch(()=>{});
+  }
+  await message.author.send('Your application has been submitted. Staff will review it and notify you.').catch(()=>{});
+  applicationSessions.delete(message.author.id);
+}
+
+async function handleHoneypot(message) {
+  const cfg = db.getConfig(message.guild.id).honeypot;
+  await message.delete().catch(()=>{});
+  const log = cfg.logChannelId ? message.guild.channels.cache.get(cfg.logChannelId) : null;
+  if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('🍯 Honeypot Triggered', `${message.author} posted in <#${cfg.channelId}>. Action: **${cfg.action}**.`)]}).catch(()=>{});
+  if (cfg.cleanupWindow !== 'none') {
+    const ms = cfg.cleanupWindow === '10m' ? 10*60e3 : cfg.cleanupWindow === '1h' ? 60*60e3 : 24*60*60e3;
+    const cutoff = Date.now() - ms;
+    for (const ch of message.guild.channels.cache.values()) {
+      if (!ch.isTextBased() || !ch.messages?.fetch) continue;
+      let before;
+      for (let page=0; page<5; page++) {
+        const opts={limit:100}; if(before) opts.before=before;
+        const msgs=await ch.messages.fetch(opts).catch(()=>null); if(!msgs?.size) break;
+        const mine=[...msgs.values()].filter(m=>m.author.id===message.author.id && m.createdTimestamp>=cutoff && m.id!==message.id);
+        await Promise.allSettled(mine.map(m=>m.delete().catch(()=>{})));
+        const oldest=msgs.last(); if(!oldest || oldest.createdTimestamp<cutoff || msgs.size<100) break; before=oldest.id;
+      }
+    }
+  }
+  const member=await message.guild.members.fetch(message.author.id).catch(()=>null);
+  if (cfg.action==='kick' || cfg.action==='ban') {
+    let invite='';
+    if(cfg.action==='kick' && cfg.createInvite) {
+      const target=message.guild.channels.cache.get(cfg.channelId) || message.guild.systemChannel;
+      if(target?.isTextBased() && target.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.CreateInstantInvite)) {
+        invite=await target.createInvite({maxAge:86400,maxUses:1,unique:true,reason:'Honeypot recovery invite'}).then(i=>i.url).catch(()=> '');
+      }
+    }
+    if(cfg.action==='kick') {
+      await member?.kick('Honeypot trigger').catch(()=>{});
+      const dm=(cfg.dmMessage||'You were removed for posting in the honeypot channel. {invite}').replace('{invite}',invite||'');
+      await message.author.send(dm).catch(()=>{});
+    } else await member?.ban({reason:'Honeypot trigger'}).catch(()=>{});
+  } else if(cfg.action==='timeout') await member?.timeout(10*60e3,'Honeypot trigger').catch(()=>{});
+}
+
+function birthdayKey(date) { return `${date.getUTCMonth()+1}-${date.getUTCDate()}`; }
+async function sendBirthdayWishes() {
+  const now=new Date(); const key=birthdayKey(now); const dayToken=`${now.getUTCFullYear()}-${key}`;
+  for (const guild of client.guilds.cache.values()) {
+    const cfg=db.getConfig(guild.id).birthdays; if(!cfg.enabled || !cfg.wishChannelId) continue;
+    const channel=guild.channels.cache.get(cfg.wishChannelId); if(!channel?.isTextBased()) continue;
+    const entries=cfg.entries||{};
+    for(const [userId,date] of Object.entries(entries)) {
+      if(date!==key || birthdayWishesSent.has(`${guild.id}:${userId}:${dayToken}`)) continue;
+      birthdayWishesSent.add(`${guild.id}:${userId}:${dayToken}`);
+      const text=(cfg.wishMessage||'Happy Birthday {user}! 🎂').replace('{user}',`<@${userId}>`).replace('{date}',key);
+      channel.send({embeds:[ui.okEmbed('🎂 Happy Birthday!',text)]}).catch(()=>{});
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------------
 // messageCreate — antilink, antispam, leveling, automod, prefix-less utility
 // ---------------------------------------------------------------------------------
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  if (!message.guild) {
-    const session=db.getAnyActiveAppSessionByUser(message.author.id);
-    if(session) await submitStaffApplicationAnswer(message,session).catch(e=>console.error('Staff application DM failed:',e));
-    return;
+
+  // Staff applications happen in DMs and intentionally have no guild.
+  if (!message.guild) return handleApplicationDM(message).catch(console.error);
+
+  const cfgAll = db.getConfig(message.guild.id);
+  // Honeypot is checked before command parsing so the no-message channel is truly a honeypot.
+  if (cfgAll.honeypot.enabled && cfgAll.honeypot.channelId === message.channel.id) {
+    return handleHoneypot(message).catch(console.error);
   }
-  if (await sys.handleHoneypot(message).catch(()=>false)) return;
-  if (await sys.handleAntiBadWord(message).catch(()=>false)) return;
+
   const wasCommand = await handlePrefixCommand(message).catch((e) => { console.error(e); return false; });
   if (wasCommand) return;
   await sys.handleAntilink(message).catch(() => {});
   await sys.handleAntispam(message).catch(() => {});
   await sys.handleLevelingMessage(message).catch(() => {});
 
-  const cfg = db.getConfig(message.guild.id).automod;
-  if (cfg.enabled) {
-    const lower = message.content.toLowerCase();
-    const hasBadWord = cfg.badWordFilter && cfg.badWords.some(w => w && lower.includes(String(w).toLowerCase()));
-    const inviteRegex = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord\.com\/invite)\/[A-Za-z0-9-]+/i;
-    const hasInvite = cfg.inviteFilter && inviteRegex.test(message.content);
-    const letters = message.content.replace(/[^A-Za-z]/g, '');
-    const caps = letters.length ? (letters.replace(/[^A-Z]/g, '').length / letters.length) * 100 : 0;
-    const tooManyCaps = cfg.capsFilter && letters.length >= 6 && caps >= Number(cfg.capsThreshold || 70);
-    if (hasBadWord || hasInvite || tooManyCaps) {
-      await message.delete().catch(() => {});
-      const reason = hasBadWord ? 'blocked word' : hasInvite ? 'Discord invite' : 'excessive caps';
-      const log = await sys.getLogChannel(message.guild, 'mod');
-      if (log) log.send({ embeds: [ui.warnEmbed(`${ui.emoji('warning')} Automod`, `${message.author} message removed (${reason}).`)] }).catch(() => {});
+  const auto = cfgAll.automod;
+  const anti = cfgAll.antibadword;
+  const builtInBadWords = [
+    'fuck','fucker','fucking','motherfucker','shit','bitch','bastard','asshole','dick','piss','cunt',
+    'idiot','stupid','گالی','گالیوں','حرامی','کمینہ','چوت','چوتیا','بکواس','لعنتی','kurwa','puta','putain',
+    'merde','scheisse','arschloch','cazzo','stronzo','mierda','carajo','joder','blyat','сука','хуй','ебать',
+    'くそ','ばか','死ね','くそったれ','씨발','병신','좆','개새끼','操你','他妈的','妈的'
+  ];
+  const words = [...builtInBadWords, ...(anti.customWords || []), ...(auto.badWords || [])].filter(Boolean);
+  if ((anti.enabled || auto.badWordFilter) && words.some(w => new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegex(w)}(?:$|[^\\p{L}\\p{N}])`, 'iu').test(message.content))) {
+    const content = message.content.slice(0, 500);
+    await message.delete().catch(() => {});
+    const log = anti.logChannelId ? message.guild.channels.cache.get(anti.logChannelId) : await sys.getLogChannel(message.guild, 'message');
+    if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('🚫 Anti Bad Word', `**User:** ${message.author}\n**Channel:** ${message.channel}\n**Message:** ${content || '(attachment only)'}`)]}).catch(()=>{});
+    if (anti.action === 'timeout') {
+      const member = await message.guild.members.fetch(message.author.id).catch(()=>null);
+      member?.timeout(60_000, 'Anti bad word').catch(()=>{});
     }
+    return;
   }
 });
 
@@ -966,5 +844,6 @@ client.on('webhooksUpdate', async (channel) => {
 });
 
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+setInterval(() => sendBirthdayWishes().catch(console.error), 60 * 60 * 1000);
 
 client.login(process.env.DISCORD_TOKEN);
