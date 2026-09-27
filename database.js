@@ -82,6 +82,11 @@ CREATE TABLE IF NOT EXISTS join_tracker (
   userId TEXT NOT NULL,
   timestamp INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS emoji_overrides (
+  name TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `);
 
 // ---------- default config shape ----------
@@ -96,7 +101,7 @@ const DEFAULT_CONFIG = {
   leave: { enabled: false, channel: null, message: '{user} has left the server.' },
   boost: { enabled: false, channel: null, message: '{user} just boosted the server! Thank you! 🚀' },
   greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null },
-  greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!' },
+  greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!', image: null },
   antinuke: {
     enabled: false, punishment: 'ban', // ban | kick | strip_roles
     maxChannelDeletes: 3, maxChannelCreates: 5, maxRoleDeletes: 3, maxRoleCreates: 5,
@@ -108,7 +113,15 @@ const DEFAULT_CONFIG = {
   antiraid: { enabled: false, joinThreshold: 8, windowSeconds: 10, action: 'lockdown', minAccountAgeDays: 3 },
   voicemaster: { enabled: false, hubChannelId: null, categoryId: null, nameTemplate: "{user}'s room" },
   leveling: { enabled: false, channel: null, xpPerMessage: 15, cooldownSeconds: 60, levelUpMessage: '{user} reached level {level}!', roleRewards: {} },
-  ticket: { enabled: false, categoryId: null, panelChannelId: null, supportRoleId: null, logChannelId: null, counter: 0 },
+  ticket: {
+    enabled: false, categoryId: null, panelChannelId: null, supportRoleId: null, logChannelId: null, counter: 0,
+    // The "Open Ticket" panel message (posted by /ticketpanel).
+    panelTitle: null, panelDescription: null, panelThumbnail: null, panelImage: null,
+    // The embed sent inside a freshly-created ticket channel (matches the "Welcome @user /
+    // Category: X / message" + thumbnail + banner layout).
+    categoryLabel: 'General Support', welcomeMessage: 'Our support team will assist you shortly.',
+    welcomeThumbnail: null, welcomeImage: null
+  },
   automod: { badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
   afk: {},
   autorole: { enabled: false, roleId: null },
@@ -287,6 +300,31 @@ function recentJoinCount(guildId, windowSeconds) {
   return recentJoinsStmt.get(guildId, Date.now() - windowSeconds * 1000).c;
 }
 
+// ---------- emoji overrides (bot-wide, owner-configurable via /emojis) ----------
+const getEmojiStmt = db.prepare('SELECT value FROM emoji_overrides WHERE name = ?');
+const setEmojiStmt = db.prepare(`
+  INSERT INTO emoji_overrides (name, value) VALUES (?, ?)
+  ON CONFLICT(name) DO UPDATE SET value = excluded.value
+`);
+const deleteEmojiStmt = db.prepare('DELETE FROM emoji_overrides WHERE name = ?');
+const allEmojiStmt = db.prepare('SELECT name, value FROM emoji_overrides');
+
+function getEmojiOverride(name) {
+  const row = getEmojiStmt.get(name);
+  return row ? row.value : null;
+}
+function setEmojiOverride(name, value) {
+  setEmojiStmt.run(name, value);
+}
+function resetEmojiOverride(name) {
+  deleteEmojiStmt.run(name);
+}
+function getAllEmojiOverrides() {
+  const out = {};
+  for (const row of allEmojiStmt.all()) out[row.name] = row.value;
+  return out;
+}
+
 module.exports = {
   db, DEFAULT_CONFIG,
   getConfig, saveConfig,
@@ -297,5 +335,6 @@ module.exports = {
   addToWhitelist, removeFromWhitelist, isWhitelisted,
   logAction, recentActions,
   getStickyRoles, setStickyRoles,
-  bumpSpam, trackJoin, recentJoinCount
+  bumpSpam, trackJoin, recentJoinCount,
+  getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides
 };
