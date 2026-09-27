@@ -429,7 +429,7 @@ commands.push({
   async execute(interaction){
     if(!requireAdmin(interaction))return;
     const cfg=db.getConfig(interaction.guildId).birthdays;
-    await interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:[ui.birthdaySetupRow(cfg)],ephemeral:true});
+    await interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg),ephemeral:true});
   }
 });
 
@@ -439,7 +439,7 @@ commands.push({
   async execute(interaction){
     if(!requireAdmin(interaction))return;
     const cfg=db.getConfig(interaction.guildId).antibadword;
-    await interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:[ui.antiBadwordSetupRow(cfg)],ephemeral:true});
+    await interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true});
   }
 });
 
@@ -449,7 +449,7 @@ commands.push({
   async execute(interaction){
     if(!requireAdmin(interaction))return;
     const cfg=db.getConfig(interaction.guildId).honeypot;
-    await interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:[ui.honeypotSetupRow(cfg)],ephemeral:true});
+    await interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true});
   }
 });
 
@@ -460,7 +460,38 @@ commands.push({
   async execute(interaction){
     if(!requireAdmin(interaction))return;
     const cfg=db.getConfig(interaction.guildId).greetvoice;
-    await interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:[ui.greetVoiceSetupRow(cfg)],ephemeral:true});
+    await interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('autorespondersetup').setDescription('Open the easy Auto Responder setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const cfg=db.getConfig(interaction.guildId).autoresponder;
+    await interaction.reply({embeds:[ui.autoresponderSetupEmbed(cfg)],components:ui.autoresponderSetupRow(cfg),ephemeral:true});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('autoreactorsetup').setDescription('Open the easy Auto Reactor setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const cfg=db.getConfig(interaction.guildId).autoreactor;
+    await interaction.reply({embeds:[ui.autoreactorSetupEmbed(cfg)],components:ui.autoreactorSetupRow(cfg),ephemeral:true});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('embedbuilder').setDescription('Build a custom embed with buttons and post it to a channel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    sys.embedBuilderSessions.set(interaction.user.id, { title:'', description:'', color:'', imageUrl:'', thumbnailUrl:'', footer:'', buttons: [] });
+    const draft = sys.embedBuilderSessions.get(interaction.user.id);
+    await interaction.reply({embeds:[ui.embedBuilderPreviewEmbed(draft)],components:ui.embedBuilderRow(draft),ephemeral:true});
   }
 });
 
