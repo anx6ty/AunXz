@@ -634,6 +634,7 @@ commands.push({
     await interaction.reply({
       content: changed ? `${ui.emoji('success')} Ticket appearance updated. Previews below:` : 'Current ticket appearance — previews below:',
       embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg), ui.ticketWelcomeEmbed(interaction.user, cfg)],
+      components: ui.ticketConfigRow(),
       ephemeral: true
     });
   }
