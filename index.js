@@ -27,6 +27,26 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
 });
 
+
+
+function wrapInteraction(interaction) {
+  const methods = new Set(['reply', 'update', 'followUp', 'editReply']);
+  return new Proxy(interaction, {
+    get(target, prop, receiver) {
+      if (methods.has(prop)) {
+        return (...args) => {
+          if (args.length && args[0] && typeof args[0] === 'object') {
+            args[0] = ui.toComponentsV2(args[0]);
+          }
+          return target[prop](...args);
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------------
 // Slash command registration
 // ---------------------------------------------------------------------------------
@@ -182,9 +202,9 @@ function buildFakeInteraction(message, json, tokens) {
       getUser: getter, getRole: getter, getChannel: getter, getMentionable: getter,
       getSubcommand: () => schema.subcommand
     },
-    reply: async (payload) => { fake.replied = true; return message.reply(stripEphemeral(payload)); },
-    followUp: async (payload) => message.channel.send(stripEphemeral(payload)),
-    editReply: async (payload) => message.channel.send(stripEphemeral(payload)),
+    reply: async (payload) => { fake.replied = true; return message.reply(stripEphemeral(ui.toComponentsV2(payload))); },
+    followUp: async (payload) => message.channel.send(stripEphemeral(ui.toComponentsV2(payload))),
+    editReply: async (payload) => message.channel.send(stripEphemeral(ui.toComponentsV2(payload))),
     deferReply: async () => { fake.deferred = true; },
     showModal: async () => message.reply({ embeds: [ui.warnEmbed('Slash Command Needed', 'That action opens a popup form — use the `/' + json.name + '` slash command instead.')] })
   };
@@ -214,14 +234,14 @@ async function handlePrefixCommand(message) {
   const json = cmd.data.toJSON();
   const fake = buildFakeInteraction(message, json, tokens);
   if (!fake) {
-    message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
+    message.reply(ui.toComponentsV2({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] })).catch(() => {});
     return true;
   }
   try {
     await cmd.execute(fake);
   } catch (e) {
     console.error(e);
-    message.reply({ embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')] }).catch(() => {});
+    message.reply(ui.toComponentsV2({ embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')] })).catch(() => {});
   }
   return true;
 }
@@ -229,7 +249,8 @@ async function handlePrefixCommand(message) {
 // ---------------------------------------------------------------------------------
 // interactionCreate — slash commands, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
-client.on('interactionCreate', async (interaction) => {
+client.on('interactionCreate', async (rawInteraction) => {
+  const interaction = wrapInteraction(rawInteraction);
   try {
     if (interaction.isChatInputCommand()) {
       if (db.getConfig(interaction.guildId).blacklist.includes(interaction.user.id) && !isOwner(interaction.user.id)) {
