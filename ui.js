@@ -48,24 +48,35 @@ function embedToV2Parts(embed) {
   return parts;
 }
 
-function toComponentsV2(payload) {
+function toComponentsV2(payload, force = false) {
   if (!payload || typeof payload !== 'object') return payload;
   if (payload.flags && (Number(payload.flags) & COMPONENTS_V2_FLAG)) return payload;
-  if (!Array.isArray(payload.embeds) || !payload.embeds.length) return payload;
-  if (!Array.isArray(payload.components) || !payload.components.length) return payload;
+
+  const embeds = Array.isArray(payload.embeds) ? payload.embeds.filter(Boolean) : [];
+  const rawComponents = Array.isArray(payload.components) ? payload.components.flat(Infinity).filter(Boolean) : [];
+  const hasInteractiveComponents = rawComponents.length > 0;
+  if (!force && !embeds.length && !hasInteractiveComponents) return payload;
+  if (!embeds.length && !hasInteractiveComponents) return payload;
 
   const panel = [];
-  for (let i = 0; i < payload.embeds.length; i++) {
-    panel.push(...embedToV2Parts(payload.embeds[i]));
-    if (i < payload.embeds.length - 1) panel.push({ type: 14, spacing: 1 });
+  if (payload.content) panel.push({ type: 10, content: String(payload.content) });
+
+  for (let i = 0; i < embeds.length; i++) {
+    panel.push(...embedToV2Parts(embeds[i]));
+    if (i < embeds.length - 1) panel.push({ type: 14, spacing: 1 });
   }
-  if (payload.content) panel.unshift({ type: 10, content: String(payload.content) });
-  if (panel.length) panel.push({ type: 14, spacing: 1 });
 
-  for (const row of payload.components) panel.push(componentJson(row));
+  if (rawComponents.length) {
+    if (panel.length) panel.push({ type: 14, spacing: 1 });
+    for (const component of rawComponents) {
+      const json = componentJson(component);
+      if (json && typeof json === 'object') panel.push(json);
+    }
+  }
 
+  if (!panel.length) return payload;
   const container = { type: 17, components: panel.slice(0, 10) };
-  const first = componentJson(payload.embeds[0]) || {};
+  const first = embeds[0] ? componentJson(embeds[0]) || {} : {};
   if (first.color != null) container.accent_color = first.color;
 
   const out = {
