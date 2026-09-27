@@ -152,7 +152,7 @@ const GENERIC_MODULES = [
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetvoice', 'greetmessage',
   'leveling', 'tickets', 'logs', ...GENERIC_MODULES,
-  'sticky', 'counters', 'reminders', 'customcommands', 'autoresponder', 'verification', 'tempchannels', 'messagefilter', 'wordfilter', 'capsfilter', 'mentionguard', 'raidmode', 'serverstats', 'memberlogs', 'rolelogs', 'channellogs', 'voicelogs', 'mediaonly', 'linkfilter', 'antiemoji', 'antimention', 'nicknameguard', 'ghostping', 'selfroles', 'reactionrolesplus', 'suggestionbox', 'confessions', 'applications', 'forms', 'feedback', 'serverbackup', 'autorename', 'autothread', 'threadguard', 'activityroles', 'inactivity', 'commandlogs', 'moderatorroles', 'staffnotify', 'welcomeimages', 'goodbyeimages'
+  'sticky', 'counters', 'reminders', 'customcommands', 'autoresponder', 'verification', 'tempchannels', 'messagefilter', 'wordfilter', 'capsfilter', 'mentionguard', 'raidmode', 'serverstats', 'memberlogs', 'rolelogs', 'channellogs', 'voicelogs', 'mediaonly', 'linkfilter', 'antiemoji', 'antimention', 'nicknameguard', 'ghostping', 'selfroles', 'reactionrolesplus', 'suggestionbox', 'confessions', 'applications', 'forms', 'feedback', 'serverbackup', 'autorename', 'autothread', 'threadguard', 'activityroles', 'inactivity', 'commandlogs', 'moderatorroles', 'staffnotify', 'welcomeimages', 'goodbyeimages', 'buttonroles', 'staffapplications', 'birthday', 'antibadword', 'honeypot'
 ];
 const GENERIC_COMMANDS = {
   welcome: 'welcome', leave: 'leave', boost: 'boost', automod: 'automod',
@@ -472,7 +472,7 @@ const EXTRA_SETUP_MODULES = [
   'linkfilter', 'antiemoji', 'antimention', 'nicknameguard', 'ghostping', 'selfroles',
   'reactionrolesplus', 'suggestionbox', 'confessions', 'applications', 'forms', 'feedback',
   'serverbackup', 'autorename', 'autothread', 'threadguard', 'activityroles', 'inactivity',
-  'commandlogs', 'moderatorroles', 'staffnotify', 'welcomeimages', 'goodbyeimages'
+  'commandlogs', 'moderatorroles', 'staffnotify', 'welcomeimages', 'goodbyeimages', 'buttonroles', 'staffapplications', 'birthday', 'antibadword', 'honeypot'
 ];
 
 for (const moduleName of EXTRA_SETUP_MODULES) {
@@ -1145,5 +1145,141 @@ commands.push({
     }
   }
 });
+
+
+// ---------------------------------------------------------------------------------
+// /buttonroles — fully customizable role claim panel
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder().setName('buttonroles').setDescription('Create a customizable self-role panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s => s.setName('setup').setDescription('Create or update a role claim panel.')
+      .addChannelOption(o=>o.setName('channel').setDescription('Channel for the panel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+      .addStringOption(o=>o.setName('mode').setDescription('Buttons or dropdown selection').setRequired(true).addChoices({name:'buttons',value:'buttons'},{name:'select menu',value:'select'}))
+      .addStringOption(o=>o.setName('title').setDescription('Panel title').setRequired(true))
+      .addStringOption(o=>o.setName('description').setDescription('Panel description').setRequired(true))
+      .addRoleOption(o=>o.setName('role1').setDescription('First claimable role').setRequired(true))
+      .addRoleOption(o=>o.setName('role2').setDescription('Second claimable role'))
+      .addRoleOption(o=>o.setName('role3').setDescription('Third claimable role'))
+      .addRoleOption(o=>o.setName('role4').setDescription('Fourth claimable role'))
+      .addRoleOption(o=>o.setName('role5').setDescription('Fifth claimable role'))
+      .addStringOption(o=>o.setName('label1').setDescription('Custom label for role 1'))
+      .addStringOption(o=>o.setName('label2').setDescription('Custom label for role 2'))
+      .addStringOption(o=>o.setName('label3').setDescription('Custom label for role 3'))
+      .addStringOption(o=>o.setName('label4').setDescription('Custom label for role 4'))
+      .addStringOption(o=>o.setName('label5').setDescription('Custom label for role 5'))
+    ),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const sub=interaction.options.getSubcommand(); if(sub!=='setup') return;
+    const channel=interaction.options.getChannel('channel'), mode=interaction.options.getString('mode');
+    const roles=[]; for(let i=1;i<=5;i++){ const role=interaction.options.getRole(`role${i}`); if(role) roles.push({roleId:role.id,label:interaction.options.getString(`label${i}`)||role.name,description:`Toggle ${role.name}`}); }
+    const id=`${interaction.guildId}-${Date.now()}`;
+    const panel={id,guildId:interaction.guildId,channelId:channel.id,messageId:'',mode,title:interaction.options.getString('title'),description:interaction.options.getString('description'),roles};
+    const msg=await channel.send({embeds:[ui.buttonRolePanelEmbed(panel.title,panel.description)],components:ui.buttonRolePanelComponents(panel)});
+    panel.messageId=msg.id; db.saveButtonRolePanel(panel); db.saveConfig(interaction.guildId,{buttonroles:{enabled:true}});
+    await interaction.reply({embeds:[ui.okEmbed('🎭 Role Panel Created',`Posted the role panel in ${channel}. Members can press a role to claim or remove it.`)],ephemeral:true});
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /staffapplications — DM, one-question-at-a-time application system
+// ---------------------------------------------------------------------------------
+commands.push({
+  data:new SlashCommandBuilder().setName('staffapplications').setDescription('Configure staff applications.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s=>s.setName('setup').setDescription('Configure and post the application panel.')
+      .addChannelOption(o=>o.setName('channel').setDescription('Application panel channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+      .addChannelOption(o=>o.setName('log_channel').setDescription('Application review/log channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+      .addRoleOption(o=>o.setName('staff_role').setDescription('Role allowed to review applications'))
+      .addStringOption(o=>o.setName('title').setDescription('Panel title'))
+      .addStringOption(o=>o.setName('description').setDescription('Panel description'))
+      .addStringOption(o=>o.setName('apply_label').setDescription('Apply button label')))
+    .addSubcommand(s=>s.setName('addquestion').setDescription('Add an application question.').addStringOption(o=>o.setName('question').setDescription('Question to ask in DMs').setRequired(true)))
+    .addSubcommand(s=>s.setName('removequestion').setDescription('Remove a question.').addIntegerOption(o=>o.setName('number').setDescription('Question number').setRequired(true).setMinValue(1)))
+    .addSubcommand(s=>s.setName('list').setDescription('List current questions.'))
+    .addSubcommand(s=>s.setName('panel').setDescription('Post the current application panel.').addChannelOption(o=>o.setName('channel').setDescription('Optional channel').addChannelTypes(ChannelType.GuildText))),
+  async execute(interaction){
+    if(!requireAdmin(interaction)) return;
+    const sub=interaction.options.getSubcommand(); const cfg=db.getConfig(interaction.guildId).staffapplications;
+    if(sub==='addquestion'){ const q=interaction.options.getString('question').trim(); if(cfg.questions.length>=20) return interaction.reply({embeds:[ui.errorEmbed('Question Limit','You can have up to 20 questions.')],ephemeral:true}); db.saveConfig(interaction.guildId,{staffapplications:{questions:[...cfg.questions,q],enabled:true}}); return interaction.reply({embeds:[ui.okEmbed('Question Added',`Question **${cfg.questions.length+1}** added.`)],ephemeral:true}); }
+    if(sub==='removequestion'){ const n=interaction.options.getInteger('number'); if(!cfg.questions[n-1]) return interaction.reply({embeds:[ui.errorEmbed('Not Found','That question does not exist.')],ephemeral:true}); const questions=cfg.questions.filter((_,i)=>i!==n-1); db.saveConfig(interaction.guildId,{staffapplications:{questions}}); return interaction.reply({embeds:[ui.okEmbed('Question Removed',`Question **${n}** removed.`)],ephemeral:true}); }
+    if(sub==='list'){ const text=cfg.questions.length?cfg.questions.map((q,i)=>`**${i+1}.** ${q}`).join('\n'): 'No questions configured yet. Use `/staffapplications addquestion`.'; return interaction.reply({embeds:[ui.base('📋 Application Questions').setDescription(text.slice(0,4000))],ephemeral:true}); }
+    let next=cfg; if(sub==='setup'){
+      const channel=interaction.options.getChannel('channel'), log=interaction.options.getChannel('log_channel'), role=interaction.options.getRole('staff_role');
+      next=db.saveConfig(interaction.guildId,{staffapplications:{enabled:true,panelChannelId:channel.id,logChannelId:log.id,supportRoleId:role?.id||cfg.supportRoleId,title:interaction.options.getString('title')||cfg.title,description:interaction.options.getString('description')||cfg.description,applyLabel:interaction.options.getString('apply_label')||cfg.applyLabel}});
+      if(!next.questions.length) return interaction.reply({embeds:[ui.warnEmbed('Panel Configured','Add at least one question with `/staffapplications addquestion`, then run `/staffapplications panel`.')],ephemeral:true});
+      const msg=await channel.send({embeds:[ui.staffApplicationPanelEmbed(next.staffapplications),],components:ui.staffApplicationPanelRow(next.staffapplications, interaction.guildId)}); return interaction.reply({embeds:[ui.okEmbed('Staff Applications Configured',`Panel posted in ${channel}. Message: ${msg.id}`)],ephemeral:true});
+    }
+    if(sub==='panel'){ const channel=interaction.options.getChannel('channel')||interaction.guild.channels.cache.get(cfg.panelChannelId); if(!channel) return interaction.reply({embeds:[ui.errorEmbed('No Panel Channel','Run `/staffapplications setup` first.')],ephemeral:true}); const msg=await channel.send({embeds:[ui.staffApplicationPanelEmbed(cfg)],components:ui.staffApplicationPanelRow(cfg, interaction.guildId)}); return interaction.reply({embeds:[ui.okEmbed('Panel Posted',`Application panel posted in ${channel}.`)],ephemeral:true}); }
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /birthday — registration panel + automatic wishes
+// ---------------------------------------------------------------------------------
+commands.push({
+  data:new SlashCommandBuilder().setName('birthday').setDescription('Configure birthday registration and wishes.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s=>s.setName('setup').setDescription('Post the birthday registration panel.')
+      .addChannelOption(o=>o.setName('channel').setDescription('Registration panel channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+      .addChannelOption(o=>o.setName('wish_channel').setDescription('Channel for birthday wishes').setRequired(true).addChannelTypes(ChannelType.GuildText))
+      .addStringOption(o=>o.setName('message').setDescription('Wish message; {user} and {date} are supported'))
+      .addStringOption(o=>o.setName('title').setDescription('Panel title')))
+    .addSubcommand(s=>s.setName('panel').setDescription('Post the birthday panel again.').addChannelOption(o=>o.setName('channel').setDescription('Optional channel').addChannelTypes(ChannelType.GuildText))),
+  async execute(interaction){ if(!requireAdmin(interaction))return; const sub=interaction.options.getSubcommand(); let cfg=db.getConfig(interaction.guildId).birthdays;
+    if(sub==='setup'){const ch=interaction.options.getChannel('channel'), wish=interaction.options.getChannel('wish_channel'); cfg=db.saveConfig(interaction.guildId,{birthdays:{enabled:true,panelChannelId:ch.id,wishChannelId:wish.id,message:interaction.options.getString('message')||cfg.message,title:interaction.options.getString('title')||cfg.title}}).birthdays; const msg=await ch.send({embeds:[ui.birthdayPanelEmbed(cfg)],components:ui.birthdayPanelRow()}); return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Setup Complete',`Panel posted in ${ch}.`)],ephemeral:true});}
+    const ch=interaction.options.getChannel('channel')||interaction.guild.channels.cache.get(cfg.panelChannelId); if(!ch)return interaction.reply({embeds:[ui.errorEmbed('No Channel','Run `/birthday setup` first.')],ephemeral:true}); await ch.send({embeds:[ui.birthdayPanelEmbed(cfg)],components:ui.birthdayPanelRow()}); return interaction.reply({embeds:[ui.okEmbed('Birthday Panel Posted',`Posted in ${ch}.`)],ephemeral:true}); }
+});
+
+// ---------------------------------------------------------------------------------
+// /antibadwordsetup — multilingual starter filter + custom words
+// ---------------------------------------------------------------------------------
+commands.push({
+  data:new SlashCommandBuilder().setName('antibadwordsetup').setDescription('Configure multilingual bad-word filtering.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('log_channel').setDescription('Violation log channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('custom_words').setDescription('Extra blocked words, comma separated'))
+    .addBooleanOption(o=>o.setName('delete_message').setDescription('Delete matching messages')),
+  async execute(interaction){ if(!requireAdmin(interaction))return; const words=(interaction.options.getString('custom_words')||'').split(',').map(x=>x.trim()).filter(Boolean); const current=db.getConfig(interaction.guildId).antibadword; const cfg=db.saveConfig(interaction.guildId,{antibadword:{enabled:true,logChannelId:interaction.options.getChannel('log_channel').id,deleteMessage:interaction.options.getBoolean('delete_message')??true,words:[...new Set([...current.words,...words])]}}); await interaction.reply({embeds:[ui.okEmbed('🛡️ Anti Bad-Word Enabled',`Filtering is enabled. Custom words: **${cfg.antibadword.words.length}**. The built-in detector also normalizes Unicode/case.`)]}); }
+});
+
+// ---------------------------------------------------------------------------------
+// /honeypotsetup — trap channel with configurable action
+// ---------------------------------------------------------------------------------
+commands.push({
+  data:new SlashCommandBuilder().setName('honeypotsetup').setDescription('Configure a honeypot channel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel that should not receive messages').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('action').setDescription('Action for anyone who posts there').setRequired(true).addChoices({name:'delete',value:'delete'},{name:'kick',value:'kick'},{name:'ban',value:'ban'}))
+    .addBooleanOption(o=>o.setName('invite_back').setDescription('If kicking, DM a fresh invite back'))
+    .addBooleanOption(o=>o.setName('delete_user_messages').setDescription("Delete this user's previous messages across server channels"))
+    .addStringOption(o=>o.setName('cleanup_window').setDescription("How far back to remove the user's messages")
+      .addChoices({name:'10 minutes',value:'10'},{name:'1 hour',value:'60'},{name:'24 hours',value:'1440'},{name:'All available history',value:'all'}))
+    .addStringOption(o=>o.setName('message').setDescription('Optional warning/log text')),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const ch=interaction.options.getChannel('channel');
+    const windowValue=interaction.options.getString('cleanup_window')||'1440';
+    const cfg=db.saveConfig(interaction.guildId,{honeypot:{
+      enabled:true,
+      channelId:ch.id,
+      action:interaction.options.getString('action'),
+      inviteBack:interaction.options.getBoolean('invite_back')??false,
+      deleteUserMessages:interaction.options.getBoolean('delete_user_messages')??true,
+      cleanupMinutes:windowValue==='all'?0:Number(windowValue),
+      message:interaction.options.getString('message')||'Please do not send messages here.'
+    }}).honeypot;
+    await ch.permissionOverwrites.edit(interaction.guild.roles.everyone,{SendMessages:false}).catch(()=>{});
+    const cleanupText=cfg.deleteUserMessages?(cfg.cleanupMinutes===0?'all available history':`${cfg.cleanupMinutes} minutes`):'disabled';
+    await interaction.reply({embeds:[ui.okEmbed('🍯 Honeypot Enabled',`${ch} is now protected. Action: **${cfg.action}**\n**Delete triggered user's previous messages:** ${cleanupText}.`)]});
+  }
+});
+
+// A few additional simple setup aliases for common server systems.
+for (const [name,key,title] of [['afk','afk','AFK'],['starboard','starboard','Starboard'],['suggestions','suggestions','Suggestions'],['welcome','welcome','Welcome'],['leave','leave','Goodbye'],['boost','boost','Boost Messages']]) {
+  if(commands.some(c=>c.data.name===name)) continue;
+  commands.push({data:new SlashCommandBuilder().setName(name).setDescription(`Configure ${title}.`).setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(s=>s.setName('setup').setDescription(`Configure ${title}.`)),async execute(interaction){if(!requireAdmin(interaction))return; const cfg=db.getConfig(interaction.guildId); const current=cfg[key]; const enabled=typeof current==='object'? !current.enabled : !current; const patch=typeof current==='object'?{[key]:{enabled}}:{[key]:enabled}; db.saveConfig(interaction.guildId,patch); await interaction.reply({embeds:[ui.okEmbed(`${ui.emoji('settings')} ${title}`,`${title} is now **${enabled?'enabled':'disabled'}**.`)]});}});
+}
 
 module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
