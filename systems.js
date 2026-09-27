@@ -4,6 +4,10 @@
 
 const { PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const https = require('https');
 const ffmpegPath = require('ffmpeg-static');
 const {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
@@ -19,6 +23,10 @@ const persistentConnections = new Map(); // guildId -> connection
 
 async function joinAndStayInVC(voiceChannel) {
   let connection = getVoiceConnection(voiceChannel.guild.id);
+  if (connection && connection.joinConfig?.channelId !== voiceChannel.id) {
+    try { connection.destroy(); } catch {}
+    connection = null;
+  }
   if (!connection) {
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
@@ -46,83 +54,56 @@ async function joinAndStayInVC(voiceChannel) {
 // Plays a TTS prompt in the given VC and resolves when playback finishes.
 // Google TTS returns MP3. We explicitly decode it through the bundled FFmpeg binary
 // into raw 48 kHz stereo PCM so Discord's voice player can reliably play it.
+function downloadAudio(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 AunXz-GreetVoice' }, timeout: 15000 }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) return downloadAudio(res.headers.location).then(resolve, reject);
+      if (res.statusCode !== 200) return reject(new Error(`Google TTS returned HTTP ${res.statusCode}.`));
+      const chunks=[]; res.on('data',c=>chunks.push(c)); res.on('end',()=>resolve(Buffer.concat(chunks))); res.on('error',reject);
+    });
+    req.on('timeout',()=>req.destroy(new Error('Google TTS request timed out.')));
+    req.on('error',reject);
+  });
+}
+
 async function playTTSInChannel(guild, vcId, prompt) {
   const channel = guild.channels.cache.get(vcId);
   if (!channel || !channel.isVoiceBased?.()) throw new Error('Configured greetvoice channel was not found.');
-
   const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
   if (!me) throw new Error('Could not resolve the bot member.');
   const perms = channel.permissionsFor(me);
-  if (perms && (!perms.has(PermissionFlagsBits.Connect) || !perms.has(PermissionFlagsBits.Speak))) {
-    throw new Error('The bot needs Connect and Speak permissions in the greetvoice channel.');
-  }
+  if (perms && (!perms.has(PermissionFlagsBits.Connect) || !perms.has(PermissionFlagsBits.Speak))) throw new Error('The bot needs Connect and Speak permissions in the greetvoice channel.');
   if (!ffmpegPath) throw new Error('ffmpeg-static is not available. Run npm install.');
-
-  const connection = await joinAndStayInVC(channel);
-  await entersState(connection, VoiceConnectionStatus.Ready, 15000);
-
   const text = String(prompt || 'Welcome!').trim().slice(0, 500);
   if (!text) throw new Error('The greetvoice TTS prompt is empty.');
+  const connection = await joinAndStayInVC(channel);
+  await entersState(connection, VoiceConnectionStatus.Ready, 20000);
 
-  const url = googleTTS.getAudioUrl(text, {
-    lang: 'en',
-    slow: false,
-    host: 'https://translate.google.com'
-  });
-
-  const response = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 AunXz-GreetVoice' }
-  });
-  if (!response.ok) throw new Error(`Google TTS returned HTTP ${response.status}.`);
-  const audioBuffer = Buffer.from(await response.arrayBuffer());
+  const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+  const audioBuffer = await downloadAudio(url);
   if (!audioBuffer.length) throw new Error('Google TTS returned an empty audio file.');
 
-  const ffmpeg = spawn(ffmpegPath, [
-    '-hide_banner', '-loglevel', 'error',
-    '-i', 'pipe:0',
-    '-f', 's16le', '-ar', '48000', '-ac', '2',
-    'pipe:1'
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-  let ffmpegError = '';
-  ffmpeg.stderr.on('data', chunk => { ffmpegError += chunk.toString(); });
-  ffmpeg.stdin.end(audioBuffer);
-
-  const player = createAudioPlayer();
-  connection.subscribe(player);
-  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
-
-  await new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (err) reject(err); else resolve();
-    };
-
-    const timer = setTimeout(() => {
-      try { player.stop(true); } catch {}
-      try { ffmpeg.kill('SIGKILL'); } catch {}
-      finish(new Error('TTS playback timed out after 30 seconds.'));
-    }, 30000);
-
-    player.once(AudioPlayerStatus.Playing, () => {});
-    player.once(AudioPlayerStatus.Idle, () => finish());
-    player.once('error', err => finish(err));
-    ffmpeg.once('error', err => finish(err));
-    ffmpeg.once('close', code => {
-      if (code !== 0 && !settled) {
-        finish(new Error(`FFmpeg exited with code ${code}: ${ffmpegError.trim() || 'unknown error'}`));
-      }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aunxz-tts-'));
+  const input = path.join(dir, 'input.mp3');
+  const output = path.join(dir, 'output.ogg');
+  fs.writeFileSync(input, audioBuffer);
+  try {
+    await new Promise((resolve, reject) => {
+      const ff = spawn(ffmpegPath, ['-y','-hide_banner','-loglevel','error','-i',input,'-c:a','libopus','-b:a','96k','-ar','48000','-ac','2',output], {stdio:['ignore','ignore','pipe']});
+      let err=''; ff.stderr.on('data',c=>err+=c.toString()); ff.once('error',reject); ff.once('close',code=>code===0?resolve():reject(new Error(`FFmpeg exited with code ${code}: ${err.trim()||'unknown error'}`)));
     });
+    if (!fs.existsSync(output) || fs.statSync(output).size < 100) throw new Error('FFmpeg produced no playable audio.');
 
-    player.play(resource);
-  }).finally(() => {
-    try { ffmpeg.kill('SIGKILL'); } catch {}
-  });
-
-  return true;
+    const player=createAudioPlayer({behaviors:{noSubscriber:'stop'}});
+    connection.subscribe(player);
+    const resource=createAudioResource(output,{inputType:StreamType.OggOpus,metadata:{guildId:guild.id,source:'greetvoice'}});
+    await new Promise((resolve,reject)=>{
+      let settled=false; const timer=setTimeout(()=>finish(new Error('TTS playback timed out after 30 seconds.')),30000);
+      const finish=err=>{if(settled)return;settled=true;clearTimeout(timer);try{player.stop(true);}catch{};err?reject(err):resolve();};
+      player.once(AudioPlayerStatus.Playing,()=>{}); player.once(AudioPlayerStatus.Idle,()=>finish()); player.once('error',finish); player.play(resource);
+    });
+    return true;
+  } finally { try{fs.rmSync(dir,{recursive:true,force:true});}catch{} }
 }
 // ===================================================================================
 // ANTINUKE
@@ -364,6 +345,81 @@ async function onVoiceJoinGreetvoice(oldState, newState) {
 }
 
 // ===================================================================================
+// ANTI BAD-WORD + HONEYPOT
+// ===================================================================================
+// This is a multilingual starter detector rather than a claim of literally every word in every language.
+// Guild admins can extend it with their own list from /antibadwordsetup.
+const BUILTIN_BADWORD_PATTERNS = [
+  /\bf+u+c+k/i, /\bs+h+i+t/i, /\bb+i+t+c+h/i, /\ba+s+s+h+o+l+e/i, /\bd+a+m+n/i, /\bh+e+l+l/i,
+  /\bp+u+t+a/i, /\bm+i+e+r+d+a/i, /\bc+o+n+c+h+a/i, /\bme?rd[ea]/i, /\bputain/i,
+  /\bkurwa/i, /\bchuj/i, /\bdupa/i, /\bshit/i, /\bfuck/i, /\bbastard/i
+];
+function normalizeForFilter(text='') { return text.normalize('NFKC').toLowerCase().replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/[^\p{L}\p{N}]+/gu,''); }
+function containsBadWord(message,cfg){
+  const raw=message.content||''; const normalized=normalizeForFilter(raw);
+  const custom=(cfg.words||[]).map(w=>normalizeForFilter(String(w))).filter(Boolean);
+  if(custom.some(w=>normalized.includes(w))) return true;
+  return BUILTIN_BADWORD_PATTERNS.some(re=>re.test(raw));
+}
+async function handleAntiBadWord(message){
+  const cfg=db.getConfig(message.guild.id).antibadword; if(!cfg.enabled || message.member?.permissions.has(PermissionFlagsBits.Administrator)) return false;
+  if(!containsBadWord(message,cfg)) return false;
+  if(cfg.deleteMessage) await message.delete().catch(()=>{});
+  const log=await getLogChannel(message.guild,'mod');
+  const configured=cfg.logChannelId?message.guild.channels.cache.get(cfg.logChannelId):null;
+  const target=(configured?.isTextBased()?configured:log);
+  if(target) target.send({embeds:[ui.errorEmbed('🚫 Anti Bad-Word',`${message.author} sent a blocked message in ${message.channel}.`)]}).catch(()=>{});
+  return true;
+}
+async function deleteUserMessagesAcrossServer(guild, userId, cleanupMinutes){
+  // Discord has no single endpoint for this. Walk accessible text channels and delete
+  // matching messages newest-first. cleanupMinutes=0 means all available history.
+  const cutoff=cleanupMinutes>0?Date.now()-cleanupMinutes*60*1000:0;
+  let deleted=0;
+  const channels=[...guild.channels.cache.values()].filter(ch=>ch.isTextBased?.() && !ch.isThread?.());
+  for(const channel of channels){
+    const me=guild.members.me;
+    if(!channel.viewable || !me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ViewChannel|PermissionFlagsBits.ReadMessageHistory|PermissionFlagsBits.ManageMessages)) continue;
+    let before;
+    try{
+      while(true){
+        const batch=await channel.messages.fetch({limit:100,...(before?{before}:{})}).catch(()=>null);
+        if(!batch?.size) break;
+        const oldest=[...batch.values()].at(-1);
+        for(const msg of batch.values()){
+          if(msg.createdTimestamp<cutoff) continue;
+          if(msg.author.id===userId) await msg.delete('Honeypot cleanup').then(()=>{deleted++;}).catch(()=>{});
+        }
+        if(!oldest || oldest.createdTimestamp<cutoff || batch.size<100) break;
+        before=oldest.id;
+      }
+    }catch{}
+  }
+  return deleted;
+}
+
+async function handleHoneypot(message){
+  const cfg=db.getConfig(message.guild.id).honeypot;
+  if(!cfg.enabled || message.channel.id!==cfg.channelId || message.author.bot) return false;
+  const invite=(cfg.action==='kick' && cfg.inviteBack)?await message.channel.createInvite({maxAge:86400,maxUses:1,unique:true,reason:'Honeypot invite-back'}).catch(()=>null):null;
+
+  // Always remove the triggering message, then optionally clean the same user's history.
+  await message.delete('Honeypot trigger').catch(()=>{});
+  let cleaned=0;
+  if(cfg.deleteUserMessages!==false){
+    cleaned=await deleteUserMessagesAcrossServer(message.guild,message.author.id,Number(cfg.cleanupMinutes)||0);
+  }
+
+  if(cfg.action==='ban') await message.member?.ban({reason:'Honeypot channel violation'}).catch(()=>{});
+  else if(cfg.action==='kick') await message.member?.kick('Honeypot channel violation').catch(()=>{});
+
+  if(cfg.action!=='delete' && invite) await message.author.send(`You were removed for posting in the honeypot channel. If you were removed by mistake, you can rejoin with this invite: ${invite}`).catch(()=>{});
+  const log=cfg.logChannelId?message.guild.channels.cache.get(cfg.logChannelId):await getLogChannel(message.guild,'mod');
+  if(log?.isTextBased()) log.send({embeds:[ui.warnEmbed('🍯 Honeypot Triggered',`${message.author} triggered <#${cfg.channelId}>. Action: **${cfg.action}**\nPrevious messages removed: **${cleaned}**.`)]}).catch(()=>{});
+  return true;
+}
+
+// ===================================================================================
 // LEVELING
 // ===================================================================================
 function xpForLevel(level) { return 5 * (level ** 2) + 50 * level + 100; }
@@ -442,6 +498,7 @@ module.exports = {
   handleAntiraidJoin,
   handleAntilink,
   handleAntispam,
+  handleAntiBadWord, handleHoneypot,
   lockRoleToSingleChannel, onChannelCreateGreetvoiceSync, onMemberJoinGreetvoice, onVoiceJoinGreetvoice,
   xpForLevel, handleLevelingMessage,
   handleVoicemasterJoin
