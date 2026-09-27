@@ -1282,4 +1282,14 @@ for (const [name,key,title] of [['afk','afk','AFK'],['starboard','starboard','St
   commands.push({data:new SlashCommandBuilder().setName(name).setDescription(`Configure ${title}.`).setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(s=>s.setName('setup').setDescription(`Configure ${title}.`)),async execute(interaction){if(!requireAdmin(interaction))return; const cfg=db.getConfig(interaction.guildId); const current=cfg[key]; const enabled=typeof current==='object'? !current.enabled : !current; const patch=typeof current==='object'?{[key]:{enabled}}:{[key]:enabled}; db.saveConfig(interaction.guildId,patch); await interaction.reply({embeds:[ui.okEmbed(`${ui.emoji('settings')} ${title}`,`${title} is now **${enabled?'enabled':'disabled'}**.`)]});}});
 }
 
+// Discord requires every top-level application command name to be unique.
+// Keep the first definition if an accidental duplicate is introduced.
+const _seenCommandNames = new Set();
+for (let i = commands.length - 1; i >= 0; i--) {
+  const name = commands[i]?.data?.name;
+  if (!name) continue;
+  if (_seenCommandNames.has(name)) commands.splice(i, 1);
+  else _seenCommandNames.add(name);
+}
+
 module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
