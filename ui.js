@@ -135,6 +135,16 @@ const HELP_CATEGORIES = {
     name: 'Logging', emojiKey: 'logs',
     desc: '**/logs setup** — route mod/message/member/voice/antinuke/server logs to channels'
   },
+  automation: {
+    name: 'Automation & Content', emojiKey: 'tools',
+    desc: '**/autorespondersetup** — auto-reply when a message matches a phrase\n' +
+      '**/autoreactorsetup** — auto-react with emoji when a message matches a phrase\n' +
+      '**/embedbuilder** — build a custom embed with link buttons and post it\n' +
+      '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
+      '**/antibadwordsetup** — multilingual profanity filter\n' +
+      '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
+      '**/birthdaysetup** — birthday panel + automatic wishes'
+  },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
     desc: 'Use **/setup list** to see every configurable module. Smaller modules use their own **/<feature> setup** command.'
@@ -478,6 +488,87 @@ function greetVoiceSetupRow(cfg) { return [
   new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('greetvoice_cfg:role').setLabel('Select Gate Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')), new ButtonBuilder().setCustomId('greetvoice_cfg:prompt').setLabel('Set TTS Prompt').setStyle(ButtonStyle.Primary).setEmoji(emoji('voice')), new ButtonBuilder().setCustomId('greetvoice_cfg:test').setLabel('Test Voice').setStyle(ButtonStyle.Success).setEmoji(emoji('success')))
 ]; }
 
+// ---------------- AUTORESPONDER ----------------
+function autoresponderSetupEmbed(cfg) {
+  const triggers = cfg.triggers || [];
+  const list = triggers.slice(0, 10).map((t, i) => `**${i + 1}.** \`${t.match}\` (${t.mode}) → ${String(t.response || '').slice(0, 60)}`).join('\n') || 'No triggers yet — press Add Trigger to create one.';
+  return featureSetupEmbed('Auto Responder', 'Automatically replies when a message matches a phrase. Use `{user}` and `{server}` in the response text.', [
+    { name: 'Status', value: cfg.enabled ? 'Enabled' : 'Disabled', inline: true },
+    { name: 'Triggers', value: String(triggers.length), inline: true },
+    { name: 'Matching', value: cfg.ignoreCase ? 'Case-insensitive' : 'Case-sensitive', inline: true },
+    { name: 'Current triggers', value: list, inline: false }
+  ]);
+}
+function autoresponderSetupRow(cfg) {
+  const triggers = cfg.triggers || [];
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('autoresponder_cfg:toggle').setLabel(cfg.enabled ? 'Disable' : 'Enable').setStyle(cfg.enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(cfg.enabled ? emoji('disabled') : emoji('enabled')),
+    new ButtonBuilder().setCustomId('autoresponder_cfg:add').setLabel('Add Trigger').setStyle(ButtonStyle.Primary).setEmoji(emoji('add')),
+    new ButtonBuilder().setCustomId('autoresponder_cfg:case').setLabel(cfg.ignoreCase ? 'Case: Insensitive' : 'Case: Sensitive').setStyle(ButtonStyle.Secondary).setEmoji(emoji('settings'))
+  )];
+  if (triggers.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('autoresponder_cfg:remove').setPlaceholder('Remove a trigger…')
+        .addOptions(triggers.slice(0, 25).map(t => ({ label: (t.match || '(empty)').slice(0, 90), value: t.id, emoji: emoji('remove') })))
+    ));
+  }
+  return rows;
+}
+
+// ---------------- AUTOREACTOR ----------------
+function autoreactorSetupEmbed(cfg) {
+  const triggers = cfg.triggers || [];
+  const list = triggers.slice(0, 10).map((t, i) => `**${i + 1}.** \`${t.match}\` (${t.mode}) → ${(t.emojis || []).join(' ')}`).join('\n') || 'No triggers yet — press Add Trigger to create one.';
+  return featureSetupEmbed('Auto Reactor', 'Automatically reacts with emoji when a message matches a phrase.', [
+    { name: 'Status', value: cfg.enabled ? 'Enabled' : 'Disabled', inline: true },
+    { name: 'Triggers', value: String(triggers.length), inline: true },
+    { name: 'Matching', value: cfg.ignoreCase ? 'Case-insensitive' : 'Case-sensitive', inline: true },
+    { name: 'Current triggers', value: list, inline: false }
+  ]);
+}
+function autoreactorSetupRow(cfg) {
+  const triggers = cfg.triggers || [];
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('autoreactor_cfg:toggle').setLabel(cfg.enabled ? 'Disable' : 'Enable').setStyle(cfg.enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(cfg.enabled ? emoji('disabled') : emoji('enabled')),
+    new ButtonBuilder().setCustomId('autoreactor_cfg:add').setLabel('Add Trigger').setStyle(ButtonStyle.Primary).setEmoji(emoji('add')),
+    new ButtonBuilder().setCustomId('autoreactor_cfg:case').setLabel(cfg.ignoreCase ? 'Case: Insensitive' : 'Case: Sensitive').setStyle(ButtonStyle.Secondary).setEmoji(emoji('settings'))
+  )];
+  if (triggers.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('autoreactor_cfg:remove').setPlaceholder('Remove a trigger…')
+        .addOptions(triggers.slice(0, 25).map(t => ({ label: (t.match || '(empty)').slice(0, 90), value: t.id, emoji: emoji('remove') })))
+    ));
+  }
+  return rows;
+}
+
+// ---------------- EMBED BUILDER ----------------
+function embedBuilderPreviewEmbed(draft) {
+  const e = base(draft.title || 'Untitled Embed');
+  e.setDescription(draft.description || '*No description set — press Edit Text.*');
+  if (draft.color) { const n = parseInt(String(draft.color).replace('#', ''), 16); if (!Number.isNaN(n)) e.setColor(n); }
+  if (draft.imageUrl) e.setImage(draft.imageUrl);
+  if (draft.thumbnailUrl) e.setThumbnail(draft.thumbnailUrl);
+  if (draft.footer) e.setFooter({ text: draft.footer.slice(0, 200) });
+  return e;
+}
+function embedBuilderRow(draft) {
+  const buttons = draft.buttons || [];
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('embedbuilder:text').setLabel('Edit Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+    new ButtonBuilder().setCustomId('embedbuilder:image').setLabel('Edit Images').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+    new ButtonBuilder().setCustomId('embedbuilder:addbutton').setLabel('Add Button').setStyle(ButtonStyle.Secondary).setEmoji(emoji('add')),
+    new ButtonBuilder().setCustomId('embedbuilder:post').setLabel('Post').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
+  )];
+  if (buttons.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('embedbuilder:removebutton').setPlaceholder(`Remove a button… (${buttons.length} added)`)
+        .addOptions(buttons.slice(0, 25).map((b, i) => ({ label: (b.label || 'Button').slice(0, 90), value: String(i), emoji: emoji('remove') })))
+    ));
+  }
+  return rows;
+}
+
 module.exports.featureSetupEmbed = featureSetupEmbed;
 module.exports.featureSetupRow = featureSetupRow;
 module.exports.buttonRoleEmbed = buttonRoleEmbed;
@@ -499,5 +590,7 @@ module.exports = {
   levelUpEmbed, leaderboardEmbed,
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
   featureSetupEmbed, featureSetupRow, buttonRoleEmbed, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
+  autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
+  embedBuilderPreviewEmbed, embedBuilderRow,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
