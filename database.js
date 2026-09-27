@@ -100,6 +100,20 @@ CREATE TABLE IF NOT EXISTS emoji_overrides (
   name TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS giveaways (
+  id TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL,
+  messageId TEXT NOT NULL,
+  hostId TEXT NOT NULL,
+  prize TEXT NOT NULL,
+  winners INTEGER NOT NULL DEFAULT 1,
+  endsAt INTEGER NOT NULL,
+  ended INTEGER NOT NULL DEFAULT 0,
+  entrants TEXT NOT NULL DEFAULT '[]',
+  createdAt INTEGER NOT NULL
+);
 `);
 
 // ---------- default config shape ----------
@@ -137,7 +151,7 @@ const DEFAULT_CONFIG = {
   },
   automod: { badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
   afk: {},
-  autorole: { enabled: false, roleId: null },
+  autorole: { enabled: false, roleId: null, humanRoleId: null, botRoleId: null },
   reactionRoles: {},
   suggestions: { enabled: false, channelId: null },
   polls: { enabled: true },
@@ -313,6 +327,41 @@ function recentJoinCount(guildId, windowSeconds) {
   return recentJoinsStmt.get(guildId, Date.now() - windowSeconds * 1000).c;
 }
 
+
+// ---------- giveaways ----------
+const createGiveawayStmt = db.prepare(`INSERT INTO giveaways
+  (id, guildId, channelId, messageId, hostId, prize, winners, endsAt, ended, entrants, createdAt)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', ?)`);
+const getGiveawayStmt = db.prepare('SELECT * FROM giveaways WHERE id = ?');
+const activeGiveawaysStmt = db.prepare('SELECT * FROM giveaways WHERE ended = 0 AND endsAt > ? ORDER BY endsAt ASC');
+const allGiveawaysStmt = db.prepare('SELECT * FROM giveaways WHERE guildId = ? ORDER BY createdAt DESC LIMIT ?');
+const finishGiveawayStmt = db.prepare('UPDATE giveaways SET ended = 1, entrants = ? WHERE id = ?');
+const setGiveawayMessageStmt = db.prepare('UPDATE giveaways SET messageId = ? WHERE id = ?');
+
+function createGiveaway(row) {
+  createGiveawayStmt.run(row.id, row.guildId, row.channelId, row.messageId || '', row.hostId, row.prize, row.winners, row.endsAt, Date.now());
+  return getGiveawayStmt.get(row.id);
+}
+function getGiveaway(id) { return getGiveawayStmt.get(id); }
+function getActiveGiveaways() { return activeGiveawaysStmt.all(Date.now()); }
+function listGiveaways(guildId, limit = 10) { return allGiveawaysStmt.all(guildId, limit); }
+function addGiveawayEntrant(id, userId) {
+  const row = getGiveaway(id);
+  if (!row || row.ended) return null;
+  const entrants = JSON.parse(row.entrants || '[]');
+  if (!entrants.includes(userId)) entrants.push(userId);
+  db.prepare('UPDATE giveaways SET entrants = ? WHERE id = ?').run(JSON.stringify(entrants), id);
+  return entrants;
+}
+function finishGiveaway(id, entrants = null) {
+  const row = getGiveaway(id);
+  if (!row) return null;
+  const finalEntrants = entrants || JSON.parse(row.entrants || '[]');
+  finishGiveawayStmt.run(JSON.stringify(finalEntrants), id);
+  return getGiveawayStmt.get(id);
+}
+function setGiveawayMessage(id, messageId) { setGiveawayMessageStmt.run(messageId, id); }
+
 // ---------- emoji overrides (bot-wide, owner-configurable via /emoji) ----------
 const getEmojiStmt = db.prepare('SELECT value FROM emoji_overrides WHERE name = ?');
 const setEmojiStmt = db.prepare(`
@@ -350,5 +399,6 @@ module.exports = {
   logAction, recentActions,
   getStickyRoles, setStickyRoles,
   bumpSpam, trackJoin, recentJoinCount,
-  getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides
+  getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
+  createGiveaway, getGiveaway, getActiveGiveaways, listGiveaways, addGiveawayEntrant, finishGiveaway, setGiveawayMessage
 };
