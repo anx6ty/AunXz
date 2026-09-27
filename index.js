@@ -5,7 +5,8 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
-  AuditLogEvent
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ButtonBuilder, ButtonStyle,
+  AuditLogEvent, PermissionsBitField
 } = require('discord.js');
 
 const db = require('./database');
@@ -34,22 +35,15 @@ async function registerCommands() {
   const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
   const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
 
-  // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
-  // propagate on first deploy; instant after that on updates within the same command set).
   await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: publicBody });
   console.log(`Registered ${publicBody.length} global commands.`);
 
-  // Owner-only commands are deliberately NOT registered globally — they're guild-scoped to a
-  // single "home" server (OWNER_GUILD_ID, falling back to GUILD_ID for backward compatibility)
-  // so they don't show up as slash commands in every server the bot joins. They're still usable
-  // everywhere as text commands (<prefix>eval ..., <prefix>maintenance ...) since execute()
-  // itself checks isOwner() regardless of how it was invoked.
   const ownerGuildId = process.env.OWNER_GUILD_ID || process.env.GUILD_ID;
   if (ownerGuildId && ownerBody.length) {
     await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, ownerGuildId), { body: ownerBody });
-    console.log(`Registered ${ownerBody.length} owner-only commands to guild ${ownerGuildId}.`);
+    console.log(`Registered ${ownerBody.length} owner-only commands to guild${ownerGuildId}.`);
   } else if (ownerBody.length) {
-    console.log(`OWNER_GUILD_ID not set — ${ownerBody.length} owner-only command(s) not registered as slash commands (still usable as text commands, e.g. !eval).`);
+    console.log(`OWNER_GUILD_ID not set — ${ownerBody.length} owner-only command(s) not registered as slash commands.`);
   }
 }
 
@@ -60,9 +54,7 @@ client.once('ready', async () => {
 });
 
 // ---------------------------------------------------------------------------------
-// Text-command engine — "<prefix> <cmd> ..." runs the exact same execute(interaction)
-// handlers as slash commands, via a small adapter that mimics the ChatInputCommandInteraction
-// surface those handlers use (options.getX, reply, member, guild, etc).
+// Text-command engine & helpers
 // ---------------------------------------------------------------------------------
 const OPT = { SUBCOMMAND: 1, SUBCOMMAND_GROUP: 2, STRING: 3, INTEGER: 4, BOOLEAN: 5, USER: 6, CHANNEL: 7, ROLE: 8, MENTIONABLE: 9, NUMBER: 10 };
 
@@ -74,8 +66,6 @@ function tokenize(str) {
   return tokens;
 }
 
-// Walks a command's option tree to find which subcommand/group (if any) the user typed,
-// consuming those tokens, and returns the flat list of leaf (non-subcommand) options left to fill.
 function findOptionsSchema(json, tokens) {
   let options = json.options || [];
   let group = null, subcommand = null;
@@ -115,12 +105,10 @@ function resolveOptionValue(type, raw, message) {
       const id = raw.replace(/[<#>]/g, '');
       return message.mentions.channels.get(id) || message.guild.channels.cache.get(id) || null;
     }
-    default: return raw; // STRING and anything else passes through as text
+    default: return raw;
   }
 }
 
-// Positionally fills leaf options from tokens. The last option, if it's a STRING, greedily
-// swallows every remaining token (so reasons/messages/prompts don't need quotes).
 function parseLeafArgs(leafOptions, tokens) {
   const raw = {};
   for (let i = 0; i < leafOptions.length; i++) {
@@ -189,6 +177,7 @@ function buildFakeInteraction(message, json, tokens) {
   };
   return fake;
 }
+
 function stripEphemeral(payload) {
   if (!payload || typeof payload !== 'object') return payload;
   const { ephemeral, ...rest } = payload;
@@ -226,7 +215,7 @@ async function handlePrefixCommand(message) {
 }
 
 // ---------------------------------------------------------------------------------
-// interactionCreate — slash commands, buttons, select menus, modals
+// interactionCreate — slash commands, interactive setup views, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -239,9 +228,16 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
-      const key = interaction.values[0];
-      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'help_select') {
+        const key = interaction.values[0];
+        return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
+      }
+
+      // Handle Select Menu for Kicking Members from Temp VC
+      if (interaction.customId.startsWith('vm_kick_select_')) {
+        return handleVCKickSelect(interaction);
+      }
     }
 
     if (interaction.isButton()) return handleButton(interaction);
@@ -299,28 +295,101 @@ async function handleButton(interaction) {
     return;
   }
 
-  // ---- Voicemaster ----
+  // ---- Temp VC / Voicemaster Control Buttons ----
   if (id.startsWith('vm_')) {
     const vc = interaction.member.voice.channel;
-    if (!vc || !db.getVMChannel(vc.id)) return interaction.reply({ embeds: [ui.errorEmbed('No Channel', 'Join a voicemaster channel first.')], ephemeral: true });
+    if (!vc || !db.getVMChannel(vc.id)) return interaction.reply({ embeds: [ui.errorEmbed('No Channel', 'You are not inside your temporary voice channel.')], ephemeral: true });
+    
     const record = db.getVMChannel(vc.id);
-    if (record.ownerId !== interaction.user.id) return interaction.reply({ embeds: [ui.errorEmbed('Not Owner', 'Only the channel owner can do that.')], ephemeral: true });
+    if (record.ownerId !== interaction.user.id) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Access Denied 🚫', 'Only the owner of this Voice Channel can use these controls.')], ephemeral: true });
+    }
 
     const everyone = interaction.guild.roles.everyone;
-    if (id === 'vm_lock') { await vc.permissionOverwrites.edit(everyone, { Connect: false }); return interaction.reply({ embeds: [ui.okEmbed('🔒 Locked', 'Channel locked.')], ephemeral: true }); }
-    if (id === 'vm_unlock') { await vc.permissionOverwrites.edit(everyone, { Connect: true }); return interaction.reply({ embeds: [ui.okEmbed('🔓 Unlocked', 'Channel unlocked.')], ephemeral: true }); }
-    if (id === 'vm_hide') { await vc.permissionOverwrites.edit(everyone, { ViewChannel: false }); return interaction.reply({ embeds: [ui.okEmbed('🙈 Hidden', 'Channel hidden.')], ephemeral: true }); }
-    if (id === 'vm_unhide') { await vc.permissionOverwrites.edit(everyone, { ViewChannel: true }); return interaction.reply({ embeds: [ui.okEmbed('👁️ Visible', 'Channel visible.')], ephemeral: true }); }
-    if (id === 'vm_rename' || id === 'vm_limit' || id === 'vm_transfer' || id === 'vm_kick') return openVMModal(interaction, id);
+
+    // Toggle Lock / Unlock
+    if (id === 'vm_lock' || id === 'vm_unlock') {
+      const isLocked = vc.permissionsFor(everyone).has(PermissionsBitField.Flags.Connect) === false;
+      await vc.permissionOverwrites.edit(everyone, { Connect: isLocked ? null : false });
+      return interaction.reply({
+        embeds: [ui.okEmbed(isLocked ? '🔓 Channel Unlocked' : '🔒 Channel Locked', isLocked ? 'Your Voice Channel is now **unlocked** for everyone.' : 'Your Voice Channel is now **locked**.')],
+        ephemeral: true
+      });
+    }
+
+    // Toggle Hide / Unhide
+    if (id === 'vm_hide' || id === 'vm_unhide') {
+      const isHidden = vc.permissionsFor(everyone).has(PermissionsBitField.Flags.ViewChannel) === false;
+      await vc.permissionOverwrites.edit(everyone, { ViewChannel: isHidden ? null : false });
+      return interaction.reply({
+        embeds: [ui.okEmbed(isHidden ? '👁️ Channel Visible' : '🙈 Channel Hidden', isHidden ? 'Your Voice Channel is now **visible** to all members.' : 'Your Voice Channel is now **hidden**.')],
+        ephemeral: true
+      });
+    }
+
+    // Interactive Kick Selection Menu Trigger
+    if (id === 'vm_kick') {
+      const membersInVc = vc.members.filter(m => m.id !== interaction.user.id);
+
+      if (membersInVc.size === 0) {
+        return interaction.reply({
+          embeds: [ui.warnEmbed('⚠️ Voice Channel Empty', 'There are currently no other members in your Voice Channel to disconnect.')],
+          ephemeral: true
+        });
+      }
+
+      const selectMenu = new StringSelectMenuBuilder()
+        .setCustomId(`vm_kick_select_${interaction.user.id}`)
+        .setPlaceholder('Select a member to disconnect...');
+
+      membersInVc.forEach(m => {
+        selectMenu.addOptions(
+          new StringSelectMenuOptionBuilder()
+            .setLabel(m.displayName)
+            .setValue(m.id)
+            .setDescription(`User ID: ${m.id}`)
+            .setEmoji('👤')
+        );
+      });
+
+      const menuRow = new ActionRowBuilder().addComponents(selectMenu);
+      const kickEmbed = ui.base('👢 Kick Voice Channel Member')
+        .setDescription('Select a member from the dropdown menu below to disconnect them from your Voice Channel.')
+        .setColor(0xE67E22);
+
+      return interaction.reply({ embeds: [kickEmbed], components: [menuRow], ephemeral: true });
+    }
+
+    if (id === 'vm_rename' || id === 'vm_limit' || id === 'vm_transfer') return openVMModal(interaction, id);
   }
+}
+
+// Handler for the Ephemeral Kick Selection Menu Callback
+async function handleVCKickSelect(interaction) {
+  const targetId = interaction.values[0];
+  const targetMember = await interaction.guild.members.fetch(targetId).catch(() => null);
+  const ownerVoiceChannel = interaction.member.voice.channel;
+
+  if (!targetMember || !targetMember.voice.channelId || targetMember.voice.channelId !== ownerVoiceChannel?.id) {
+    return interaction.reply({
+      embeds: [ui.errorEmbed('❌ Member Unavailable', 'The selected user is **no longer present** inside your Voice Channel.')],
+      ephemeral: true
+    });
+  }
+
+  await targetMember.voice.disconnect().catch(() => {});
+
+  return interaction.reply({
+    embeds: [ui.okEmbed('👢 Member Disconnected', `Successfully kicked **${targetMember.user.tag}** from **${ownerVoiceChannel.name}**.`)],
+    ephemeral: true
+  });
 }
 
 async function openVMModal(interaction, id) {
   const fieldMap = {
     vm_rename: { title: 'Rename Channel', label: 'New name', id: 'value' },
     vm_limit: { title: 'Set User Limit', label: 'Limit (0 = unlimited)', id: 'value' },
-    vm_transfer: { title: 'Transfer Ownership', label: 'User ID to transfer to', id: 'value' },
-    vm_kick: { title: 'Kick From Channel', label: 'User ID to kick', id: 'value' }
+    vm_transfer: { title: 'Transfer Ownership', label: 'User ID to transfer to', id: 'value' }
   };
   const f = fieldMap[id];
   const modal = new ModalBuilder().setCustomId(id).setTitle(f.title).addComponents(
@@ -336,11 +405,6 @@ async function handleModal(interaction) {
 
   if (interaction.customId === 'vm_rename') { await vc.setName(value.slice(0, 100)); return interaction.reply({ embeds: [ui.okEmbed('✏️ Renamed', `Now called **${value}**.`)], ephemeral: true }); }
   if (interaction.customId === 'vm_limit') { await vc.setUserLimit(Math.max(0, Math.min(99, parseInt(value) || 0))); return interaction.reply({ embeds: [ui.okEmbed('🔢 Limit Set', `User limit is now ${value}.`)], ephemeral: true }); }
-  if (interaction.customId === 'vm_kick') {
-    const member = vc.members.get(value.trim());
-    await member?.voice.disconnect().catch(() => {});
-    return interaction.reply({ embeds: [ui.okEmbed('👢 Kicked', member ? `${member.user.tag} removed.` : 'User not found in channel.')], ephemeral: true });
-  }
   if (interaction.customId === 'vm_transfer') {
     db.removeVMChannel(vc.id);
     db.addVMChannel(vc.id, interaction.guildId, value.trim());
@@ -349,11 +413,10 @@ async function handleModal(interaction) {
 }
 
 // ---------------------------------------------------------------------------------
-// guildMemberAdd — antiraid, greetvoice, welcome, autorole, sticky roles
+// guildMemberAdd — antiraid, welcome, autorole, sticky roles (GreetVoice Excluded)
 // ---------------------------------------------------------------------------------
 client.on('guildMemberAdd', async (member) => {
   await sys.handleAntiraidJoin(member).catch(() => {});
-  await sys.onMemberJoinGreetvoice(member).catch(() => {});
 
   const cfg = db.getConfig(member.guild.id);
   if (cfg.welcome.enabled && cfg.welcome.channel) {
@@ -403,7 +466,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 });
 
 // ---------------------------------------------------------------------------------
-// messageCreate — antilink, antispam, leveling, automod, prefix-less utility
+// messageCreate — antilink, antispam, leveling, automod, prefix commands
 // ---------------------------------------------------------------------------------
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
@@ -420,7 +483,7 @@ client.on('messageCreate', async (message) => {
 });
 
 // ---------------------------------------------------------------------------------
-// voiceStateUpdate — greetvoice TTS gate, voicemaster join-to-create
+// voiceStateUpdate — greetvoice state management, voicemaster join-to-create
 // ---------------------------------------------------------------------------------
 client.on('voiceStateUpdate', async (oldState, newState) => {
   if (newState.channelId && newState.channelId !== oldState.channelId) {
