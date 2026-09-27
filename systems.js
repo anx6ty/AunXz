@@ -17,12 +17,13 @@ const persistentConnections = new Map(); // guildId -> connection
 
 async function joinAndStayInVC(voiceChannel) {
   let connection = getVoiceConnection(voiceChannel.guild.id);
-  if (!connection) {
+  if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: voiceChannel.guild.id,
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-      selfDeaf: false
+      selfDeaf: false,
+      selfMute: false
     });
     persistentConnections.set(voiceChannel.guild.id, connection);
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -32,35 +33,58 @@ async function joinAndStayInVC(voiceChannel) {
           entersState(connection, VoiceConnectionStatus.Connecting, 5000)
         ]);
       } catch {
-        // real disconnect (e.g. kicked / VC deleted) — rejoin if the channel still exists
         const freshChannel = voiceChannel.guild.channels.cache.get(voiceChannel.id);
-        if (freshChannel) joinAndStayInVC(freshChannel).catch(() => {});
+        if (freshChannel) {
+          try { connection.destroy(); } catch {}
+          persistentConnections.delete(voiceChannel.guild.id);
+          setTimeout(() => joinAndStayInVC(freshChannel).catch(() => {}), 1000);
+        }
       }
     });
   }
+  // Discord voice connections can take a moment to become usable. Waiting for Ready
+  // avoids the common "operation was aborted" / aborted playback race on Railway.
+  await entersState(connection, VoiceConnectionStatus.Ready, 15000);
   return connection;
 }
 
-// Plays a TTS prompt in the given VC and resolves once playback finishes.
+function downloadAudio(url) {
+  return new Promise((resolve, reject) => {
+    const https = require('https');
+    const req = https.get(url, { headers: { 'User-Agent': 'AunXz/1.0' } }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return downloadAudio(res.headers.location).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`TTS HTTP ${res.statusCode}`)); }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.setTimeout(15000, () => req.destroy(new Error('TTS request timed out')));
+    req.on('error', reject);
+  });
+}
+
 async function playTTSInChannel(guild, vcId, prompt) {
   const channel = guild.channels.cache.get(vcId);
-  if (!channel) throw new Error('Welcome voice channel was not found.');
+  if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Welcome voice channel was not found.');
   const connection = await joinAndStayInVC(channel);
+  const text = String(prompt || 'Welcome!').slice(0, 200);
+  const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+  const buffer = await downloadAudio(url);
+  if (!buffer.length) throw new Error('TTS returned an empty audio file.');
   const player = createAudioPlayer();
   connection.subscribe(player);
-  const text = (prompt || 'Welcome!').slice(0, 200);
-  const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
-  const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
-  if (!response.ok) throw new Error(`TTS request returned HTTP ${response.status}`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (!buffer.length) throw new Error('TTS returned an empty audio file.');
   const resource = createAudioResource(Readable.from(buffer), { inputType: StreamType.Arbitrary });
-  player.play(resource);
-  await entersState(player, AudioPlayerStatus.Playing, 5000).catch(() => {});
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { player.stop(); resolve(); }, 20000);
-    player.once(AudioPlayerStatus.Idle, () => { clearTimeout(timer); resolve(); });
-    player.once('error', err => { clearTimeout(timer); reject(err); });
+    let settled = false;
+    const finish = err => { if (settled) return; settled = true; clearTimeout(timer); err ? reject(err) : resolve(); };
+    const timer = setTimeout(() => { try { player.stop(true); } catch {} finish(); }, 25000);
+    player.once(AudioPlayerStatus.Idle, () => finish());
+    player.once('error', err => finish(err));
+    try { player.play(resource); } catch (e) { finish(e); }
   });
 }
 
