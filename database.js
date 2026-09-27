@@ -300,7 +300,7 @@ function recentJoinCount(guildId, windowSeconds) {
   return recentJoinsStmt.get(guildId, Date.now() - windowSeconds * 1000).c;
 }
 
-// ---------- emoji overrides (bot-wide, owner-configurable via /emojis) ----------
+// ---------- emoji overrides (bot-wide, owner-configurable via /emoji) ----------
 const getEmojiStmt = db.prepare('SELECT value FROM emoji_overrides WHERE name = ?');
 const setEmojiStmt = db.prepare(`
   INSERT INTO emoji_overrides (name, value) VALUES (?, ?)
