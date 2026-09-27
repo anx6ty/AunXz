@@ -282,6 +282,13 @@ async function onVoiceJoinGreetvoice(oldState, newState) {
     await playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
   } catch (e) {
     console.error('greetvoice TTS failed:', e.message);
+    const log = await getLogChannel(guild, 'voice');
+    if (log) {
+      log.send({ embeds: [ui.errorEmbed('🔇 Greetvoice TTS Failed',
+        `Could not play the greeting for ${member}: \`${e.message}\`.\n` +
+        'If this keeps happening, make sure dependencies are installed (`npm install`) — the bot needs `ffmpeg-static` ' +
+        'to transcode the TTS audio.')] }).catch(() => {});
+    }
   }
   // after the prompt finishes (playTTSInChannel resolves when playback ends), disconnect + strip role
   const freshMember = await guild.members.fetch(member.id).catch(() => null);
@@ -349,7 +356,7 @@ async function handleVoicemasterJoin(oldState, newState) {
     await newState.member.voice.setChannel(channel).catch(() => {});
     const controlMsg = await channel.send({
       embeds: [ui.vmControlEmbed(newState.member)],
-      components: ui.vmControlRows()
+      components: ui.vmControlRows(channel)
     }).catch(() => {});
     return;
   }
