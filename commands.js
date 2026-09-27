@@ -35,7 +35,7 @@ const commands = [];
 commands.push({
   data: new SlashCommandBuilder().setName('help').setDescription('Browse everything the bot can do.'),
   async execute(interaction) {
-    await interaction.reply({ embeds: [ui.helpHomeEmbed(interaction.client)], components: [ui.helpSelectRow()] });
+    await interaction.reply({ embeds: [ui.helpHomeEmbed(interaction.client)], components: ui.helpSelectRow() });
   }
 });
 
@@ -216,9 +216,9 @@ function panelSetupCommand(name, description, optionBuilder) {
       const patch = buildModulePatch(name, guildId, o);
       const cfg = db.saveConfig(guildId, patch);
       if (name === 'voicemaster') {
-        return interaction.reply({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
+        return interaction.reply({ embeds: [ui.vmSetupEmbed(cfg)], components: ui.vmSetupRow(cfg) });
       }
-      return interaction.reply({ embeds: [ui.setupPanelEmbed(name, cfg)], components: [ui.setupPanelRow(name, cfg)] });
+      return interaction.reply({ embeds: [ui.setupPanelEmbed(name, cfg)], components: ui.setupPanelRow(name, cfg) });
     }
   };
 }
