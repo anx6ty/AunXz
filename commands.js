@@ -446,10 +446,28 @@ commands.push({
     .addSubcommand(s => s.setName('setup').setDescription('Set the role, voice channel and TTS prompt.')
       .addRoleOption(o => o.setName('role').setDescription('role granted to new members until they complete the greet').setRequired(true))
       .addChannelOption(o => o.setName('vc').setDescription('the only voice channel the role can see/join').setRequired(true).addChannelTypes(ChannelType.GuildVoice))
-      .addStringOption(o => o.setName('prompt').setDescription('TTS text played when a gated member joins the VC').setRequired(true))),
+      .addStringOption(o => o.setName('prompt').setDescription('TTS text played when a gated member joins the VC').setRequired(true)))
+      .addSubcommand(s => s.setName('test').setDescription('Test the configured greetvoice TTS in its voice channel.')
+      .addStringOption(o => o.setName('prompt').setDescription('Optional test prompt (uses the configured prompt if omitted).').setRequired(false))),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
-    if (interaction.options.getSubcommand() !== 'setup') return;
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand === 'test') {
+      const cfg = db.getConfig(interaction.guildId).greetvoice;
+      if (!cfg.enabled || !cfg.vcId || !cfg.ttsPrompt) {
+        return interaction.reply({ embeds: [ui.errorEmbed('Greetvoice Not Configured', 'Run **/greetvoice setup** first.')], ephemeral: true });
+      }
+      const prompt = interaction.options.getString('prompt') || cfg.ttsPrompt;
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        await sys.playTTSInChannel(interaction.guild, cfg.vcId, prompt);
+        return interaction.editReply({ embeds: [ui.okEmbed(`${ui.emoji('voice')} Greetvoice Test`, `TTS finished playing in <#${cfg.vcId}>.`)] });
+      } catch (e) {
+        console.error('greetvoice test failed:', e);
+        return interaction.editReply({ embeds: [ui.errorEmbed('Greetvoice Test Failed', `\`${String(e.message || e).slice(0, 1000)}\``)] });
+      }
+    }
+    if (subcommand !== 'setup') return;
     const role = interaction.options.getRole('role');
     const vc = interaction.options.getChannel('vc');
     const prompt = interaction.options.getString('prompt');
