@@ -19,27 +19,78 @@ const DANGER = 0xed4245;
 const BRAND_FOOTER = 'AIO • all-in-one';
 
 // ---------------- EMOJI REGISTRY ----------------
-// Every icon used on a button (and a few on embed titles) is looked up through emoji(name)
-// instead of being hardcoded, so the owner-only /emojis command can restyle the bot without
-// touching code. Falls back to this default the first time / until overridden.
+// Every distinct emoji found in the bot UI has one canonical key. The override is stored
+// in SQLite, so changing an emoji takes effect immediately without a restart.
 const DEFAULT_EMOJIS = {
-  lock: '🔒', unlock: '🔓', hide: '🙈', unhide: '👁️', rename: '✏️', limit: '🔢', kick: '👢', transfer: '🔁',
-  ticket_open: '🎫', ticket_close: '🔒', staff_controls: '🛠️', claim: '🙋', unclaim: '↩️',
-  add_member: '➕', remove_member: '➖', delete: '🗑️',
-  enable: '🟢', disable: '🔴', edit: '⚙️',
-  ok: '✅', warn: '⚠️', error: '❌', shield: '🛡️'
+  success: '✅', lock: '🔒', voice: '🔊', level: '📈', ticket: '🎫', wave: '👋', settings: '⚙️',
+  kick: '👢', delete: '🗑️', enabled: '🟢', disabled: '🔴', shield: '🛡️', unlock: '🔓',
+  moderation: '🔨', warning: '⚠️', claim: '🙋', undo: '↩️', add: '➕', remove: '➖',
+  hidden: '🙈', visible: '👁️', rename: '✏️', limit: '🔢', transfer: '🔁', category: '📁',
+  voice_mic: '🎙️', link: '🔗', spam: '🚫', tools: '🛠️', error: '❌', logs: '📜', owner: '👑',
+  raid: '🚨', mute: '🔇', boost: '🚀', clear: '🧹', slow: '🐌', unknown: '❔', help: '📖',
+  cancel: '✖️', emoji: '😀', nobody: '🙅', already_gone: '😅', balloon: '🎈',
+  member_join: '📥', member_leave: '📤'
+};
+
+// Backward-compatible semantic names used by existing UI builders.
+const EMOJI_ALIASES = {
+  ok: 'success', warn: 'warning', error: 'error',
+  ticket_open: 'ticket', ticket_close: 'lock', staff_controls: 'tools',
+  unclaim: 'undo', add_member: 'add', remove_member: 'remove',
+  enable: 'enabled', disable: 'disabled', edit: 'settings',
+  unhide: 'visible', hide: 'hidden', rename: 'rename', limit: 'limit',
+  kick: 'kick', transfer: 'transfer', lock: 'lock', unlock: 'unlock',
+  shield: 'shield'
 };
 const EMOJI_KEYS = Object.keys(DEFAULT_EMOJIS);
+const DEFAULT_TO_KEY = new Map(Object.entries(DEFAULT_EMOJIS).map(([k, v]) => [v, k]));
+
+function resolveEmojiKey(name) { return EMOJI_ALIASES[name] || name; }
 function emoji(name) {
-  return db.getEmojiOverride(name) || DEFAULT_EMOJIS[name] || '❔';
+  const key = resolveEmojiKey(name);
+  return db.getEmojiOverride(key) || DEFAULT_EMOJIS[key] || DEFAULT_EMOJIS.unknown;
+}
+
+// Replace every default emoji found inside user-facing text with its current configured value.
+// This also covers embeds built outside of a helper such as ui.okEmbed(...).
+function emojify(value) {
+  if (typeof value !== 'string' || !value) return value;
+  const entries = Object.entries(DEFAULT_EMOJIS).sort((a, b) => b[1].length - a[1].length);
+  const overrides = db.getAllEmojiOverrides();
+  const byDefault = new Map(entries.map(([key, def]) => [def, overrides[key] || def]));
+  const pattern = new RegExp(entries.map(([, def]) => def.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')).join('|'), 'gu');
+  return value.replace(pattern, m => byDefault.get(m) || m);
+}
+
+function decorateEmbed(embed) {
+  const setTitle = embed.setTitle.bind(embed);
+  const setDescription = embed.setDescription.bind(embed);
+  const setFooter = embed.setFooter.bind(embed);
+  const setAuthor = embed.setAuthor.bind(embed);
+  const addFields = embed.addFields.bind(embed);
+  embed.setTitle = value => setTitle(emojify(value));
+  embed.setDescription = value => setDescription(emojify(value));
+  embed.setFooter = value => {
+    if (value && typeof value === 'object') return setFooter({ ...value, text: emojify(value.text) });
+    return setFooter(emojify(value));
+  };
+  embed.setAuthor = value => {
+    if (value && typeof value === 'object') return setAuthor({ ...value, name: emojify(value.name) });
+    return setAuthor(value);
+  };
+  embed.addFields = (...fields) => addFields(...fields.map(field => {
+    if (Array.isArray(field)) return field.map(f => ({ ...f, name: emojify(f.name), value: emojify(f.value) }));
+    if (field && typeof field === 'object') return { ...field, name: emojify(field.name), value: emojify(field.value) };
+    return field;
+  }));
+  return embed;
 }
 
 function base(title) {
-  return new EmbedBuilder()
-    .setColor(THEME)
-    .setTitle(title)
-    .setFooter({ text: BRAND_FOOTER })
-    .setTimestamp();
+  const embed = new EmbedBuilder().setColor(THEME).setTimestamp();
+  decorateEmbed(embed);
+  embed.setTitle(title).setFooter({ text: BRAND_FOOTER });
+  return embed;
 }
 function okEmbed(title, desc) { return base(title).setColor(OK).setDescription(desc); }
 function warnEmbed(title, desc) { return base(title).setColor(WARN).setDescription(desc); }
@@ -48,20 +99,20 @@ function errorEmbed(title, desc) { return base(title).setColor(DANGER).setDescri
 // ---------------- HELP MENU ----------------
 const HELP_CATEGORIES = {
   protection: {
-    label: '🛡️ Protection', emoji: '🛡️',
-    desc: '**/setup antinuke** — punishment, thresholds, protected owner\n' +
-      '**/setup antilink** — delete/warn/mute, domain whitelist, bypass role\n' +
-      '**/setup antispam** — message/mention/emoji flood limits\n' +
-      '**/setup antiraid** — join-rate lockdown, min account age\n' +
+    name: 'Protection', emojiKey: 'shield',
+    desc: '**/antinuke setup** — punishment, thresholds, protected owner\n' +
+      '**/antilink setup** — delete/warn/mute, domain whitelist, bypass role\n' +
+      '**/antispam setup** — message/mention/emoji flood limits\n' +
+      '**/antiraid setup** — join-rate lockdown, min account age\n' +
       '**/whitelist add|remove** — exempt trusted staff from antinuke'
   },
   voice: {
-    label: '🔊 Voice', emoji: '🔊',
-    desc: '**/greetvoice** `<role> <vc> <prompt>` — role-gated VC greeting with TTS\n' +
-      '**/setup voicemaster** — join-to-create hub channel & category'
+    name: 'Voice', emojiKey: 'voice',
+    desc: '**/greetvoice setup** — role-gated VC greeting with TTS\n' +
+      '**/voicemaster setup** — join-to-create hub channel & category'
   },
   moderation: {
-    label: '🔨 Moderation', emoji: '🔨',
+    name: 'Moderation', emojiKey: 'moderation',
     desc: '**/ban /kick /timeout /untimeout** — with mod-log embeds\n' +
       '**/warn /warnings /clearwarns** — warning system\n' +
       '**/purge** — bulk delete with filters\n' +
@@ -69,30 +120,27 @@ const HELP_CATEGORIES = {
       '**/nickname /role add|remove**'
   },
   leveling: {
-    label: '📈 Leveling', emoji: '📈',
-    desc: '**/setup leveling** — xp rate, cooldown, level-up message, role rewards\n' +
+    name: 'Leveling', emojiKey: 'level',
+    desc: '**/leveling setup** — xp rate, cooldown, level-up message, role rewards\n' +
       '**/rank** — view a level card\n' +
       '**/leaderboard** — top XP in the server'
   },
   tickets: {
-    label: '🎫 Tickets', emoji: '🎫',
-    desc: '**/setup tickets** — category, support role, log channel\n' +
-      '**/ticketpanel** — post the open-a-ticket button panel'
+    name: 'Tickets', emojiKey: 'ticket',
+    desc: '**/tickets setup** — ticket category, support role, log channel\n' +
+      '**/ticketpanel** — post the open-a-ticket panel\n' +
+      '**/ticketconfig** — customize panel/welcome images and text'
   },
   logging: {
-    label: '📜 Logging', emoji: '📜',
-    desc: '**/setup logs** — route mod/message/member/voice/antinuke/server logs to channels'
+    name: 'Logging', emojiKey: 'logs',
+    desc: '**/logs setup** — route mod/message/member/voice/antinuke/server logs to channels'
   },
   extra: {
-    label: '⚙️ 40+ more setups', emoji: '⚙️',
-    desc: 'Use **/setup list** to see every configurable module: welcome, leave, boost, ' +
-      'autorole, sticky roles, reaction roles, starboard, invite tracker, birthdays, suggestions, ' +
-      'polls, automod word filter, caps filter, invite filter, nsfw filter, snipe, afk, and more. ' +
-      'Each is toggled with **/setup \\<module\\> enable|disable** plus its own options.\n' +
-      '**/setup greetmessage** — text-channel welcome message on join (not voice-related)'
+    name: '40+ more setups', emojiKey: 'settings',
+    desc: 'Use **/setup list** to see every configurable module. Smaller modules use their own **/<feature> setup** command.'
   },
   owner: {
-    label: '👑 Owner-only', emoji: '👑',
+    name: 'Owner-only', emojiKey: 'owner',
     desc: '**/maintenance** — toggle maintenance mode\n' +
       '**/blacklist add|remove** — block a user from all commands\n' +
       '**/eval** — run raw JS (bot owner only, use with care)\n' +
@@ -101,23 +149,24 @@ const HELP_CATEGORIES = {
 };
 
 function helpHomeEmbed(client) {
-  return base('📖 Help Menu')
+  return base(`${emoji('help')} Help Menu`)
     .setDescription(
       `Pick a category from the menu below.\n\n` +
-      Object.values(HELP_CATEGORIES).map(c => `${c.emoji} **${c.label.split(' ').slice(1).join(' ')}**`).join('\n')
+      Object.values(HELP_CATEGORIES).map(c => `${emoji(c.emojiKey)} **${c.name}**`).join('\n')
     )
     .setThumbnail(client.user.displayAvatarURL());
 }
 function helpCategoryEmbed(key) {
   const cat = HELP_CATEGORIES[key];
-  return base(cat.label).setDescription(cat.desc);
+  if (!cat) return errorEmbed('Unknown Category', 'That help category no longer exists.');
+  return base(`${emoji(cat.emojiKey)} ${cat.name}`).setDescription(cat.desc);
 }
 function helpSelectRow() {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('help_select')
     .setPlaceholder('Choose a category…')
     .addOptions(Object.entries(HELP_CATEGORIES).map(([value, c]) => ({
-      label: c.label.replace(/^\S+\s/, ''), value, emoji: c.emoji
+      label: c.name, value, emoji: emoji(c.emojiKey)
     })));
   return new ActionRowBuilder().addComponents(menu);
 }
@@ -125,8 +174,8 @@ function helpSelectRow() {
 // ---------------- GENERIC CONFIRM / TOGGLE BUTTONS ----------------
 function confirmRow(idBase) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`${idBase}_confirm`).setLabel('Confirm').setStyle(ButtonStyle.Success).setEmoji('✅'),
-    new ButtonBuilder().setCustomId(`${idBase}_cancel`).setLabel('Cancel').setStyle(ButtonStyle.Danger).setEmoji('✖️')
+    new ButtonBuilder().setCustomId(`${idBase}_confirm`).setLabel('Confirm').setStyle(ButtonStyle.Success).setEmoji(emoji('success')),
+    new ButtonBuilder().setCustomId(`${idBase}_cancel`).setLabel('Cancel').setStyle(ButtonStyle.Danger).setEmoji(emoji('cancel'))
   );
 }
 
@@ -188,7 +237,7 @@ function staffControlsRow(claimed) {
 
 // ---------------- VOICEMASTER CONTROL PANEL ----------------
 function vmControlEmbed(owner) {
-  return base('🔊 Voice Channel Controls')
+  return base(`${emoji('voice')} Voice Channel Controls`)
     .setDescription(`Owned by ${owner}. Use the buttons below to manage this room.`);
 }
 // `overrides` lets a caller that JUST changed lock/hide state pass the fresh values directly,
@@ -204,15 +253,15 @@ function vmControlRows(vc, overrides = {}) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('vm_togglelock').setLabel(locked ? 'Unlock' : 'Lock')
-        .setStyle(locked ? ButtonStyle.Success : ButtonStyle.Secondary).setEmoji(locked ? '🔓' : '🔒'),
+        .setStyle(locked ? ButtonStyle.Success : ButtonStyle.Secondary).setEmoji(locked ? emoji('unlock') : emoji('lock')),
       new ButtonBuilder().setCustomId('vm_togglehide').setLabel(hidden ? 'Unhide' : 'Hide')
-        .setStyle(hidden ? ButtonStyle.Success : ButtonStyle.Secondary).setEmoji(hidden ? '👁️' : '🙈'),
-      new ButtonBuilder().setCustomId('vm_rename').setLabel('Rename').setStyle(ButtonStyle.Primary).setEmoji('✏️'),
-      new ButtonBuilder().setCustomId('vm_limit').setLabel('Set Limit').setStyle(ButtonStyle.Primary).setEmoji('🔢')
+        .setStyle(hidden ? ButtonStyle.Success : ButtonStyle.Secondary).setEmoji(hidden ? emoji('visible') : emoji('hidden')),
+      new ButtonBuilder().setCustomId('vm_rename').setLabel('Rename').setStyle(ButtonStyle.Primary).setEmoji(emoji('rename')),
+      new ButtonBuilder().setCustomId('vm_limit').setLabel('Set Limit').setStyle(ButtonStyle.Primary).setEmoji(emoji('limit'))
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('vm_kick').setLabel('Kick').setStyle(ButtonStyle.Danger).setEmoji('👢'),
-      new ButtonBuilder().setCustomId('vm_transfer').setLabel('Transfer').setStyle(ButtonStyle.Danger).setEmoji('🔁')
+      new ButtonBuilder().setCustomId('vm_kick').setLabel('Kick').setStyle(ButtonStyle.Danger).setEmoji(emoji('kick')),
+      new ButtonBuilder().setCustomId('vm_transfer').setLabel('Transfer').setStyle(ButtonStyle.Danger).setEmoji(emoji('transfer'))
     )
   ];
 }
@@ -224,27 +273,27 @@ function vmControlRows(vc, overrides = {}) {
 // every voice channel in the server instead of typing an ID.
 function vmSetupEmbed(cfg) {
   const vm = cfg.voicemaster;
-  const status = vm.enabled ? '🟢 Enabled' : '🔴 Disabled';
-  return base('🔊 Voicemaster — Join to Create')
+  const status = vm.enabled ? `${emoji('enabled')} Enabled` : `${emoji('disabled')} Disabled`;
+  return base(`${emoji('voice')} Voicemaster — Join to Create`)
     .setDescription(
       `Give members their own temporary voice channel the moment they join a hub VC.\n\n` +
       `**Status:** ${status}\n` +
-      `**📁 Category:** ${vm.categoryId ? `<#${vm.categoryId}>` : '*not set*'} — new temp channels are created here.\n` +
-      `**🎙️ Join-to-Create Channel:** ${vm.hubChannelId ? `<#${vm.hubChannelId}>` : '*not set*'} — joining this VC spins up a fresh temp channel.\n\n` +
+      `**${emoji('category')} Category:** ${vm.categoryId ? `<#${vm.categoryId}>` : '*not set*'} — new temp channels are created here.\n` +
+      `**${emoji('voice_mic')} Join-to-Create Channel:** ${vm.hubChannelId ? `<#${vm.hubChannelId}>` : '*not set*'} — joining this VC spins up a fresh temp channel.\n\n` +
       `Use the buttons below to configure each piece, or flip the whole module on/off.`
     );
 }
 function vmSetupRow(cfg) {
   const enabled = cfg.voicemaster.enabled;
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('vm_setup_category').setLabel('Category').setStyle(ButtonStyle.Secondary).setEmoji('📁'),
-    new ButtonBuilder().setCustomId('vm_setup_channel').setLabel('Voice Channel').setStyle(ButtonStyle.Secondary).setEmoji('🎙️'),
+    new ButtonBuilder().setCustomId('vm_setup_category').setLabel('Category').setStyle(ButtonStyle.Secondary).setEmoji(emoji('category')),
+    new ButtonBuilder().setCustomId('vm_setup_channel').setLabel('Voice Channel').setStyle(ButtonStyle.Secondary).setEmoji(emoji('voice_mic')),
     new ButtonBuilder().setCustomId('vm_setup_toggle').setLabel(enabled ? 'Disable' : 'Enable')
-      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? '🔴' : '🟢')
+      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? emoji('disabled') : emoji('enabled'))
   );
 }
 function vmCategoryPromptEmbed() {
-  return base('📁 Pick a Category').setDescription('Choose the category temp voice channels should be created under.');
+  return base(`${emoji('category')} Pick a Category`).setDescription('Choose the category temp voice channels should be created under.');
 }
 function vmCategorySelectRow() {
   const menu = new ChannelSelectMenuBuilder().setCustomId('vm_setup_category_select')
@@ -252,7 +301,7 @@ function vmCategorySelectRow() {
   return new ActionRowBuilder().addComponents(menu);
 }
 function vmChannelPromptEmbed() {
-  return base('🎙️ Pick a Voice Channel').setDescription('Choose the voice channel members join to get their own temp channel.');
+  return base(`${emoji('voice_mic')} Pick a Voice Channel`).setDescription('Choose the voice channel members join to get their own temp channel.');
 }
 function vmChannelSelectRow() {
   const menu = new ChannelSelectMenuBuilder().setCustomId('vm_setup_channel_select')
@@ -270,22 +319,26 @@ function ticketMemberSelectRow(action) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-// ---------------- OWNER: /emojis ----------------
-function emojisListEmbed(overrides) {
-  const lines = EMOJI_KEYS.map(k => `**${k}:** ${overrides[k] || DEFAULT_EMOJIS[k]}${overrides[k] ? ' *(custom)*' : ''}`);
-  return base('😀 Bot Emoji Registry')
-    .setDescription(lines.join('\n') + '\n\nEvery button/embed icon in the bot is looked up by these names. Use `/emojis set` to override one, `/emojis reset` to go back to default.');
+// ---------------- OWNER: /emoji ----------------
+function emojisListEmbed(overrides = {}) {
+  const lines = EMOJI_KEYS.map((key, i) => {
+    const value = overrides[key] || DEFAULT_EMOJIS[key];
+    const custom = overrides[key] ? ' *(custom)*' : '';
+    return `**${i + 1}. ${key}:** ${value}${custom}`;
+  });
+  return base(`${emoji('emoji')} Bot Emoji Registry`)
+    .setDescription(lines.join('\n') + '\n\nChange any entry with **/emoji set**. Reset with **/emoji reset**. Changes apply to buttons and embed text immediately.');
 }
 
 // ---------------- LEVELING ----------------
 function levelUpEmbed(text) {
-  return base('📈 Level Up!').setColor(OK).setDescription(text);
+  return base(`${emoji('level')} Level Up!`).setColor(OK).setDescription(text);
 }
 function leaderboardEmbed(guildName, rows, startRank = 1) {
   const desc = rows.length
     ? rows.map((r, i) => `**#${startRank + i}** <@${r.userId}> — Level ${r.level} (${r.xp} XP)`).join('\n')
     : 'No XP recorded yet.';
-  return base(`📈 ${guildName} Leaderboard`).setDescription(desc);
+  return base(`${emoji('level')} ${guildName} Leaderboard`).setDescription(desc);
 }
 
 // ---------------- SETUP SUMMARY ----------------
@@ -297,34 +350,34 @@ function configSummaryEmbed(moduleName, cfgObject) {
     if (typeof val === 'object') val = '`' + JSON.stringify(val) + '`';
     return `**${k}:** ${val}`;
   });
-  return base(`⚙️ ${moduleName} Settings`).setDescription(lines.join('\n') || 'No settings.');
+  return base(`${emoji('settings')} ${moduleName} Settings`).setDescription(lines.join('\n') || 'No settings.');
 }
 
 function moduleListEmbed(modules) {
-  return base('⚙️ All Setup Modules')
+  return base(`${emoji('settings')} All Setup Modules`)
     .setDescription(modules.map(m => `• \`${m}\``).join('\n'))
-    .setFooter({ text: `${BRAND_FOOTER} • Use /setup <module> to configure` });
+    .setFooter({ text: `${BRAND_FOOTER} • Use /<module> setup to configure` });
 }
 
 // ---------------- INTERACTIVE SETUP PANEL ----------------
-// Every dedicated /setup subcommand replies with one of these instead of a static summary:
+// Every dedicated /<feature> setup command replies with one of these instead of a static summary:
 // a single embed showing current settings + a row of buttons to toggle it on/off or open an
 // edit modal — fully customizable, nothing here is gated or locked behind anything.
 const SETUP_MODULE_META = {
-  antinuke: { emoji: '🛡️', title: 'Antinuke', cfgKey: 'antinuke' },
-  antilink: { emoji: '🔗', title: 'Antilink', cfgKey: 'antilink' },
-  antispam: { emoji: '🚫', title: 'Antispam', cfgKey: 'antispam' },
-  antiraid: { emoji: '🚨', title: 'Antiraid', cfgKey: 'antiraid' },
-  voicemaster: { emoji: '🔊', title: 'Voicemaster', cfgKey: 'voicemaster' },
-  greetmessage: { emoji: '👋', title: 'Greet Message', cfgKey: 'greetmessage' },
-  leveling: { emoji: '📈', title: 'Leveling', cfgKey: 'leveling' },
-  tickets: { emoji: '🎫', title: 'Tickets', cfgKey: 'ticket' }
+  antinuke: { emojiKey: 'shield', title: 'Antinuke', cfgKey: 'antinuke' },
+  antilink: { emojiKey: 'link', title: 'Antilink', cfgKey: 'antilink' },
+  antispam: { emojiKey: 'spam', title: 'Antispam', cfgKey: 'antispam' },
+  antiraid: { emojiKey: 'raid', title: 'Antiraid', cfgKey: 'antiraid' },
+  voicemaster: { emojiKey: 'voice', title: 'Voicemaster', cfgKey: 'voicemaster' },
+  greetmessage: { emojiKey: 'wave', title: 'Greet Message', cfgKey: 'greetmessage' },
+  leveling: { emojiKey: 'level', title: 'Leveling', cfgKey: 'leveling' },
+  tickets: { emojiKey: 'ticket', title: 'Tickets', cfgKey: 'ticket' }
 };
 
 function setupPanelEmbed(sub, cfg) {
   const meta = SETUP_MODULE_META[sub];
   const modcfg = cfg[meta.cfgKey];
-  const status = modcfg.enabled ? '🟢 Enabled' : '🔴 Disabled';
+  const status = modcfg.enabled ? `${emoji('enabled')} Enabled` : `${emoji('disabled')} Disabled`;
   const lines = Object.entries(modcfg).filter(([k]) => k !== 'enabled').map(([k, v]) => {
     let val = v;
     if (val === null || val === undefined) val = '—';
@@ -332,7 +385,7 @@ function setupPanelEmbed(sub, cfg) {
     if (typeof val === 'object') val = '`' + JSON.stringify(val) + '`';
     return `**${k}:** ${val}`;
   });
-  return base(`${meta.emoji} ${meta.title} — Setup`)
+  return base(`${emoji(meta.emojiKey)} ${meta.title} — Setup`)
     .setDescription(`**Status:** ${status}\n\n${lines.join('\n')}\n\n` +
       'Every option below is fully unlocked for you to customize — use the buttons to toggle it or edit its settings.');
 }
@@ -342,35 +395,35 @@ function setupPanelRow(sub, cfg) {
   const enabled = cfg[meta.cfgKey].enabled;
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled ? 'Disable' : 'Enable')
-      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? '🔴' : '🟢'),
-    new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji('⚙️')
+      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? emoji('disabled') : emoji('enabled')),
+    new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings'))
   );
 }
 
 // ---------------- VOICEMASTER: KICK-FROM-VC SELECTION ----------------
 function vmKickPromptEmbed() {
-  return base('👢 Kick From Voice Channel')
-    .setDescription('Pick the member you\'d like to disconnect from your channel below. 🔒 Only you can see and use this menu.');
+  return base(`${emoji('kick')} Kick From Voice Channel`)
+    .setDescription(`Pick the member you'd like to disconnect from your channel below. ${emoji('lock')} Only you can see and use this menu.`);
 }
 function vmKickSelectRow(members) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('vm_kick_pick')
     .setPlaceholder('Choose a member to disconnect…')
-    .addOptions(members.slice(0, 25).map(m => ({ label: m.displayName.slice(0, 100), value: m.id, emoji: '🔇' })));
+    .addOptions(members.slice(0, 25).map(m => ({ label: m.displayName.slice(0, 100), value: m.id, emoji: emoji('mute') })));
   return new ActionRowBuilder().addComponents(menu);
 }
 function vmKickNobodyEmbed() {
-  return warnEmbed('🙅 Nobody To Kick', 'There\'s no one else in your voice channel right now.');
+  return warnEmbed(`${emoji('nobody')} Nobody To Kick`, 'There\'s no one else in your voice channel right now.');
 }
 function vmKickGoneEmbed(userId) {
-  return warnEmbed('😅 Already Gone', `Looks like <@${userId}> isn't in the voice channel anymore — nothing to do here! 🎈`);
+  return warnEmbed(`${emoji('already_gone')} Already Gone`, `Looks like <@${userId}> isn't in the voice channel anymore — nothing to do here! ${emoji('balloon')}`);
 }
 function vmKickedEmbed(tag) {
-  return okEmbed('👢 Member Removed', `**${tag}** has been disconnected from the voice channel. 👋`);
+  return okEmbed(`${emoji('kick')} Member Removed`, `**${tag}** has been disconnected from the voice channel. ${emoji('wave')}`);
 }
 
 module.exports = {
-  THEME, OK, WARN, DANGER, emoji, EMOJI_KEYS, DEFAULT_EMOJIS,
+  THEME, OK, WARN, DANGER, emoji, emojify, EMOJI_KEYS, DEFAULT_EMOJIS,
   base, okEmbed, warnEmbed, errorEmbed,
   HELP_CATEGORIES, helpHomeEmbed, helpCategoryEmbed, helpSelectRow,
   confirmRow,
