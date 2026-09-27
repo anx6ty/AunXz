@@ -7,14 +7,31 @@
 
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder
+  StringSelectMenuBuilder, PermissionFlagsBits
 } = require('discord.js');
+const db = require('./database');
 
 const THEME = 0x2b2d31;
 const OK = 0x57f287;
 const WARN = 0xfee75c;
 const DANGER = 0xed4245;
 const BRAND_FOOTER = 'AIO • all-in-one';
+
+// ---------------- EMOJI REGISTRY ----------------
+// Every icon used on a button (and a few on embed titles) is looked up through emoji(name)
+// instead of being hardcoded, so the owner-only /emojis command can restyle the bot without
+// touching code. Falls back to this default the first time / until overridden.
+const DEFAULT_EMOJIS = {
+  lock: '🔒', unlock: '🔓', hide: '🙈', unhide: '👁️', rename: '✏️', limit: '🔢', kick: '👢', transfer: '🔁',
+  ticket_open: '🎫', ticket_close: '🔒', staff_controls: '🛠️', claim: '🙋', unclaim: '↩️',
+  add_member: '➕', remove_member: '➖', delete: '🗑️',
+  enable: '🟢', disable: '🔴', edit: '⚙️',
+  ok: '✅', warn: '⚠️', error: '❌', shield: '🛡️'
+};
+const EMOJI_KEYS = Object.keys(DEFAULT_EMOJIS);
+function emoji(name) {
+  return db.getEmojiOverride(name) || DEFAULT_EMOJIS[name] || '❔';
+}
 
 function base(title) {
   return new EmbedBuilder()
@@ -40,8 +57,7 @@ const HELP_CATEGORIES = {
   voice: {
     label: '🔊 Voice', emoji: '🔊',
     desc: '**/greetvoice** `<role> <vc> <prompt>` — role-gated VC greeting with TTS\n' +
-      '**/setup voicemaster** — join-to-create hub channel & category\n' +
-      '**/setup greetmessage** — welcome text channel message'
+      '**/setup voicemaster** — join-to-create hub channel & category'
   },
   moderation: {
     label: '🔨 Moderation', emoji: '🔨',
@@ -71,7 +87,8 @@ const HELP_CATEGORIES = {
     desc: 'Use **/setup list** to see every configurable module: welcome, leave, boost, ' +
       'autorole, sticky roles, reaction roles, starboard, invite tracker, birthdays, suggestions, ' +
       'polls, automod word filter, caps filter, invite filter, nsfw filter, snipe, afk, and more. ' +
-      'Each is toggled with **/setup \\<module\\> enable|disable** plus its own options.'
+      'Each is toggled with **/setup \\<module\\> enable|disable** plus its own options.\n' +
+      '**/setup greetmessage** — text-channel welcome message on join (not voice-related)'
   },
   owner: {
     label: '👑 Owner-only', emoji: '👑',
@@ -114,23 +131,53 @@ function confirmRow(idBase) {
 
 // ---------------- TICKET PANEL ----------------
 function ticketPanelEmbed(guildName) {
-  return base(`🎫 ${guildName} Support`)
+  return base(`${emoji('ticket_open')} ${guildName} Support`)
     .setDescription('Need help? Click **Open Ticket** below and our team will assist you shortly.');
 }
 function ticketPanelRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_open').setLabel('Open Ticket').setStyle(ButtonStyle.Primary).setEmoji('🎫')
+    new ButtonBuilder().setCustomId('ticket_open').setLabel('Open Ticket').setStyle(ButtonStyle.Primary).setEmoji(emoji('ticket_open'))
   );
 }
-function ticketControlRow(claimed) {
+// Everything here is pulled from cfg (the guild's `ticket` config) so /ticketsetup's Edit Settings
+// modal fully controls the title, message, thumbnail and banner image — matching a design like
+// "Welcome @user / Category: X / message" + small thumbnail + big banner underneath.
+function ticketWelcomeEmbed(user, cfg) {
+  const text = (cfg.welcomeMessage || 'Welcome {user}! Our support team will assist you shortly.').replace('{user}', `${user}`);
+  const e = base(`${cfg.categoryLabel || 'General Support'} Ticket`)
+    .setDescription(`**Welcome** ${user}\n**Category:** ${cfg.categoryLabel || 'General Support'}\n${text}`);
+  if (cfg.welcomeThumbnail) e.setThumbnail(cfg.welcomeThumbnail);
+  if (cfg.welcomeImage) e.setImage(cfg.welcomeImage);
+  return e;
+}
+// Matches the "embed + buttons directly beneath it" layout: Close Ticket (red) + Staff Controls
+// (blue) sent in the SAME message payload as the welcome embed above.
+function ticketControlRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_claim').setLabel(claimed ? 'Claimed' : 'Claim').setStyle(ButtonStyle.Secondary).setEmoji('🙋').setDisabled(!!claimed),
-    new ButtonBuilder().setCustomId('ticket_close').setLabel('Close').setStyle(ButtonStyle.Danger).setEmoji('🔒')
+    new ButtonBuilder().setCustomId('ticket_close').setLabel('Close Ticket').setStyle(ButtonStyle.Danger).setEmoji(emoji('ticket_close')),
+    new ButtonBuilder().setCustomId('staff_controls').setLabel('Staff Controls').setStyle(ButtonStyle.Primary).setEmoji(emoji('staff_controls'))
   );
 }
-function ticketWelcomeEmbed(user) {
-  return base('🎫 New Ticket')
-    .setDescription(`Hi ${user}, thanks for reaching out. Describe your issue and a staff member will be with you soon.\n\nStaff can **Claim** or **Close** this ticket using the buttons below.`);
+
+// ---------------- TICKET: STAFF CONTROLS SUB-PANEL ----------------
+// Opened (ephemeral, staff-only) by the "Staff Controls" button on the ticket panel above.
+function staffControlsEmbed(ticket) {
+  const claimLine = ticket?.claimedBy ? `**Claimed by:** <@${ticket.claimedBy}>` : '**Claimed by:** nobody yet';
+  return base(`${emoji('staff_controls')} Staff Controls`)
+    .setDescription(`Manage this ticket. ${claimLine}`);
+}
+function staffControlsRow(claimed) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('staff_claim').setLabel(claimed ? 'Unclaim' : 'Claim')
+        .setStyle(claimed ? ButtonStyle.Secondary : ButtonStyle.Success).setEmoji(claimed ? emoji('unclaim') : emoji('claim')),
+      new ButtonBuilder().setCustomId('staff_addmember').setLabel('Add Member').setStyle(ButtonStyle.Primary).setEmoji(emoji('add_member')),
+      new ButtonBuilder().setCustomId('staff_removemember').setLabel('Remove Member').setStyle(ButtonStyle.Primary).setEmoji(emoji('remove_member'))
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('staff_delete').setLabel('Delete Ticket').setStyle(ButtonStyle.Danger).setEmoji(emoji('delete'))
+    )
+  ];
 }
 
 // ---------------- VOICEMASTER CONTROL PANEL ----------------
@@ -138,17 +185,26 @@ function vmControlEmbed(owner) {
   return base('🔊 Voice Channel Controls')
     .setDescription(`Owned by ${owner}. Use the buttons below to manage this room.`);
 }
-function vmControlRows() {
+// `overrides` lets a caller that JUST changed lock/hide state pass the fresh values directly,
+// instead of relying on `vc`'s permission-overwrite cache which may not have settled yet.
+function vmControlRows(vc, overrides = {}) {
+  const everyone = vc.guild.roles.everyone;
+  const overwrite = vc.permissionOverwrites.cache.get(everyone.id);
+  const locked = overrides.locked !== undefined ? overrides.locked
+    : !!(overwrite && overwrite.deny.has(PermissionFlagsBits.Connect));
+  const hidden = overrides.hidden !== undefined ? overrides.hidden
+    : !!(overwrite && overwrite.deny.has(PermissionFlagsBits.ViewChannel));
+
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('vm_lock').setLabel('Lock').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
-      new ButtonBuilder().setCustomId('vm_unlock').setLabel('Unlock').setStyle(ButtonStyle.Secondary).setEmoji('🔓'),
-      new ButtonBuilder().setCustomId('vm_hide').setLabel('Hide').setStyle(ButtonStyle.Secondary).setEmoji('🙈'),
-      new ButtonBuilder().setCustomId('vm_unhide').setLabel('Unhide').setStyle(ButtonStyle.Secondary).setEmoji('👁️')
+      new ButtonBuilder().setCustomId('vm_togglelock').setLabel(locked ? 'Unlock' : 'Lock')
+        .setStyle(locked ? ButtonStyle.Success : ButtonStyle.Secondary).setEmoji(locked ? '🔓' : '🔒'),
+      new ButtonBuilder().setCustomId('vm_togglehide').setLabel(hidden ? 'Unhide' : 'Hide')
+        .setStyle(hidden ? ButtonStyle.Success : ButtonStyle.Secondary).setEmoji(hidden ? '👁️' : '🙈'),
+      new ButtonBuilder().setCustomId('vm_rename').setLabel('Rename').setStyle(ButtonStyle.Primary).setEmoji('✏️'),
+      new ButtonBuilder().setCustomId('vm_limit').setLabel('Set Limit').setStyle(ButtonStyle.Primary).setEmoji('🔢')
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('vm_rename').setLabel('Rename').setStyle(ButtonStyle.Primary).setEmoji('✏️'),
-      new ButtonBuilder().setCustomId('vm_limit').setLabel('Set Limit').setStyle(ButtonStyle.Primary).setEmoji('🔢'),
       new ButtonBuilder().setCustomId('vm_kick').setLabel('Kick').setStyle(ButtonStyle.Danger).setEmoji('👢'),
       new ButtonBuilder().setCustomId('vm_transfer').setLabel('Transfer').setStyle(ButtonStyle.Danger).setEmoji('🔁')
     )
@@ -184,6 +240,69 @@ function moduleListEmbed(modules) {
     .setFooter({ text: `${BRAND_FOOTER} • Use /setup <module> to configure` });
 }
 
+// ---------------- INTERACTIVE SETUP PANEL ----------------
+// Every dedicated /setup subcommand replies with one of these instead of a static summary:
+// a single embed showing current settings + a row of buttons to toggle it on/off or open an
+// edit modal — fully customizable, nothing here is gated or locked behind anything.
+const SETUP_MODULE_META = {
+  antinuke: { emoji: '🛡️', title: 'Antinuke', cfgKey: 'antinuke' },
+  antilink: { emoji: '🔗', title: 'Antilink', cfgKey: 'antilink' },
+  antispam: { emoji: '🚫', title: 'Antispam', cfgKey: 'antispam' },
+  antiraid: { emoji: '🚨', title: 'Antiraid', cfgKey: 'antiraid' },
+  voicemaster: { emoji: '🔊', title: 'Voicemaster', cfgKey: 'voicemaster' },
+  greetmessage: { emoji: '👋', title: 'Greet Message', cfgKey: 'greetmessage' },
+  leveling: { emoji: '📈', title: 'Leveling', cfgKey: 'leveling' },
+  tickets: { emoji: '🎫', title: 'Tickets', cfgKey: 'ticket' }
+};
+
+function setupPanelEmbed(sub, cfg) {
+  const meta = SETUP_MODULE_META[sub];
+  const modcfg = cfg[meta.cfgKey];
+  const status = modcfg.enabled ? '🟢 Enabled' : '🔴 Disabled';
+  const lines = Object.entries(modcfg).filter(([k]) => k !== 'enabled').map(([k, v]) => {
+    let val = v;
+    if (val === null || val === undefined) val = '—';
+    if (Array.isArray(val)) val = val.length ? val.join(', ') : '—';
+    if (typeof val === 'object') val = '`' + JSON.stringify(val) + '`';
+    return `**${k}:** ${val}`;
+  });
+  return base(`${meta.emoji} ${meta.title} — Setup`)
+    .setDescription(`**Status:** ${status}\n\n${lines.join('\n')}\n\n` +
+      'Every option below is fully unlocked for you to customize — use the buttons to toggle it or edit its settings.');
+}
+
+function setupPanelRow(sub, cfg) {
+  const meta = SETUP_MODULE_META[sub];
+  const enabled = cfg[meta.cfgKey].enabled;
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled ? 'Disable' : 'Enable')
+      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? '🔴' : '🟢'),
+    new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji('⚙️')
+  );
+}
+
+// ---------------- VOICEMASTER: KICK-FROM-VC SELECTION ----------------
+function vmKickPromptEmbed() {
+  return base('👢 Kick From Voice Channel')
+    .setDescription('Pick the member you\'d like to disconnect from your channel below. 🔒 Only you can see and use this menu.');
+}
+function vmKickSelectRow(members) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('vm_kick_pick')
+    .setPlaceholder('Choose a member to disconnect…')
+    .addOptions(members.slice(0, 25).map(m => ({ label: m.displayName.slice(0, 100), value: m.id, emoji: '🔇' })));
+  return new ActionRowBuilder().addComponents(menu);
+}
+function vmKickNobodyEmbed() {
+  return warnEmbed('🙅 Nobody To Kick', 'There\'s no one else in your voice channel right now.');
+}
+function vmKickGoneEmbed(userId) {
+  return warnEmbed('😅 Already Gone', `Looks like <@${userId}> isn't in the voice channel anymore — nothing to do here! 🎈`);
+}
+function vmKickedEmbed(tag) {
+  return okEmbed('👢 Member Removed', `**${tag}** has been disconnected from the voice channel. 👋`);
+}
+
 module.exports = {
   THEME, OK, WARN, DANGER,
   base, okEmbed, warnEmbed, errorEmbed,
@@ -191,6 +310,8 @@ module.exports = {
   confirmRow,
   ticketPanelEmbed, ticketPanelRow, ticketControlRow, ticketWelcomeEmbed,
   vmControlEmbed, vmControlRows,
+  vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
-  configSummaryEmbed, moduleListEmbed
+  configSummaryEmbed, moduleListEmbed,
+  SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
