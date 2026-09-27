@@ -101,6 +101,8 @@ client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   client.user.setActivity('/help');
   for (const giveaway of db.getActiveGiveaways()) scheduleGiveaway(giveaway);
+  await runBirthdayWishes().catch(e=>console.error('Birthday check failed:',e));
+  setInterval(() => runBirthdayWishes().catch(e=>console.error('Birthday check failed:',e)), 60 * 60 * 1000);
   console.log(`Database: ${db.DB_PATH}`);
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
 });
@@ -336,6 +338,50 @@ async function openTicketConfigSetting(interaction,setting){
 }
 
 // ---------------------------------------------------------------------------------
+// New interactive systems
+// ---------------------------------------------------------------------------------
+async function handleButtonRoleToggle(interaction, panelId, roleId) {
+  const row=db.getButtonRolePanel(panelId); if(!row || row.guildId!==interaction.guildId) return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','This role panel is no longer configured.')],ephemeral:true});
+  const role=interaction.guild.roles.cache.get(roleId); if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Missing','That role no longer exists.')],ephemeral:true});
+  const member=interaction.member; const has=member.roles.cache.has(role.id);
+  try { if(has) await member.roles.remove(role,'Self-role toggle'); else await member.roles.add(role,'Self-role toggle'); }
+  catch(e){ return interaction.reply({embeds:[ui.errorEmbed('Role Update Failed',`I could not update ${role}. Make sure my role is above it.`)],ephemeral:true}); }
+  return interaction.reply({embeds:[ui.okEmbed(has?'Role Removed':'Role Claimed',has?`Removed ${role} from you.`:`You now have ${role}.`)],ephemeral:true});
+}
+
+async function startStaffApplication(interaction, guildId) {
+  const guild=client.guilds.cache.get(guildId); const cfg=guild ? db.getConfig(guildId).staffapplications : null;
+  if(!guild || !cfg?.enabled) return interaction.reply({content:'This application panel is no longer active.',ephemeral:true});
+  if(!cfg.questions?.length) return interaction.reply({content:'The server has not configured any application questions yet.',ephemeral:true});
+  const existing=db.getActiveAppSessionByUser(guildId,interaction.user.id); if(existing) return interaction.reply({content:'You already have an application in progress. Please finish it first.',ephemeral:true});
+  const id=`${guildId}-${interaction.user.id}-${Date.now()}`; db.createAppSession({id,guildId,userId:interaction.user.id,answers:[],questionIndex:0,status:'active'});
+  try { await interaction.user.send({embeds:[ui.base('📋 Staff Application').setDescription(`Welcome! Are you ready to start your **${cfg.title}** application?\n\nYou will answer **${cfg.questions.length}** questions one at a time.`)],components:ui.staffApplicationReadyRow(id)});
+    return interaction.reply({content:'Check your DMs — I sent you the application start message.',ephemeral:true});
+  } catch { db.updateAppSession(id,[],0,'cancelled'); return interaction.reply({content:'I could not DM you. Please enable DMs from server members and try again.',ephemeral:true}); }
+}
+
+async function submitStaffApplicationAnswer(message, session) {
+  const guild=client.guilds.cache.get(session.guildId); if(!guild) return;
+  const cfg=db.getConfig(session.guildId).staffapplications; const answers=JSON.parse(session.answers||'[]'); answers.push(message.content || (message.attachments.size ? `[Attachment: ${message.attachments.first().url}]` : '[No text]'));
+  const nextIndex=session.questionIndex+1;
+  if(nextIndex < cfg.questions.length){ db.updateAppSession(session.id,answers,nextIndex,'active'); return message.channel.send({embeds:[ui.base(`Question ${nextIndex+1}/${cfg.questions.length}`).setDescription(cfg.questions[nextIndex])]}); }
+  const finished=db.updateAppSession(session.id,answers,nextIndex,'submitted');
+  await message.channel.send({embeds:[ui.okEmbed('✅ Application Submitted','Your application has been sent to the server staff for review. You will receive a DM when a decision is made.')]});
+  const log=guild.channels.cache.get(cfg.logChannelId); if(log?.isTextBased()) await log.send({embeds:[ui.staffApplicationReviewEmbed(finished,cfg.questions)],components:ui.staffApplicationReviewRow(finished.id)}).catch(()=>{});
+}
+
+async function runBirthdayWishes() {
+  const now=new Date(); const month=now.getUTCMonth()+1, day=now.getUTCDate(); const stamp=`${now.getUTCFullYear()}-${month}-${day}`;
+  for(const guild of client.guilds.cache.values()){
+    const cfg=db.getConfig(guild.id).birthdays; if(!cfg.enabled || !cfg.wishChannelId) continue;
+    if(cfg.lastWishedDate===stamp) continue;
+    const rows=db.getBirthdaysToday(guild.id,month,day); const ch=guild.channels.cache.get(cfg.wishChannelId); if(!ch?.isTextBased()) continue;
+    for(const row of rows){ const user=await client.users.fetch(row.userId).catch(()=>null); if(!user) continue; const text=(cfg.message||'Happy Birthday, {user}! 🎉').replace('{user}',`${user}`).replace('{date}',`${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`); await ch.send({embeds:[ui.okEmbed(cfg.title||'🎂 Happy Birthday!',text)]}).catch(()=>{}); }
+    db.saveConfig(guild.id,{birthdays:{lastWishedDate:stamp}});
+  }
+}
+
+// ---------------------------------------------------------------------------------
 // interactionCreate — slash commands, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
 client.on('interactionCreate', async (rawInteraction) => {
@@ -348,6 +394,36 @@ client.on('interactionCreate', async (rawInteraction) => {
       const cmd = commands.find(c => c.data.name === interaction.commandName);
       if (cmd) await cmd.execute(interaction);
       return;
+    }
+
+    // Self-role buttons/dropdowns
+    if (interaction.isButton() && interaction.customId.startsWith('buttonrole_toggle:')) {
+      const [,panelId,roleId]=interaction.customId.split(':');
+      return handleButtonRoleToggle(interaction,panelId,roleId);
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('buttonrole_select:')) {
+      const panelId=interaction.customId.split(':')[1]; const roleId=interaction.values[0];
+      return handleButtonRoleToggle(interaction,panelId,roleId);
+    }
+
+    // Birthday registration
+    if (interaction.isButton() && interaction.customId==='birthday_register') {
+      const modal=new ModalBuilder().setCustomId('birthday_modal').setTitle('Birthday');
+      modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('birthday').setLabel('Birthday (MM-DD)').setPlaceholder('08-08').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(5)));
+      return interaction.showModal(modal);
+    }
+
+    // Staff application DM start / ready / cancel / review
+    if (interaction.isButton() && interaction.customId.startsWith('staffapp_apply:')) return startStaffApplication(interaction,interaction.customId.split(':')[1]);
+    if (interaction.isButton() && (interaction.customId.startsWith('staffapp_ready:') || interaction.customId.startsWith('staffapp_notready:'))) {
+      const [kind,id]=interaction.customId.split(':'); const session=db.getAppSession(id); if(!session || session.userId!==interaction.user.id || session.status!=='active') return interaction.reply({content:'This application session is no longer active.',ephemeral:true});
+      if(kind==='staffapp_notready'){db.updateAppSession(id,[],0,'cancelled'); return interaction.update({embeds:[ui.warnEmbed('Application Paused','No problem. Your application was not started. You can apply again later.')],components:[]});}
+      const cfg=db.getConfig(session.guildId).staffapplications; db.updateAppSession(id,[],0,'active'); return interaction.update({embeds:[ui.base(`Question 1/${cfg.questions.length}`).setDescription(cfg.questions[0])],components:[]});
+    }
+    if (interaction.isButton() && (interaction.customId.startsWith('staffapp_accept:') || interaction.customId.startsWith('staffapp_reject:'))) {
+      const [kind,id]=interaction.customId.split(':'); const session=db.getAppSession(id); if(!session || !interaction.guild || session.guildId!==interaction.guildId || session.status!=='submitted') return interaction.reply({embeds:[ui.errorEmbed('Unavailable','This application is no longer awaiting review.')],ephemeral:true});
+      const cfg=db.getConfig(interaction.guildId).staffapplications; const allowed=interaction.member.permissions.has(PermissionFlagsBits.Administrator)||(cfg.supportRoleId&&interaction.member.roles.cache.has(cfg.supportRoleId)); if(!allowed) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator or the configured staff role.')],ephemeral:true});
+      const modal=new ModalBuilder().setCustomId(`staffapp_decide:${id}:${kind==='staffapp_accept'?'accepted':'rejected'}`).setTitle(kind==='staffapp_accept'?'Accept Application':'Reject Application'); modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason / message').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000))); return interaction.showModal(modal);
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
@@ -673,6 +749,23 @@ async function openVMModal(interaction, id) {
 }
 
 async function handleModal(interaction) {
+  if (interaction.customId === 'birthday_modal') {
+    if(!interaction.guild) return interaction.reply({content:'Birthday registration must be done from the server panel.',ephemeral:true});
+    const raw=interaction.fields.getTextInputValue('birthday').trim(); const m=raw.match(/^(\d{1,2})[-\/](\d{1,2})$/); if(!m) return interaction.reply({embeds:[ui.errorEmbed('Invalid Birthday','Use **MM-DD**, for example `08-08` or `01-09`.')],ephemeral:true});
+    const month=Number(m[1]),day=Number(m[2]); const max=new Date(Date.UTC(2000,month,0)).getUTCDate(); if(month<1||month>12||day<1||day>max) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','That is not a valid month/day.')],ephemeral:true});
+    db.setBirthday(interaction.guildId,interaction.user.id,month,day); return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Saved',`Your birthday is saved as **${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}**.`)],ephemeral:true});
+  }
+  if (interaction.customId.startsWith('staffapp_decide:')) {
+    const [,id,decision]=interaction.customId.split(':'); const session=db.getAppSession(id); if(!session || session.status!=='submitted') return interaction.reply({embeds:[ui.errorEmbed('Unavailable','This application is no longer awaiting review.')],ephemeral:true});
+    const cfg=db.getConfig(interaction.guildId).staffapplications; const allowed=interaction.member.permissions.has(PermissionFlagsBits.Administrator)||(cfg.supportRoleId&&interaction.member.roles.cache.has(cfg.supportRoleId)); if(!allowed) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator or the configured staff role.')],ephemeral:true});
+    const reason=interaction.fields.getTextInputValue('reason').trim()||'No reason provided.'; db.updateAppSession(id,JSON.parse(session.answers||'[]'),session.questionIndex,decision); const user=await client.users.fetch(session.userId).catch(()=>null);
+    if(user) await user.send({embeds:[ui.okEmbed(decision==='accepted'?'✅ Application Accepted':'❌ Application Rejected',`Your staff application in **${interaction.guild.name}** was **${decision}**.
+
+**Message:** ${reason}`)]}).catch(()=>{});
+    if(decision==='accepted'&&cfg.supportRoleId){const member=await interaction.guild.members.fetch(session.userId).catch(()=>null); if(member) await member.roles.add(cfg.supportRoleId,'Staff application accepted').catch(()=>{});}
+    return interaction.update({embeds:[ui.okEmbed(decision==='accepted'?'Application Accepted':'Application Rejected',`Reviewed by ${interaction.user}.
+**Message:** ${reason}`)],components:[]});
+  }
   if (interaction.customId.startsWith('setup_setting_modal:')) {
     const [,sub,setting]=interaction.customId.split(':');
     if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Administrator to change setup settings.')],ephemeral:true});
@@ -786,7 +879,14 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 // messageCreate — antilink, antispam, leveling, automod, prefix-less utility
 // ---------------------------------------------------------------------------------
 client.on('messageCreate', async (message) => {
-  if (message.author.bot || !message.guild) return;
+  if (message.author.bot) return;
+  if (!message.guild) {
+    const session=db.getAnyActiveAppSessionByUser(message.author.id);
+    if(session) await submitStaffApplicationAnswer(message,session).catch(e=>console.error('Staff application DM failed:',e));
+    return;
+  }
+  if (await sys.handleHoneypot(message).catch(()=>false)) return;
+  if (await sys.handleAntiBadWord(message).catch(()=>false)) return;
   const wasCommand = await handlePrefixCommand(message).catch((e) => { console.error(e); return false; });
   if (wasCommand) return;
   await sys.handleAntilink(message).catch(() => {});
