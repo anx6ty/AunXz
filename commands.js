@@ -20,6 +20,13 @@ function requireAdmin(interaction) {
   return true;
 }
 
+function getImageAttachment(interaction, optionName) {
+  const attachment = interaction.options.getAttachment(optionName);
+  if (!attachment) return null;
+  if (attachment.contentType && !attachment.contentType.startsWith('image/')) return null;
+  return attachment;
+}
+
 const commands = [];
 
 // ---------------------------------------------------------------------------------
@@ -76,6 +83,8 @@ function extractModuleOptions(sub, interaction) {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.message = interaction.options.getString('message');
     o.image = interaction.options.getString('image');
+    const imageFile = getImageAttachment(interaction, 'image_file');
+    o.image_file = imageFile ? imageFile.url : null;
   } else if (sub === 'leveling') {
     const c = interaction.options.getChannel('channel'); o.channel_id = c ? c.id : null;
     o.xp_per_message = interaction.options.getInteger('xp_per_message');
@@ -90,10 +99,14 @@ function extractModuleOptions(sub, interaction) {
     o.panel_description = interaction.options.getString('panel_description');
     o.panel_thumbnail = interaction.options.getString('panel_thumbnail');
     o.panel_image = interaction.options.getString('panel_image');
+    o.panel_thumbnail_file = (getImageAttachment(interaction, 'panel_thumbnail_file') || {}).url || null;
+    o.panel_image_file = (getImageAttachment(interaction, 'panel_image_file') || {}).url || null;
     o.category_label = interaction.options.getString('category_label');
     o.welcome_message = interaction.options.getString('welcome_message');
     o.welcome_thumbnail = interaction.options.getString('welcome_thumbnail');
     o.welcome_image = interaction.options.getString('welcome_image');
+    o.welcome_thumbnail_file = (getImageAttachment(interaction, 'welcome_thumbnail_file') || {}).url || null;
+    o.welcome_image_file = (getImageAttachment(interaction, 'welcome_image_file') || {}).url || null;
   }
   return o;
 }
@@ -139,7 +152,8 @@ function buildModulePatch(sub, guildId, o) {
     if (state) patch.greetmessage.enabled = state === 'enable';
     if (o.channel_id) patch.greetmessage.channelId = o.channel_id;
     if (o.message) patch.greetmessage.message = o.message;
-    if (o.image) patch.greetmessage.image = o.image;
+    if (o.image_file) patch.greetmessage.image = o.image_file;
+    else if (o.image) patch.greetmessage.image = o.image;
   } else if (sub === 'leveling') {
     patch.leveling = {};
     if (state) patch.leveling.enabled = state === 'enable';
@@ -158,12 +172,16 @@ function buildModulePatch(sub, guildId, o) {
     if (o.log_channel_id) patch.ticket.logChannelId = o.log_channel_id;
     if (o.panel_title) patch.ticket.panelTitle = o.panel_title;
     if (o.panel_description) patch.ticket.panelDescription = o.panel_description;
-    if (o.panel_thumbnail) patch.ticket.panelThumbnail = o.panel_thumbnail;
-    if (o.panel_image) patch.ticket.panelImage = o.panel_image;
+    if (o.panel_thumbnail_file) patch.ticket.panelThumbnail = o.panel_thumbnail_file;
+    else if (o.panel_thumbnail) patch.ticket.panelThumbnail = o.panel_thumbnail;
+    if (o.panel_image_file) patch.ticket.panelImage = o.panel_image_file;
+    else if (o.panel_image) patch.ticket.panelImage = o.panel_image;
     if (o.category_label) patch.ticket.categoryLabel = o.category_label;
     if (o.welcome_message) patch.ticket.welcomeMessage = o.welcome_message;
-    if (o.welcome_thumbnail) patch.ticket.welcomeThumbnail = o.welcome_thumbnail;
-    if (o.welcome_image) patch.ticket.welcomeImage = o.welcome_image;
+    if (o.welcome_thumbnail_file) patch.ticket.welcomeThumbnail = o.welcome_thumbnail_file;
+    else if (o.welcome_thumbnail) patch.ticket.welcomeThumbnail = o.welcome_thumbnail;
+    if (o.welcome_image_file) patch.ticket.welcomeImage = o.welcome_image_file;
+    else if (o.welcome_image) patch.ticket.welcomeImage = o.welcome_image;
   }
   return patch;
 }
@@ -246,7 +264,8 @@ commands.push(panelSetupCommand('voicemaster', 'Configure join-to-create voice.'
 commands.push(panelSetupCommand('greetmessage', 'Configure the text welcome message.', sub => sub
   .addChannelOption(o => o.setName('channel').setDescription('channel to post in').addChannelTypes(ChannelType.GuildText))
   .addStringOption(o => o.setName('message').setDescription('use {user} and {server}'))
-  .addStringOption(o => o.setName('image').setDescription('image/GIF URL shown with the greet message'))));
+  .addStringOption(o => o.setName('image').setDescription('image/GIF URL shown with the greet message'))
+  .addAttachmentOption(o => o.setName('image_file').setDescription('upload an image/GIF for the greet message'))));
 
 commands.push(panelSetupCommand('leveling', 'Configure the XP/leveling system.', sub => sub
   .addChannelOption(o => o.setName('channel').setDescription('level-up announcement channel').addChannelTypes(ChannelType.GuildText))
@@ -262,11 +281,15 @@ commands.push(panelSetupCommand('tickets', 'Configure the ticket system.', sub =
   .addStringOption(o => o.setName('panel_title').setDescription('title of the ticket panel'))
   .addStringOption(o => o.setName('panel_description').setDescription('message shown on the ticket panel'))
   .addStringOption(o => o.setName('panel_thumbnail').setDescription('panel thumbnail image/GIF URL'))
+  .addAttachmentOption(o => o.setName('panel_thumbnail_file').setDescription('upload the panel thumbnail image/GIF'))
   .addStringOption(o => o.setName('panel_image').setDescription('panel banner image/GIF URL'))
+  .addAttachmentOption(o => o.setName('panel_image_file').setDescription('upload the panel banner image/GIF'))
   .addStringOption(o => o.setName('category_label').setDescription('category shown inside new tickets'))
   .addStringOption(o => o.setName('welcome_message').setDescription('message shown when a ticket opens'))
   .addStringOption(o => o.setName('welcome_thumbnail').setDescription('ticket welcome thumbnail image/GIF URL'))
-  .addStringOption(o => o.setName('welcome_image').setDescription('ticket welcome banner image/GIF URL'))));
+  .addAttachmentOption(o => o.setName('welcome_thumbnail_file').setDescription('upload the ticket welcome thumbnail image/GIF'))
+  .addStringOption(o => o.setName('welcome_image').setDescription('ticket welcome banner image/GIF URL'))
+  .addAttachmentOption(o => o.setName('welcome_image_file').setDescription('upload the ticket welcome banner image/GIF'))));
 
 commands.push({
   data: new SlashCommandBuilder().setName('logs').setDescription('Configure logging destinations.')
@@ -335,6 +358,131 @@ commands.push({
 
     await sys.lockRoleToSingleChannel(interaction.guild, role, vc.id);
     await sys.joinAndStayInVC(vc);
+  }
+});
+
+
+// ---------------------------------------------------------------------------------
+// Fully configurable newer systems
+// ---------------------------------------------------------------------------------
+function parseButtonRoles(text) {
+  return String(text || '').split(',').map(x => x.trim()).filter(Boolean).slice(0, 20).map((entry, i) => {
+    const [rawRole, ...labelParts] = entry.split('=');
+    const roleId = rawRole.replace(/[<@&>]/g, '').trim();
+    const label = (labelParts.join('=') || `Role ${i+1}`).trim().slice(0, 80);
+    return { roleId, label, mode: 'toggle' };
+  }).filter(x => /^\d{15,25}$/.test(x.roleId));
+}
+
+commands.push({
+  data: new SlashCommandBuilder().setName('buttonrolesetup').setDescription('Create a fully customizable button-role panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('channel').setDescription('Channel where the panel will be posted').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('roles').setDescription('Role=Button label, comma separated. Example: @Member=Member, @VIP=VIP').setRequired(true))
+    .addStringOption(o=>o.setName('title').setDescription('Panel title'))
+    .addStringOption(o=>o.setName('description').setDescription('Panel description'))
+    .addStringOption(o=>o.setName('embed_type').setDescription('Choose the panel style').addChoices({name:'Normal embed',value:'embed'},{name:'Selection embed',value:'selection'}))
+    .addStringOption(o=>o.setName('image').setDescription('Image/GIF URL (optional)')),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const channel=interaction.options.getChannel('channel');
+    const buttons=parseButtonRoles(interaction.options.getString('roles'));
+    if (!buttons.length) return interaction.reply({embeds:[ui.errorEmbed('No roles found','Use `@Role=Label, @Role=Label`.')],ephemeral:true});
+    const cfg=db.saveConfig(interaction.guildId,{buttonRoles:{enabled:true,channelId:channel.id,title:interaction.options.getString('title')||'Choose your roles',description:interaction.options.getString('description')||'Press a button to get or remove a role.',embedType:interaction.options.getString('embed_type')||'embed',image:interaction.options.getString('image')||null,buttons}});
+    await interaction.reply({embeds:[ui.buttonRoleEmbed(cfg.buttonRoles)],components:[ui.featureSetupRow('buttonroles',['post'])],ephemeral:true});
+    const e=ui.base(cfg.buttonRoles.title).setDescription(cfg.buttonRoles.description);
+    if(cfg.buttonRoles.image)e.setImage(cfg.buttonRoles.image);
+    let components=[];
+    if(cfg.buttonRoles.embedType==='selection') {
+      const menu=new (require('discord.js').StringSelectMenuBuilder)().setCustomId('role_select').setPlaceholder('Choose a role…').addOptions(buttons.slice(0,25).map(b=>({label:b.label,value:b.roleId})));
+      components=[new (require('discord.js').ActionRowBuilder)().addComponents(menu)];
+    } else {
+      const rows=[]; for(let i=0;i<buttons.length;i+=5){ const row=new (require('discord.js').ActionRowBuilder)(); for(const b of buttons.slice(i,i+5)) row.addComponents(new (require('discord.js').ButtonBuilder)().setCustomId(`rolebtn:${b.roleId}`).setLabel(b.label).setStyle(require('discord.js').ButtonStyle.Primary)); rows.push(row); } components=rows;
+    }
+    await channel.send({embeds:[e],components});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('staffapplicationssetup').setDescription('Configure DM staff applications and publish an Apply panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('panel_channel').setDescription('Apply panel channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addChannelOption(o=>o.setName('log_channel').setDescription('Application results/log channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('questions').setDescription('Questions separated by |').setRequired(true))
+    .addStringOption(o=>o.setName('title').setDescription('Panel title'))
+    .addStringOption(o=>o.setName('description').setDescription('Panel description'))
+    .addStringOption(o=>o.setName('dm_intro').setDescription('Ready message sent in DM')),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const questions=interaction.options.getString('questions').split('|').map(x=>x.trim()).filter(Boolean).slice(0,25);
+    if(!questions.length)return interaction.reply({embeds:[ui.errorEmbed('No questions','Separate questions with `|`.')],ephemeral:true});
+    const cfg=db.saveConfig(interaction.guildId,{staffApplications:{enabled:true,panelChannelId:interaction.options.getChannel('panel_channel').id,logChannelId:interaction.options.getChannel('log_channel').id,questions,title:interaction.options.getString('title')||'Staff Applications',description:interaction.options.getString('description')||'Click Apply to start your application.',dmIntro:interaction.options.getString('dm_intro')||'Are you ready to start your staff application?'}});
+    const ch=interaction.options.getChannel('panel_channel');
+    await ch.send({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.description)],components:[new (require('discord.js').ActionRowBuilder)().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_apply').setLabel('Apply').setStyle(require('discord.js').ButtonStyle.Success))]});
+    await interaction.reply({embeds:[ui.staffApplicationEmbed(cfg.staffApplications),ui.okEmbed('Panel Published',`Application panel posted in ${ch}.`)],ephemeral:true});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('birthdaysetup').setDescription('Configure the birthday panel and daily wishes.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('panel_channel').setDescription('Channel for the birthday setup panel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addChannelOption(o=>o.setName('wish_channel').setDescription('Channel where birthday wishes are sent').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('message').setDescription('Wish message; use {user} and {date}')),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const cfg=db.saveConfig(interaction.guildId,{birthdays:{enabled:true,panelChannelId:interaction.options.getChannel('panel_channel').id,wishChannelId:interaction.options.getChannel('wish_channel').id,wishMessage:interaction.options.getString('message')||'Happy Birthday {user}! 🎂'}});
+    const ch=interaction.options.getChannel('panel_channel');
+    await ch.send({embeds:[ui.birthdaySetupEmbed(cfg.birthdays)],components:[new (require('discord.js').ActionRowBuilder)().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('birthday_set').setLabel('Set Birthday').setStyle(require('discord.js').ButtonStyle.Primary))]});
+    await interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg.birthdays)],ephemeral:true});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('antibadwordsetup').setDescription('Delete bad-word messages in any language and log them.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('log_channel').setDescription('Logging channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('extra_words').setDescription('Optional extra words/phrases, comma separated'))
+    .addStringOption(o=>o.setName('action').setDescription('Action after detection').addChoices({name:'Delete only',value:'delete'},{name:'Delete + timeout',value:'timeout'})),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const words=(interaction.options.getString('extra_words')||'').split(',').map(x=>x.trim()).filter(Boolean).slice(0,200);
+    const cfg=db.saveConfig(interaction.guildId,{antibadword:{enabled:true,logChannelId:interaction.options.getChannel('log_channel').id,customWords:words,action:interaction.options.getString('action')||'delete'}});
+    await interaction.reply({embeds:[ui.featureSetupEmbed('Anti Bad Word','The bot will detect configured profanity/bad-word patterns, delete the message, and log the event.',[{name:'Log',value:`<#${cfg.antibadword.logChannelId}>`,inline:true},{name:'Action',value:cfg.antibadword.action,inline:true}])],ephemeral:true});
+  }
+});
+
+commands.push({
+  data:new SlashCommandBuilder().setName('honeypotsetup').setDescription('Turn one channel into a no-message honeypot.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o=>o.setName('channel').setDescription('The honeypot channel').setRequired(true).addChannelTypes(ChannelType.GuildText))
+    .addStringOption(o=>o.setName('action').setDescription('What happens to a user who posts there').addChoices({name:'Kick',value:'kick'},{name:'Ban',value:'ban'},{name:'Timeout',value:'timeout'},{name:'Delete only',value:'delete'}))
+    .addChannelOption(o=>o.setName('log_channel').setDescription('Honeypot log channel').addChannelTypes(ChannelType.GuildText))
+    .addBooleanOption(o=>o.setName('create_invite').setDescription('When kicking, create an invite and DM it'))
+    .addStringOption(o=>o.setName('cleanup_window').setDescription('Delete the trigger user\'s recent messages across accessible channels').addChoices({name:'None',value:'none'},{name:'Last 10 minutes',value:'10m'},{name:'Last 1 hour',value:'1h'},{name:'Last 24 hours',value:'24h'}))
+    .addStringOption(o=>o.setName('dm_message').setDescription('DM after kick; use {invite}')),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const ch=interaction.options.getChannel('channel');
+    const cfg=db.saveConfig(interaction.guildId,{honeypot:{enabled:true,channelId:ch.id,action:interaction.options.getString('action')||'kick',logChannelId:(interaction.options.getChannel('log_channel')||ch).id,createInvite:interaction.options.getBoolean('create_invite') ?? true,cleanupWindow:interaction.options.getString('cleanup_window')||'none',dmMessage:interaction.options.getString('dm_message')||'You were removed for posting in the honeypot channel. Here is an invite back: {invite}'}});
+    await interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg.honeypot)],ephemeral:true});
+  }
+});
+
+
+commands.push({
+  data:new SlashCommandBuilder().setName('greetvoicesetup').setDescription('Easy direct setup for the role-gated voice greeting.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addRoleOption(o=>o.setName('role').setDescription('Gate role given to new members').setRequired(true))
+    .addChannelOption(o=>o.setName('voice_channel').setDescription('Only voice channel the gate role can access').setRequired(true).addChannelTypes(ChannelType.GuildVoice))
+    .addStringOption(o=>o.setName('prompt').setDescription('Text spoken when the member joins').setRequired(true)),
+  async execute(interaction){
+    if(!requireAdmin(interaction))return;
+    const role=interaction.options.getRole('role'), vc=interaction.options.getChannel('voice_channel'), prompt=interaction.options.getString('prompt');
+    const cfg=db.saveConfig(interaction.guildId,{greetvoice:{enabled:true,roleId:role.id,vcId:vc.id,ttsPrompt:prompt}});
+    await sys.lockRoleToSingleChannel(interaction.guild,role,vc.id);
+    await interaction.reply({embeds:[ui.featureSetupEmbed('Greet Voice','New members receive the gate role, join the selected VC, hear the TTS prompt, then are disconnected and released.',[{name:'Role',value:`${role}`,inline:true},{name:'Voice',value:`${vc}`,inline:true},{name:'Prompt',value:prompt,inline:false}])],ephemeral:true});
+    sys.joinAndStayInVC(vc).catch(e=>console.error('greetvoice join failed:',e));
   }
 });
 
@@ -578,11 +726,15 @@ commands.push({
     .addStringOption(o => o.setName('panel_title').setDescription('Title of the "Open Ticket" panel'))
     .addStringOption(o => o.setName('panel_description').setDescription('Body text of the "Open Ticket" panel'))
     .addStringOption(o => o.setName('panel_thumbnail').setDescription('Small image URL for the panel (top-right)'))
+    .addAttachmentOption(o => o.setName('panel_thumbnail_file').setDescription('Upload the panel thumbnail image/GIF'))
     .addStringOption(o => o.setName('panel_image').setDescription('Big banner image/GIF URL for the panel'))
+    .addAttachmentOption(o => o.setName('panel_image_file').setDescription('Upload the panel banner image/GIF'))
     .addStringOption(o => o.setName('category_label').setDescription('Category name shown when a ticket opens, e.g. "General Support"'))
     .addStringOption(o => o.setName('welcome_message').setDescription('Extra line shown under Welcome/Category in a new ticket'))
     .addStringOption(o => o.setName('welcome_thumbnail').setDescription('Small image URL shown in a new ticket (top-right)'))
-    .addStringOption(o => o.setName('welcome_image').setDescription('Big banner image/GIF URL shown in a new ticket')),
+    .addAttachmentOption(o => o.setName('welcome_thumbnail_file').setDescription('Upload the ticket welcome thumbnail image/GIF'))
+    .addStringOption(o => o.setName('welcome_image').setDescription('Big banner image/GIF URL shown in a new ticket'))
+    .addAttachmentOption(o => o.setName('welcome_image_file').setDescription('Upload the ticket welcome banner image/GIF')),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
     const map = {
@@ -594,6 +746,14 @@ commands.push({
     for (const [opt, key] of Object.entries(map)) {
       const val = interaction.options.getString(opt);
       if (val !== null) { patch.ticket[key] = val; changed = true; }
+    }
+    const fileMap = {
+      panel_thumbnail_file: 'panelThumbnail', panel_image_file: 'panelImage',
+      welcome_thumbnail_file: 'welcomeThumbnail', welcome_image_file: 'welcomeImage'
+    };
+    for (const [opt, key] of Object.entries(fileMap)) {
+      const attachment = getImageAttachment(interaction, opt);
+      if (attachment) { patch.ticket[key] = attachment.url; changed = true; }
     }
     const cfg = changed ? db.saveConfig(interaction.guildId, patch).ticket : db.getConfig(interaction.guildId).ticket;
     await interaction.reply({
@@ -780,107 +940,6 @@ commands.push({
   }
 });
 
-
-// ---------------------------------------------------------------------------------
-// DIRECT SETUP COMMANDS
-// Every configurable feature also has a simple /<feature>setup command.
-// These are standalone commands (no /feature setup subcommand) so admins can
-// configure a feature directly from one command.
-// ---------------------------------------------------------------------------------
-function addDirectState(command) {
-  return command.addStringOption(o => o.setName('state').setDescription('enable or disable')
-    .setRequired(true).addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' }));
-}
-
-function directSetupCommand(name, description, optionBuilder, handler) {
-  const data = new SlashCommandBuilder().setName(name).setDescription(description)
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
-  if (optionBuilder) optionBuilder(data);
-  commands.push({ data, async execute(interaction) {
-    if (!requireAdmin(interaction)) return;
-    await handler(interaction);
-  }});
-}
-
-function directState(interaction) {
-  return interaction.options.getString('state') === 'enable';
-}
-
-// Security
-
-directSetupCommand('antinukesetup', 'Fully configure antinuke protection.', d => {
-  addDirectState(d);
-  d.addStringOption(o => o.setName('punishment').setDescription('Action when a threshold is exceeded')
-    .addChoices({name:'ban',value:'ban'},{name:'kick',value:'kick'},{name:'strip_roles',value:'strip_roles'}));
-  d.addIntegerOption(o => o.setName('threshold').setDescription('Actions allowed before punishment').setMinValue(1).setMaxValue(100));
-  d.addIntegerOption(o => o.setName('window_seconds').setDescription('Detection window in seconds').setMinValue(1).setMaxValue(3600));
-}, async i => {
-  const cfg={enabled:directState(i)};
-  const p=i.options.getString('punishment'); const t=i.options.getInteger('threshold'); const w=i.options.getInteger('window_seconds');
-  if(p) cfg.punishment=p; if(t) Object.assign(cfg,{maxChannelDeletes:t,maxChannelCreates:t,maxRoleDeletes:t,maxRoleCreates:t,maxBans:t,maxKicks:t,maxWebhookCreates:t,maxRoleUpdates:t}); if(w) cfg.windowSeconds=w;
-  const out=db.saveConfig(i.guildId,{antinuke:cfg}); await i.reply({embeds:[ui.configSummaryEmbed('antinuke',out.antinuke)]});
-});
-
-directSetupCommand('antilinksetup', 'Fully configure anti-link protection.', d => {
-  addDirectState(d);
-  d.addStringOption(o => o.setName('mode').setDescription('What to do with detected links').addChoices({name:'delete',value:'delete'},{name:'warn',value:'warn'},{name:'mute',value:'mute'}));
-  d.addRoleOption(o => o.setName('bypass_role').setDescription('Role allowed to post links'));
-}, async i => {
-  const cfg={enabled:directState(i)}; const m=i.options.getString('mode'); const r=i.options.getRole('bypass_role'); if(m) cfg.mode=m; if(r) cfg.bypassRoleId=r.id;
-  const out=db.saveConfig(i.guildId,{antilink:cfg}); await i.reply({embeds:[ui.configSummaryEmbed('antilink',out.antilink)]});
-});
-
-directSetupCommand('antispamsetup', 'Fully configure anti-spam protection.', d => {
-  addDirectState(d); d.addIntegerOption(o=>o.setName('max_messages').setDescription('Messages allowed in the window').setMinValue(2).setMaxValue(100)); d.addIntegerOption(o=>o.setName('window_seconds').setDescription('Window in seconds').setMinValue(1).setMaxValue(300)); d.addStringOption(o=>o.setName('punishment').setDescription('Action').addChoices({name:'mute',value:'mute'},{name:'kick',value:'kick'},{name:'ban',value:'ban'}));
-}, async i => { const cfg={enabled:directState(i)}; const a=i.options.getInteger('max_messages'),w=i.options.getInteger('window_seconds'),p=i.options.getString('punishment'); if(a)cfg.maxMessages=a;if(w)cfg.windowSeconds=w;if(p)cfg.punishment=p;const out=db.saveConfig(i.guildId,{antispam:cfg});await i.reply({embeds:[ui.configSummaryEmbed('antispam',out.antispam)]}); });
-
-directSetupCommand('antiraidsetup', 'Fully configure anti-raid protection.', d => {
-  addDirectState(d); d.addIntegerOption(o=>o.setName('join_threshold').setDescription('Joins allowed in the window').setMinValue(1).setMaxValue(100)); d.addIntegerOption(o=>o.setName('window_seconds').setDescription('Window in seconds').setMinValue(1).setMaxValue(600)); d.addIntegerOption(o=>o.setName('min_account_age_days').setDescription('Minimum account age in days').setMinValue(0)); d.addStringOption(o=>o.setName('action').setDescription('Raid action').addChoices({name:'lockdown',value:'lockdown'},{name:'kick_new',value:'kick_new'}));
-}, async i => { const cfg={enabled:directState(i)}; const j=i.options.getInteger('join_threshold'),w=i.options.getInteger('window_seconds'),a=i.options.getInteger('min_account_age_days'),x=i.options.getString('action');if(j)cfg.joinThreshold=j;if(w)cfg.windowSeconds=w;if(a!==null)cfg.minAccountAgeDays=a;if(x)cfg.action=x;const out=db.saveConfig(i.guildId,{antiraid:cfg});await i.reply({embeds:[ui.configSummaryEmbed('antiraid',out.antiraid)]}); });
-
-directSetupCommand('antibadwordsetup', 'Configure multilingual bad-word filtering.', d => {
-  addDirectState(d); d.addStringOption(o=>o.setName('words').setDescription('Comma-separated words or phrases to block')); d.addChannelOption(o=>o.setName('log_channel').setDescription('Channel for filter logs').addChannelTypes(ChannelType.GuildText)); d.addStringOption(o=>o.setName('action').setDescription('Action').addChoices({name:'delete',value:'delete'},{name:'delete_and_warn',value:'delete_and_warn'}));
-}, async i => { const words=(i.options.getString('words')||'').split(',').map(x=>x.trim()).filter(Boolean); const ch=i.options.getChannel('log_channel'); const cfg={enabled:directState(i),words,logChannelId:ch?.id||null,action:i.options.getString('action')||'delete'}; const out=db.saveConfig(i.guildId,{antibadword:cfg}); await i.reply({embeds:[ui.configSummaryEmbed('antibadword',out.antibadword)]}); });
-
-directSetupCommand('honeypotsetup', 'Configure a honeypot channel and response.', d => {
-  addDirectState(d); d.addChannelOption(o=>o.setName('channel').setDescription('Honeypot text channel').setRequired(true).addChannelTypes(ChannelType.GuildText)); d.addStringOption(o=>o.setName('action').setDescription('Action for a trigger').addChoices({name:'delete',value:'delete'},{name:'kick',value:'kick'})); d.addStringOption(o=>o.setName('delete_history').setDescription('Delete the user\'s recent messages').addChoices({name:'none',value:'none'},{name:'10_minutes',value:'10_minutes'},{name:'1_hour',value:'1_hour'},{name:'24_hours',value:'24_hours'})); d.addChannelOption(o=>o.setName('log_channel').setDescription('Honeypot log channel').addChannelTypes(ChannelType.GuildText));
-}, async i => { const ch=i.options.getChannel('channel'),log=i.options.getChannel('log_channel'); const cfg={enabled:directState(i),channelId:ch.id,action:i.options.getString('action')||'delete',deleteHistory:i.options.getString('delete_history')||'none',logChannelId:log?.id||null}; const out=db.saveConfig(i.guildId,{honeypot:cfg}); await i.reply({embeds:[ui.configSummaryEmbed('honeypot',out.honeypot)]}); });
-
-// Member/community setup
-for (const [name,key,label] of [
-  ['welcomesetup','welcome','welcome'],['leavesetup','leave','leave'],['boostsetup','boost','boost'],['autorolesetup','autorole','autorole'],
-  ['automodsetup','automod','automod'],['starboardsetup','starboard','starboard'],['invitetrackersetup','inviteTracker','invite tracker'],
-  ['suggestionssetup','suggestions','suggestions'],['pollssetup','polls','polls'],['snipesetup','snipeEnabled','snipe'],['nswffiltersetup','nsfwFilter','NSFW filter']
-]) {
-  directSetupCommand(name, `Configure ${label}.`, d => { addDirectState(d); d.addChannelOption(o=>o.setName('channel').setDescription(`Channel for ${label}`).addChannelTypes(ChannelType.GuildText)); }, async i => {
-    const ch=i.options.getChannel('channel'); const current=db.getConfig(i.guildId)[key]; const value=typeof current==='boolean'?directState(i):{enabled:directState(i),...(ch?{channelId:ch.id}:{})}; const out=db.saveConfig(i.guildId,{[key]:value}); await i.reply({embeds:[ui.configSummaryEmbed(key,typeof out[key]==='boolean'?{enabled:out[key]}:out[key])]});
-  });
-}
-
-directSetupCommand('reactionrolessetup','Configure reaction/button roles.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('channel').setDescription('Panel channel').setRequired(true).addChannelTypes(ChannelType.GuildText));d.addStringOption(o=>o.setName('title').setDescription('Panel title'));d.addStringOption(o=>o.setName('description').setDescription('Panel description'));d.addRoleOption(o=>o.setName('role').setDescription('Role to assign'));d.addStringOption(o=>o.setName('button_label').setDescription('Button label'));},async i=>{const cfg={enabled:directState(i),channelId:i.options.getChannel('channel').id,title:i.options.getString('title'),description:i.options.getString('description'),roleId:i.options.getRole('role')?.id||null,buttonLabel:i.options.getString('button_label')||'Claim Role'};const out=db.saveConfig(i.guildId,{reactionRoles:cfg});await i.reply({embeds:[ui.configSummaryEmbed('reactionRoles',out.reactionRoles)]});});
-
-directSetupCommand('birthdaysetup','Configure birthday panel and wishes.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('panel_channel').setDescription('Channel for birthday setup panel').addChannelTypes(ChannelType.GuildText));d.addChannelOption(o=>o.setName('wish_channel').setDescription('Channel where wishes are sent').addChannelTypes(ChannelType.GuildText));d.addStringOption(o=>o.setName('message').setDescription('Wish message; use {user}'));d.addStringOption(o=>o.setName('panel_title').setDescription('Panel title'));},async i=>{const p=i.options.getChannel('panel_channel'),w=i.options.getChannel('wish_channel');const cfg={enabled:directState(i),panelChannelId:p?.id||null,wishChannelId:w?.id||null,message:i.options.getString('message')||'Happy Birthday {user}! 🎂',panelTitle:i.options.getString('panel_title')||'Set your birthday'};const out=db.saveConfig(i.guildId,{birthdays:cfg});await i.reply({embeds:[ui.configSummaryEmbed('birthdays',out.birthdays)]});});
-
-directSetupCommand('greetmessagesetup','Fully configure welcome messages including images/GIFs.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('channel').setDescription('Welcome channel').addChannelTypes(ChannelType.GuildText));d.addStringOption(o=>o.setName('message').setDescription('Message; {user} and {server} supported'));d.addStringOption(o=>o.setName('image').setDescription('Image or GIF URL'));},async i=>{const c=i.options.getChannel('channel');const cfg={enabled:directState(i),channelId:c?.id||null,message:i.options.getString('message')||'Welcome {user} to {server}!',image:i.options.getString('image')||null};const out=db.saveConfig(i.guildId,{greetmessage:cfg});await i.reply({embeds:[ui.configSummaryEmbed('greetmessage',out.greetmessage)]});});
-
-directSetupCommand('greetvoicesetup','Configure gated voice greeting and TTS.',d=>{addDirectState(d);d.addRoleOption(o=>o.setName('role').setDescription('Gate role').setRequired(true));d.addChannelOption(o=>o.setName('vc').setDescription('Welcome voice channel').setRequired(true).addChannelTypes(ChannelType.GuildVoice));d.addStringOption(o=>o.setName('prompt').setDescription('TTS prompt').setRequired(true));},async i=>{const role=i.options.getRole('role'),vc=i.options.getChannel('vc'),prompt=i.options.getString('prompt');db.saveConfig(i.guildId,{greetvoice:{enabled:directState(i),roleId:role.id,vcId:vc.id,ttsPrompt:prompt}});await i.reply({embeds:[ui.okEmbed(`${ui.emoji('voice')} Greet Voice Configured`,`**Role:** ${role}\n**Voice:** ${vc}\n**Prompt:** ${prompt}`)]});await sys.lockRoleToSingleChannel(i.guild,role,vc.id);await sys.joinAndStayInVC(vc);});
-
-directSetupCommand('voicemasersetup','Configure VoiceMaster.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('hub_channel').setDescription('Join-to-create channel').addChannelTypes(ChannelType.GuildVoice));d.addChannelOption(o=>o.setName('category').setDescription('Temporary VC category').addChannelTypes(ChannelType.GuildCategory));},async i=>{const h=i.options.getChannel('hub_channel'),c=i.options.getChannel('category');const out=db.saveConfig(i.guildId,{voicemaster:{enabled:directState(i),hubChannelId:h?.id||null,categoryId:c?.id||null}});await i.reply({embeds:[ui.configSummaryEmbed('voicemaster',out.voicemaster)]});});
-
-directSetupCommand('levelingsetup','Fully configure leveling.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('channel').setDescription('Level-up channel').addChannelTypes(ChannelType.GuildText));d.addIntegerOption(o=>o.setName('xp_per_message').setDescription('XP per message'));d.addIntegerOption(o=>o.setName('cooldown_seconds').setDescription('XP cooldown'));d.addIntegerOption(o=>o.setName('reward_level').setDescription('Reward level'));d.addRoleOption(o=>o.setName('reward_role').setDescription('Reward role'));},async i=>{const c=i.options.getChannel('channel'),r=i.options.getRole('reward_role'),lvl=i.options.getInteger('reward_level');const cfg={enabled:directState(i),channel:c?.id||null,xpPerMessage:i.options.getInteger('xp_per_message')||null,cooldownSeconds:i.options.getInteger('cooldown_seconds')||null,roleRewards:(lvl&&r)?{[String(lvl)]:r.id}:db.getConfig(i.guildId).leveling.roleRewards};const out=db.saveConfig(i.guildId,{leveling:cfg});await i.reply({embeds:[ui.configSummaryEmbed('leveling',out.leveling)]});});
-
-// Tickets: one command with all panel + ticket-open customization.
-directSetupCommand('ticketsetup','Fully configure tickets, panel and ticket welcome message.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('category').setDescription('Ticket category').addChannelTypes(ChannelType.GuildCategory));d.addRoleOption(o=>o.setName('support_role').setDescription('Support role'));d.addChannelOption(o=>o.setName('log_channel').setDescription('Ticket log channel').addChannelTypes(ChannelType.GuildText));d.addStringOption(o=>o.setName('panel_title').setDescription('Panel title'));d.addStringOption(o=>o.setName('panel_description').setDescription('Panel message'));d.addStringOption(o=>o.setName('panel_thumbnail').setDescription('Panel thumbnail URL'));d.addStringOption(o=>o.setName('panel_image').setDescription('Panel image/GIF URL'));d.addStringOption(o=>o.setName('category_label').setDescription('Ticket category label'));d.addStringOption(o=>o.setName('welcome_message').setDescription('Message when ticket opens'));d.addStringOption(o=>o.setName('welcome_thumbnail').setDescription('Ticket thumbnail URL'));d.addStringOption(o=>o.setName('welcome_image').setDescription('Ticket image/GIF URL'));},async i=>{const cfg={enabled:directState(i),categoryId:i.options.getChannel('category')?.id||null,supportRoleId:i.options.getRole('support_role')?.id||null,logChannelId:i.options.getChannel('log_channel')?.id||null,panelTitle:i.options.getString('panel_title'),panelDescription:i.options.getString('panel_description'),panelThumbnail:i.options.getString('panel_thumbnail'),panelImage:i.options.getString('panel_image'),categoryLabel:i.options.getString('category_label'),welcomeMessage:i.options.getString('welcome_message'),welcomeThumbnail:i.options.getString('welcome_thumbnail'),welcomeImage:i.options.getString('welcome_image')};const out=db.saveConfig(i.guildId,{ticket:cfg});await i.reply({embeds:[ui.configSummaryEmbed('tickets',out.ticket)]});});
-
-// Logs
-commands.push({data:new SlashCommandBuilder().setName('logssetup').setDescription('Fully configure a logging destination.').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addStringOption(o=>o.setName('type').setDescription('Log type').setRequired(true).addChoices({name:'moderation',value:'mod'},{name:'messages',value:'message'},{name:'members',value:'member'},{name:'voice',value:'voice'},{name:'antinuke',value:'antinuke'},{name:'server',value:'server'},{name:'tickets',value:'ticket'},{name:'joins/leaves',value:'join'})).addChannelOption(o=>o.setName('channel').setDescription('Destination').setRequired(true).addChannelTypes(ChannelType.GuildText)),async execute(i){if(!requireAdmin(i))return;const type=i.options.getString('type'),ch=i.options.getChannel('channel');const out=db.saveConfig(i.guildId,{logs:{[type]:ch.id}});await i.reply({embeds:[ui.configSummaryEmbed('logs',out.logs)]});}});
-
-// Button-role panel and staff applications.
-directSetupCommand('buttonrolesetup','Configure a role-claim button panel.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('channel').setDescription('Panel channel').setRequired(true).addChannelTypes(ChannelType.GuildText));d.addRoleOption(o=>o.setName('role').setDescription('Role users claim').setRequired(true));d.addStringOption(o=>o.setName('title').setDescription('Embed title'));d.addStringOption(o=>o.setName('description').setDescription('Embed description'));d.addStringOption(o=>o.setName('button_label').setDescription('Button text'));d.addStringOption(o=>o.setName('image').setDescription('Embed image/GIF URL'));},async i=>{const out=db.saveConfig(i.guildId,{buttonRoles:{enabled:directState(i),channelId:i.options.getChannel('channel').id,roleId:i.options.getRole('role').id,title:i.options.getString('title')||'Choose your role',description:i.options.getString('description')||'Press the button below to claim your role.',buttonLabel:i.options.getString('button_label')||'Claim Role',image:i.options.getString('image')||null}});await i.reply({embeds:[ui.configSummaryEmbed('buttonRoles',out.buttonRoles)]});});
-
-directSetupCommand('staffapplicationssetup','Configure staff applications.',d=>{addDirectState(d);d.addChannelOption(o=>o.setName('panel_channel').setDescription('Application panel channel').setRequired(true).addChannelTypes(ChannelType.GuildText));d.addChannelOption(o=>o.setName('log_channel').setDescription('Application log channel').setRequired(true).addChannelTypes(ChannelType.GuildText));d.addRoleOption(o=>o.setName('staff_role').setDescription('Role allowed to review'));d.addStringOption(o=>o.setName('questions').setDescription('Questions separated by |').setRequired(true));d.addStringOption(o=>o.setName('title').setDescription('Panel title'));d.addStringOption(o=>o.setName('description').setDescription('Panel description'));},async i=>{const out=db.saveConfig(i.guildId,{staffApplications:{enabled:directState(i),panelChannelId:i.options.getChannel('panel_channel').id,logChannelId:i.options.getChannel('log_channel').id,staffRoleId:i.options.getRole('staff_role')?.id||null,questions:(i.options.getString('questions')||'').split('|').map(x=>x.trim()).filter(Boolean),title:i.options.getString('title')||'Staff Applications',description:i.options.getString('description')||'Press Apply to begin.'}});await i.reply({embeds:[ui.configSummaryEmbed('staffApplications',out.staffApplications)]});});
-
-// ---------------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------
 // Owner-only
 // ---------------------------------------------------------------------------------
@@ -955,17 +1014,5 @@ commands.push({
     }
   }
 });
-
-// Discord requires every top-level application command name to be unique.
-// Fail fast with a useful diagnostic instead of sending an invalid command payload.
-const _commandNameCounts = new Map();
-for (const command of commands) {
-  const name = command?.data?.name;
-  if (name) _commandNameCounts.set(name, (_commandNameCounts.get(name) || 0) + 1);
-}
-const duplicateCommandNames = [..._commandNameCounts.entries()].filter(([, count]) => count > 1).map(([name]) => name);
-if (duplicateCommandNames.length) {
-  throw new Error(`Duplicate application command names: ${duplicateCommandNames.join(', ')}`);
-}
 
 module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
