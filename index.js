@@ -184,7 +184,7 @@ function parseLeafArgs(leafOptions, tokens) {
   return raw;
 }
 
-function usageLines(prefix, json) {
+function usageLines(trigger, json) {
   function walk(options, pathParts) {
     if (!options || !options.length) {
       return [`${prefix}${json.name}${pathParts.length ? ' ' + pathParts.join(' ') : ''}`];
@@ -253,8 +253,15 @@ const PREFIX_ALIASES = {
 async function handlePrefixCommand(message) {
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
-  if (!message.content.startsWith(prefix)) return false;
-  const tokens = tokenize(message.content.slice(prefix.length).trim());
+  const botId = message.client.user?.id;
+  const mentionTriggers = botId ? [`<@${botId}>`, `<@!${botId}>`] : [];
+  const mentionTrigger = mentionTriggers.find(trigger => message.content.startsWith(trigger));
+  const trigger = mentionTrigger || (message.content.startsWith(prefix) ? prefix : null);
+  if (!trigger) return false;
+
+  // Both the configured prefix and a direct bot mention work as command triggers:
+  // !help, <@BOT_ID> help, and <@!BOT_ID> help.
+  const tokens = tokenize(message.content.slice(trigger.length).trim());
   const typedName = (tokens.shift() || '').toLowerCase();
   if (!typedName) return false;
   const cmdName = PREFIX_ALIASES[typedName] || typedName;
@@ -269,7 +276,7 @@ async function handlePrefixCommand(message) {
   const json = cmd.data.toJSON();
   const fake = buildFakeInteraction(message, json, tokens);
   if (!fake) {
-    message.reply(ui.toComponentsV2({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] })).catch(() => {});
+    message.reply(ui.toComponentsV2({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(trigger, json).map(l => `\`${l}\``).join('\n'))] })).catch(() => {});
     return true;
   }
   try {
