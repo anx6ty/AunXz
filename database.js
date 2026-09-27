@@ -1,0 +1,301 @@
+// database.js — single SQLite file, all persistence for the bot.
+// Guild-level toggles/config are stored as one JSON blob per guild so we can support
+// dozens of setup options without needing a column for every single one.
+
+const Database = require('better-sqlite3');
+const path = require('path');
+
+const db = new Database(path.join(__dirname, 'bot.sqlite'));
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS guild_config (
+  guildId TEXT PRIMARY KEY,
+  data TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS levels (
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  xp INTEGER NOT NULL DEFAULT 0,
+  level INTEGER NOT NULL DEFAULT 0,
+  lastMessage INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guildId, userId)
+);
+
+CREATE TABLE IF NOT EXISTS warns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  moderatorId TEXT NOT NULL,
+  reason TEXT,
+  timestamp INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tickets (
+  channelId TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  claimedBy TEXT,
+  createdAt INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voicemaster_channels (
+  channelId TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  ownerId TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS antinuke_whitelist (
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  PRIMARY KEY (guildId, userId)
+);
+
+CREATE TABLE IF NOT EXISTS action_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guildId TEXT NOT NULL,
+  userId TEXT,
+  type TEXT NOT NULL,
+  detail TEXT,
+  timestamp INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sticky_roles (
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  roles TEXT NOT NULL,
+  PRIMARY KEY (guildId, userId)
+);
+
+CREATE TABLE IF NOT EXISTS spam_tracker (
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  windowStart INTEGER NOT NULL,
+  PRIMARY KEY (guildId, userId)
+);
+
+CREATE TABLE IF NOT EXISTS join_tracker (
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  timestamp INTEGER NOT NULL
+);
+`);
+
+// ---------- default config shape ----------
+// Every guild setting the bot supports lives in here. Missing keys fall back to these defaults.
+const DEFAULT_CONFIG = {
+  prefix: '!',
+  logs: {
+    mod: null, message: null, member: null, voice: null,
+    antinuke: null, server: null, ticket: null, join: null
+  },
+  welcome: { enabled: false, channel: null, message: 'Welcome {user} to {server}! You are member #{count}.', autoroleId: null },
+  leave: { enabled: false, channel: null, message: '{user} has left the server.' },
+  boost: { enabled: false, channel: null, message: '{user} just boosted the server! Thank you! 🚀' },
+  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null },
+  greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!' },
+  antinuke: {
+    enabled: false, punishment: 'ban', // ban | kick | strip_roles
+    maxChannelDeletes: 3, maxChannelCreates: 5, maxRoleDeletes: 3, maxRoleCreates: 5,
+    maxBans: 3, maxKicks: 3, maxWebhookCreates: 3, maxRoleUpdates: 5,
+    windowSeconds: 10, protectOwner: true
+  },
+  antilink: { enabled: false, mode: 'delete', whitelistedDomains: ['discord.gg', 'discord.com/invite'], bypassRoleId: null, whitelistedChannels: [] },
+  antispam: { enabled: false, maxMessages: 6, windowSeconds: 7, punishment: 'mute', muteMinutes: 5, maxMentions: 5, maxEmojis: 10 },
+  antiraid: { enabled: false, joinThreshold: 8, windowSeconds: 10, action: 'lockdown', minAccountAgeDays: 3 },
+  voicemaster: { enabled: false, hubChannelId: null, categoryId: null, nameTemplate: "{user}'s room" },
+  leveling: { enabled: false, channel: null, xpPerMessage: 15, cooldownSeconds: 60, levelUpMessage: '{user} reached level {level}!', roleRewards: {} },
+  ticket: { enabled: false, categoryId: null, panelChannelId: null, supportRoleId: null, logChannelId: null, counter: 0 },
+  automod: { badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
+  afk: {},
+  autorole: { enabled: false, roleId: null },
+  reactionRoles: {},
+  suggestions: { enabled: false, channelId: null },
+  polls: { enabled: true },
+  snipeEnabled: true,
+  nsfwFilter: { enabled: false },
+  birthdays: {},
+  starboard: { enabled: false, channelId: null, threshold: 3 },
+  inviteTracker: { enabled: false },
+  maintenance: false,
+  blacklist: []
+};
+
+function deepMerge(base, override) {
+  const out = Array.isArray(base) ? [...base] : { ...base };
+  for (const k of Object.keys(override || {})) {
+    if (override[k] && typeof override[k] === 'object' && !Array.isArray(override[k]) && base[k] && typeof base[k] === 'object') {
+      out[k] = deepMerge(base[k], override[k]);
+    } else {
+      out[k] = override[k];
+    }
+  }
+  return out;
+}
+
+const getConfigStmt = db.prepare('SELECT data FROM guild_config WHERE guildId = ?');
+const upsertConfigStmt = db.prepare(`
+  INSERT INTO guild_config (guildId, data) VALUES (@guildId, @data)
+  ON CONFLICT(guildId) DO UPDATE SET data = @data
+`);
+
+function getConfig(guildId) {
+  const row = getConfigStmt.get(guildId);
+  const stored = row ? JSON.parse(row.data) : {};
+  return deepMerge(DEFAULT_CONFIG, stored);
+}
+
+function saveConfig(guildId, partial) {
+  const current = getConfig(guildId);
+  const merged = deepMerge(current, partial);
+  upsertConfigStmt.run({ guildId, data: JSON.stringify(merged) });
+  return merged;
+}
+
+// ---------- leveling ----------
+const getLevelStmt = db.prepare('SELECT * FROM levels WHERE guildId = ? AND userId = ?');
+const upsertLevelStmt = db.prepare(`
+  INSERT INTO levels (guildId, userId, xp, level, lastMessage) VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT(guildId, userId) DO UPDATE SET xp = excluded.xp, level = excluded.level, lastMessage = excluded.lastMessage
+`);
+const topLevelsStmt = db.prepare('SELECT * FROM levels WHERE guildId = ? ORDER BY xp DESC LIMIT ?');
+
+function getLevel(guildId, userId) {
+  return getLevelStmt.get(guildId, userId) || { guildId, userId, xp: 0, level: 0, lastMessage: 0 };
+}
+function setLevel(guildId, userId, xp, level, lastMessage) {
+  upsertLevelStmt.run(guildId, userId, xp, level, lastMessage);
+}
+function topLevels(guildId, limit = 10) {
+  return topLevelsStmt.all(guildId, limit);
+}
+
+// ---------- warns ----------
+const addWarnStmt = db.prepare('INSERT INTO warns (guildId, userId, moderatorId, reason, timestamp) VALUES (?, ?, ?, ?, ?)');
+const getWarnsStmt = db.prepare('SELECT * FROM warns WHERE guildId = ? AND userId = ? ORDER BY timestamp DESC');
+const clearWarnsStmt = db.prepare('DELETE FROM warns WHERE guildId = ? AND userId = ?');
+
+function addWarn(guildId, userId, moderatorId, reason) {
+  addWarnStmt.run(guildId, userId, moderatorId, reason, Date.now());
+}
+function getWarns(guildId, userId) {
+  return getWarnsStmt.all(guildId, userId);
+}
+function clearWarns(guildId, userId) {
+  clearWarnsStmt.run(guildId, userId);
+}
+
+// ---------- tickets ----------
+const createTicketStmt = db.prepare('INSERT INTO tickets (channelId, guildId, userId, status, createdAt) VALUES (?, ?, ?, ?, ?)');
+const getTicketStmt = db.prepare('SELECT * FROM tickets WHERE channelId = ?');
+const setTicketStatusStmt = db.prepare('UPDATE tickets SET status = ?, claimedBy = COALESCE(?, claimedBy) WHERE channelId = ?');
+const openTicketForUserStmt = db.prepare("SELECT * FROM tickets WHERE guildId = ? AND userId = ? AND status = 'open'");
+
+function createTicket(channelId, guildId, userId) {
+  createTicketStmt.run(channelId, guildId, userId, 'open', Date.now());
+}
+function getTicket(channelId) {
+  return getTicketStmt.get(channelId);
+}
+function setTicketStatus(channelId, status, claimedBy = null) {
+  setTicketStatusStmt.run(status, claimedBy, channelId);
+}
+function openTicketForUser(guildId, userId) {
+  return openTicketForUserStmt.get(guildId, userId);
+}
+
+// ---------- voicemaster ----------
+const addVMChannelStmt = db.prepare('INSERT INTO voicemaster_channels (channelId, guildId, ownerId) VALUES (?, ?, ?)');
+const getVMChannelStmt = db.prepare('SELECT * FROM voicemaster_channels WHERE channelId = ?');
+const removeVMChannelStmt = db.prepare('DELETE FROM voicemaster_channels WHERE channelId = ?');
+
+function addVMChannel(channelId, guildId, ownerId) {
+  addVMChannelStmt.run(channelId, guildId, ownerId);
+}
+function getVMChannel(channelId) {
+  return getVMChannelStmt.get(channelId);
+}
+function removeVMChannel(channelId) {
+  removeVMChannelStmt.run(channelId);
+}
+
+// ---------- antinuke whitelist ----------
+const addWhitelistStmt = db.prepare('INSERT OR IGNORE INTO antinuke_whitelist (guildId, userId) VALUES (?, ?)');
+const removeWhitelistStmt = db.prepare('DELETE FROM antinuke_whitelist WHERE guildId = ? AND userId = ?');
+const isWhitelistedStmt = db.prepare('SELECT 1 FROM antinuke_whitelist WHERE guildId = ? AND userId = ?');
+
+function addToWhitelist(guildId, userId) { addWhitelistStmt.run(guildId, userId); }
+function removeFromWhitelist(guildId, userId) { removeWhitelistStmt.run(guildId, userId); }
+function isWhitelisted(guildId, userId) { return !!isWhitelistedStmt.get(guildId, userId); }
+
+// ---------- action log (antinuke / audit trail shown in /logs) ----------
+const addActionLogStmt = db.prepare('INSERT INTO action_log (guildId, userId, type, detail, timestamp) VALUES (?, ?, ?, ?, ?)');
+const recentActionLogStmt = db.prepare('SELECT * FROM action_log WHERE guildId = ? ORDER BY timestamp DESC LIMIT ?');
+
+function logAction(guildId, userId, type, detail) {
+  addActionLogStmt.run(guildId, userId, type, detail, Date.now());
+}
+function recentActions(guildId, limit = 15) {
+  return recentActionLogStmt.all(guildId, limit);
+}
+
+// ---------- sticky roles ----------
+const getStickyStmt = db.prepare('SELECT roles FROM sticky_roles WHERE guildId = ? AND userId = ?');
+const setStickyStmt = db.prepare(`
+  INSERT INTO sticky_roles (guildId, userId, roles) VALUES (?, ?, ?)
+  ON CONFLICT(guildId, userId) DO UPDATE SET roles = excluded.roles
+`);
+
+function getStickyRoles(guildId, userId) {
+  const row = getStickyStmt.get(guildId, userId);
+  return row ? JSON.parse(row.roles) : [];
+}
+function setStickyRoles(guildId, userId, roles) {
+  setStickyStmt.run(guildId, userId, JSON.stringify(roles));
+}
+
+// ---------- spam tracker (rolling window counters, cleaned lazily) ----------
+const getSpamStmt = db.prepare('SELECT * FROM spam_tracker WHERE guildId = ? AND userId = ?');
+const setSpamStmt = db.prepare(`
+  INSERT INTO spam_tracker (guildId, userId, count, windowStart) VALUES (?, ?, ?, ?)
+  ON CONFLICT(guildId, userId) DO UPDATE SET count = excluded.count, windowStart = excluded.windowStart
+`);
+
+function bumpSpam(guildId, userId, windowSeconds) {
+  const now = Date.now();
+  const row = getSpamStmt.get(guildId, userId);
+  if (!row || now - row.windowStart > windowSeconds * 1000) {
+    setSpamStmt.run(guildId, userId, 1, now);
+    return 1;
+  }
+  const count = row.count + 1;
+  setSpamStmt.run(guildId, userId, count, row.windowStart);
+  return count;
+}
+
+// ---------- join tracker (antiraid) ----------
+const addJoinStmt = db.prepare('INSERT INTO join_tracker (guildId, userId, timestamp) VALUES (?, ?, ?)');
+const recentJoinsStmt = db.prepare('SELECT COUNT(*) as c FROM join_tracker WHERE guildId = ? AND timestamp > ?');
+
+function trackJoin(guildId, userId) {
+  addJoinStmt.run(guildId, userId, Date.now());
+}
+function recentJoinCount(guildId, windowSeconds) {
+  return recentJoinsStmt.get(guildId, Date.now() - windowSeconds * 1000).c;
+}
+
+module.exports = {
+  db, DEFAULT_CONFIG,
+  getConfig, saveConfig,
+  getLevel, setLevel, topLevels,
+  addWarn, getWarns, clearWarns,
+  createTicket, getTicket, setTicketStatus, openTicketForUser,
+  addVMChannel, getVMChannel, removeVMChannel,
+  addToWhitelist, removeFromWhitelist, isWhitelisted,
+  logAction, recentActions,
+  getStickyRoles, setStickyRoles,
+  bumpSpam, trackJoin, recentJoinCount
+};
