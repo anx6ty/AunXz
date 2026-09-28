@@ -116,6 +116,35 @@ CREATE TABLE IF NOT EXISTS giveaways (
 );
 `);
 
+// ---------- lightweight schema migrations ----------
+// Existing Railway volumes keep the old SQLite file. CREATE TABLE IF NOT EXISTS does
+// not add columns to an already-existing table, so every new column must be migrated.
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some(c => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+// Giveaways were introduced after some installations already had an older giveaways table.
+// These migrations are safe to run on every startup.
+ensureColumn('giveaways', 'channelId', 'TEXT');
+ensureColumn('giveaways', 'messageId', 'TEXT');
+ensureColumn('giveaways', 'hostId', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('giveaways', 'prize', "TEXT NOT NULL DEFAULT 'Giveaway'");
+ensureColumn('giveaways', 'winners', 'INTEGER NOT NULL DEFAULT 1');
+ensureColumn('giveaways', 'durationMs', 'INTEGER NOT NULL DEFAULT 86400000');
+ensureColumn('giveaways', 'endsAt', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('giveaways', 'status', "TEXT NOT NULL DEFAULT 'configuring'");
+ensureColumn('giveaways', 'participants', "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn('giveaways', 'createdAt', 'INTEGER NOT NULL DEFAULT 0');
+
+// Repair old rows that were created before the new fields existed.
+db.prepare("UPDATE giveaways SET durationMs = 86400000 WHERE durationMs IS NULL OR durationMs <= 0").run();
+db.prepare("UPDATE giveaways SET createdAt = COALESCE(createdAt, 0) WHERE createdAt IS NULL").run();
+db.prepare("UPDATE giveaways SET endsAt = createdAt + durationMs WHERE (endsAt IS NULL OR endsAt = 0) AND createdAt > 0").run();
+db.prepare("UPDATE giveaways SET participants = '[]' WHERE participants IS NULL OR participants = ''").run();
+
 // ---------- default config shape ----------
 // Every guild setting the bot supports lives in here. Missing keys fall back to these defaults.
 const DEFAULT_CONFIG = {
