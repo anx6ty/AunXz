@@ -399,7 +399,7 @@ commands.push({
     } else {
       const rows=[]; for(let i=0;i<buttons.length;i+=5){ const row=new (require('discord.js').ActionRowBuilder)(); for(const b of buttons.slice(i,i+5)) row.addComponents(new (require('discord.js').ButtonBuilder)().setCustomId(`rolebtn:${b.roleId}`).setLabel(b.label).setStyle(require('discord.js').ButtonStyle.Primary)); rows.push(row); } components=rows;
     }
-    await channel.send(ui.componentsV2Payload({embeds:[e],components}));
+    await channel.send({embeds:[e],components});
   }
 });
 
@@ -418,7 +418,7 @@ commands.push({
     if(!questions.length)return interaction.reply({embeds:[ui.errorEmbed('No questions','Separate questions with `|`.')],ephemeral:true});
     const cfg=db.saveConfig(interaction.guildId,{staffApplications:{enabled:true,panelChannelId:interaction.options.getChannel('panel_channel').id,logChannelId:interaction.options.getChannel('log_channel').id,questions,title:interaction.options.getString('title')||'Staff Applications',description:interaction.options.getString('description')||'Click Apply to start your application.',dmIntro:interaction.options.getString('dm_intro')||'Are you ready to start your staff application?'}});
     const ch=interaction.options.getChannel('panel_channel');
-    await ch.send(ui.componentsV2Payload({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.description)],components:[new (require('discord.js').ActionRowBuilder)().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_apply').setLabel('Apply').setStyle(require('discord.js').ButtonStyle.Success))]}));
+    await ch.send({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.description)],components:[new (require('discord.js').ActionRowBuilder)().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_apply').setLabel('Apply').setStyle(require('discord.js').ButtonStyle.Success))]});
     await interaction.reply({embeds:[ui.staffApplicationEmbed(cfg.staffApplications),ui.okEmbed('Panel Published',`Application panel posted in ${ch}.`)],ephemeral:true});
   }
 });
@@ -721,7 +721,7 @@ commands.push({
   async execute(interaction) {
     const cfg = db.getConfig(interaction.guildId).ticket;
     if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Run `/tickets setup state:enable` first.')], ephemeral: true });
-    await interaction.channel.send(ui.componentsV2Payload({ embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg)], components: [ui.ticketPanelRow()] }));
+    await interaction.channel.send({ embeds: [ui.ticketPanelEmbed(interaction.guild.name, cfg)], components: [ui.ticketPanelRow()] });
     await interaction.reply({ embeds: [ui.okEmbed('✅ Panel Posted', 'The ticket panel is live.')], ephemeral: true });
   }
 });
