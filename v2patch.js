@@ -1,5 +1,5 @@
 // v2patch.js — makes every outgoing message that has an embed render with Discord Components V2
-// (Container layout, plus any buttons/selects as rows) instead of legacy embeds.
+// (Container layout, with any buttons/selects placed inside the container) instead of legacy embeds.
 // Applied once at startup by index.js. Everything is guarded, so a missing class/method in the
 // installed discord.js version is skipped instead of crashing the bot.
 const D = require('discord.js');
