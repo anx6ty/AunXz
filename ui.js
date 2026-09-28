@@ -110,7 +110,7 @@ const HELP_CATEGORIES = {
   },
   voice: {
     name: 'Voice', emojiKey: 'voice',
-    desc: '**/greetvoice setup** — role-gated VC greeting with TTS\n' +
+    desc: '**/greetvoicesetup** — role-gated VC greeting with TTS\n' +
       '**/voicemaster setup** — join-to-create hub channel & category'
   },
   moderation: {
@@ -135,7 +135,7 @@ const HELP_CATEGORIES = {
   },
   logging: {
     name: 'Logging', emojiKey: 'logs',
-    desc: '**/logs setup** — route mod/message/member/voice/antinuke/server logs to channels'
+    desc: '**/logsetup** — select a log type and destination channel'
   },
   automation: {
     name: 'Automation & Content', emojiKey: 'tools',
@@ -145,7 +145,9 @@ const HELP_CATEGORIES = {
       '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
       '**/antibadwordsetup** — multilingual profanity filter\n' +
       '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
-      '**/birthdaysetup** — birthday panel + automatic wishes'
+      '**/birthdaysetup** — birthday panel + automatic wishes\n' +
+      '**/buttonrolesetup** — fully customizable button-role panel\n' +
+      '**/reactionrolesetup** — fully customizable reaction-role panel'
   },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
@@ -452,6 +454,85 @@ function buttonRoleEmbed(cfg) { return featureSetupEmbed('Button Roles', 'Choose
 ${cfg.description || ''}`,inline:false},
   {name:'Buttons',value:String((cfg.buttons||[]).length),inline:true}, {name:'Style',value:cfg.embedType||'embed',inline:true}
 ]); }
+
+function buttonRoleSetupRows(cfg) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId('buttonroles_cfg:channel').setPlaceholder(cfg.channelId ? 'Change panel channel' : 'Select panel channel').setChannelTypes(ChannelType.GuildText)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('buttonroles_cfg:panel').setLabel('Edit Panel').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+      new ButtonBuilder().setCustomId('buttonroles_cfg:buttons').setLabel('Edit Buttons').setStyle(ButtonStyle.Primary).setEmoji(emoji('tools')),
+      new ButtonBuilder().setCustomId('buttonroles_cfg:post').setLabel('Post / Refresh').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
+    )
+  ];
+}
+function automodSetupEmbed(cfg) {
+  return featureSetupEmbed('AutoMod', 'Fully customize what AutoMod checks and what it does when a message matches.', [
+    {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
+    {name:'Bad words',value:cfg.badWordFilter?'Enabled':'Disabled',inline:true},
+    {name:'Caps filter',value:cfg.capsFilter?`Enabled (${cfg.capsThreshold || 70}%)`:'Disabled',inline:true},
+    {name:'Invite filter',value:cfg.inviteFilter?'Enabled':'Disabled',inline:true},
+    {name:'Custom words',value:String((cfg.badWords||[]).length),inline:true}
+  ]);
+}
+function automodSetupRows(cfg) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('automod_cfg:status').setPlaceholder(cfg.enabled?'AutoMod: ON':'AutoMod: OFF')
+        .addOptions({label:'Enable AutoMod',value:'enable',emoji:emoji('enabled')},{label:'Disable AutoMod',value:'disable',emoji:emoji('disabled')})
+    ),
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('automod_cfg:filter').setPlaceholder('Choose a filter to toggle')
+        .addOptions({label:`Bad words: ${cfg.badWordFilter?'ON':'OFF'}`,value:'badwords'},{label:`Caps filter: ${cfg.capsFilter?'ON':'OFF'}`,value:'caps'},{label:`Invite filter: ${cfg.inviteFilter?'ON':'OFF'}`,value:'invites'})
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('automod_cfg:words').setLabel('Edit Bad Words').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+      new ButtonBuilder().setCustomId('automod_cfg:caps').setLabel('Caps Threshold').setStyle(ButtonStyle.Secondary).setEmoji(emoji('spam'))
+    )
+  ];
+}
+function logSetupEmbed(cfg) {
+  const configured = Object.entries(cfg || {}).filter(([,v])=>v).length;
+  return featureSetupEmbed('Logging Setup', 'Use the two selectors below: choose a log type, then choose its destination channel.', [
+    {name:'Configured routes',value:`${configured} / ${Object.keys(cfg||{}).length}`,inline:true}
+  ]);
+}
+function logSetupRows(cfg) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('logsetup:type').setPlaceholder('1️⃣ Select log type')
+        .addOptions(
+          {label:'Moderation',value:'mod'},{label:'Messages',value:'message'},{label:'Members',value:'member'},
+          {label:'Voice',value:'voice'},{label:'Antinuke',value:'antinuke'},{label:'Server',value:'server'},
+          {label:'Tickets',value:'ticket'},{label:'Joins / Leaves',value:'join'}
+        )
+    ),
+    new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId('logsetup:channel').setPlaceholder('2️⃣ Select destination channel').setChannelTypes(ChannelType.GuildText)
+    )
+  ];
+}
+function reactionRoleSetupEmbed(cfg) {
+  return featureSetupEmbed('Reaction Roles', 'Configure a message and map emoji reactions to roles. Members can add/remove the mapped role by reacting.', [
+    {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
+    {name:'Channel',value:cfg.channelId?`<#${cfg.channelId}>`:'Not set',inline:true},
+    {name:'Message',value:cfg.messageId?`\`${cfg.messageId}\``:'Not set',inline:true},
+    {name:'Mappings',value:String((cfg.mappings||[]).length),inline:true}
+  ]);
+}
+function reactionRoleSetupRows(cfg) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId('reactionroles_cfg:channel').setPlaceholder('Select reaction-role channel').setChannelTypes(ChannelType.GuildText)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('reactionroles_cfg:message').setLabel('Set Message ID').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+      new ButtonBuilder().setCustomId('reactionroles_cfg:mappings').setLabel('Edit Reactions').setStyle(ButtonStyle.Primary).setEmoji(emoji('tools')),
+      new ButtonBuilder().setCustomId('reactionroles_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled'))
+    )
+  ];
+}
 function staffApplicationEmbed(cfg) { return featureSetupEmbed('Staff Applications', 'Members press Apply, receive a DM, choose Ready, then answer your questions one by one.', [
   {name:'Questions',value:String((cfg.questions||[]).length),inline:true}, {name:'Application log',value:cfg.logChannelId ? `<#${cfg.logChannelId}>`:'Not set',inline:true}
 ]); }
@@ -659,7 +740,7 @@ module.exports = {
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
-  featureSetupEmbed, featureSetupRow, buttonRoleEmbed, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
+  featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, automodSetupEmbed, automodSetupRows, logSetupEmbed, logSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
   embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
