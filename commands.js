@@ -43,17 +43,16 @@ commands.push({
 // Setup commands — every configurable feature follows /<feature> setup.
 // ---------------------------------------------------------------------------------
 const GENERIC_MODULES = [
-  'welcome', 'leave', 'boost', 'autorole', 'automod', 'starboard', 'inviteTracker',
-  'suggestions', 'polls', 'snipeEnabled', 'nsfwFilter', 'reactionRoles', 'birthdays'
+  'welcome', 'leave', 'boost', 'starboard', 'inviteTracker',
+  'suggestions', 'polls', 'snipeEnabled', 'nsfwFilter', 'birthdays'
 ];
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetvoice', 'greetmessage',
   'leveling', 'tickets', 'logs', ...GENERIC_MODULES
 ];
 const GENERIC_COMMANDS = {
-  welcome: 'welcome', leave: 'leave', boost: 'boost', autorole: 'autorole', automod: 'automod',
-  starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
-  snipe: 'snipeEnabled', nswffilter: 'nsfwFilter', reactionroles: 'reactionRoles', birthdays: 'birthdays'
+  welcome: 'welcome', leave: 'leave', boost: 'boost', starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
+  snipe: 'snipeEnabled', nswffilter: 'nsfwFilter', birthdays: 'birthdays'
 };
 
 const PANEL_MODULES = ['antinuke', 'antilink', 'antispam', 'antiraid', 'voicemaster', 'greetmessage', 'leveling', 'tickets'];
@@ -292,20 +291,52 @@ commands.push(panelSetupCommand('tickets', 'Configure the ticket system.', sub =
   .addAttachmentOption(o => o.setName('welcome_image_file').setDescription('upload the ticket welcome banner image/GIF'))));
 
 commands.push({
-  data: new SlashCommandBuilder().setName('logs').setDescription('Configure logging destinations.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addSubcommand(s => s.setName('setup').setDescription('Route a log type to a channel.')
-      .addStringOption(o => o.setName('type').setDescription('log category').setRequired(true).addChoices(
-        { name: 'moderation', value: 'mod' }, { name: 'messages', value: 'message' }, { name: 'members', value: 'member' },
-        { name: 'voice', value: 'voice' }, { name: 'antinuke', value: 'antinuke' }, { name: 'server', value: 'server' },
-        { name: 'tickets', value: 'ticket' }, { name: 'joins/leaves', value: 'join' }))
-      .addChannelOption(o => o.setName('channel').setDescription('channel to send this log type to').setRequired(true).addChannelTypes(ChannelType.GuildText))),
+  data: new SlashCommandBuilder().setName('logsetup').setDescription('Open the easy logging setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
-    const type = interaction.options.getString('type');
-    const channel = interaction.options.getChannel('channel');
-    const cfg = db.saveConfig(interaction.guildId, { logs: { [type]: channel.id } });
-    await interaction.reply({ embeds: [ui.configSummaryEmbed('logs', cfg.logs)] });
+    const cfg = db.getConfig(interaction.guildId).logs;
+    await interaction.reply({ embeds: [ui.logSetupEmbed(cfg)], components: ui.logSetupRows(cfg), ephemeral: true });
+  }
+});
+
+
+// /autorole — direct command, not a setup command.
+commands.push({
+  data: new SlashCommandBuilder().setName('autorole').setDescription('Set the automatic role for bots or humans.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('target').setDescription('Who should receive the role?').setRequired(true)
+      .addChoices({name:'Humans',value:'humans'},{name:'Bots',value:'bots'},{name:'Everyone',value:'everyone'}))
+    .addRoleOption(o => o.setName('role').setDescription('Role to assign automatically').setRequired(true)),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const target = interaction.options.getString('target');
+    const role = interaction.options.getRole('role');
+    const next = db.saveConfig(interaction.guildId, { autorole: { enabled: true, target, roleId: role.id } }).autorole;
+    await interaction.reply({ embeds: [ui.okEmbed('Autorole Updated', `**Target:** ${target}\n**Role:** ${role}`)] });
+  }
+});
+
+// /automod setup — one setup command that opens the full customization panel.
+commands.push({
+  data: new SlashCommandBuilder().setName('automod').setDescription('Open the fully customizable AutoMod setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s => s.setName('setup').setDescription('Open AutoMod configuration.')),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const cfg = db.getConfig(interaction.guildId).automod;
+    await interaction.reply({ embeds: [ui.automodSetupEmbed(cfg)], components: ui.automodSetupRows(cfg), ephemeral: true });
+  }
+});
+
+// /reactionrolesetup — one panel for channel, message and fully editable reaction-role mappings.
+commands.push({
+  data: new SlashCommandBuilder().setName('reactionrolesetup').setDescription('Open the fully customizable reaction-role setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const cfg = db.getConfig(interaction.guildId).reactionRoles;
+    await interaction.reply({ embeds: [ui.reactionRoleSetupEmbed(cfg)], components: ui.reactionRoleSetupRows(cfg), ephemeral: true });
   }
 });
 
@@ -333,36 +364,6 @@ for (const [commandName, moduleName] of Object.entries(GENERIC_COMMANDS)) {
 }
 
 // ---------------------------------------------------------------------------------
-// /greetvoice setup
-// ---------------------------------------------------------------------------------
-commands.push({
-  data: new SlashCommandBuilder()
-    .setName('greetvoice')
-    .setDescription('Configure the role-gated voice greeting system.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addSubcommand(s => s.setName('setup').setDescription('Set the role, voice channel and TTS prompt.')
-      .addRoleOption(o => o.setName('role').setDescription('role granted to new members until they complete the greet').setRequired(true))
-      .addChannelOption(o => o.setName('vc').setDescription('the only voice channel the role can see/join').setRequired(true).addChannelTypes(ChannelType.GuildVoice))
-      .addStringOption(o => o.setName('prompt').setDescription('TTS text played when a gated member joins the VC').setRequired(true))),
-  async execute(interaction) {
-    if (!requireAdmin(interaction)) return;
-    if (interaction.options.getSubcommand() !== 'setup') return;
-    const role = interaction.options.getRole('role');
-    const vc = interaction.options.getChannel('vc');
-    const prompt = interaction.options.getString('prompt');
-
-    db.saveConfig(interaction.guildId, { greetvoice: { enabled: true, roleId: role.id, vcId: vc.id, ttsPrompt: prompt } });
-
-    await interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('voice')} Greetvoice Configured`,
-      `**Role:** ${role}\n**Voice channel:** ${vc}\n**Prompt:** ${prompt}\n\nLocking that role out of every other channel and joining the VC now…`)] });
-
-    await sys.lockRoleToSingleChannel(interaction.guild, role, vc.id);
-    await sys.joinAndStayInVC(vc);
-  }
-});
-
-
-// ---------------------------------------------------------------------------------
 // Fully configurable newer systems
 // ---------------------------------------------------------------------------------
 function parseButtonRoles(text) {
@@ -375,31 +376,12 @@ function parseButtonRoles(text) {
 }
 
 commands.push({
-  data: new SlashCommandBuilder().setName('buttonrolesetup').setDescription('Create a fully customizable button-role panel.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption(o=>o.setName('channel').setDescription('Channel where the panel will be posted').setRequired(true).addChannelTypes(ChannelType.GuildText))
-    .addStringOption(o=>o.setName('roles').setDescription('Role=Button label, comma separated. Example: @Member=Member, @VIP=VIP').setRequired(true))
-    .addStringOption(o=>o.setName('title').setDescription('Panel title'))
-    .addStringOption(o=>o.setName('description').setDescription('Panel description'))
-    .addStringOption(o=>o.setName('embed_type').setDescription('Choose the panel style').addChoices({name:'Normal embed',value:'embed'},{name:'Selection embed',value:'selection'}))
-    .addStringOption(o=>o.setName('image').setDescription('Image/GIF URL (optional)')),
+  data: new SlashCommandBuilder().setName('buttonrolesetup').setDescription('Open the fully customizable button-role setup panel.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
-    const channel=interaction.options.getChannel('channel');
-    const buttons=parseButtonRoles(interaction.options.getString('roles'));
-    if (!buttons.length) return interaction.reply({embeds:[ui.errorEmbed('No roles found','Use `@Role=Label, @Role=Label`.')],ephemeral:true});
-    const cfg=db.saveConfig(interaction.guildId,{buttonRoles:{enabled:true,channelId:channel.id,title:interaction.options.getString('title')||'Choose your roles',description:interaction.options.getString('description')||'Press a button to get or remove a role.',embedType:interaction.options.getString('embed_type')||'embed',image:interaction.options.getString('image')||null,buttons}});
-    await interaction.reply({embeds:[ui.buttonRoleEmbed(cfg.buttonRoles)],components:[ui.featureSetupRow('buttonroles',['post'])],ephemeral:true});
-    const e=ui.base(cfg.buttonRoles.title).setDescription(cfg.buttonRoles.description);
-    if(cfg.buttonRoles.image)e.setImage(cfg.buttonRoles.image);
-    let components=[];
-    if(cfg.buttonRoles.embedType==='selection') {
-      const menu=new (require('discord.js').StringSelectMenuBuilder)().setCustomId('role_select').setPlaceholder('Choose a role…').addOptions(buttons.slice(0,25).map(b=>({label:b.label,value:b.roleId})));
-      components=[new (require('discord.js').ActionRowBuilder)().addComponents(menu)];
-    } else {
-      const rows=[]; for(let i=0;i<buttons.length;i+=5){ const row=new (require('discord.js').ActionRowBuilder)(); for(const b of buttons.slice(i,i+5)) row.addComponents(new (require('discord.js').ButtonBuilder)().setCustomId(`rolebtn:${b.roleId}`).setLabel(b.label).setStyle(require('discord.js').ButtonStyle.Primary)); rows.push(row); } components=rows;
-    }
-    await channel.send({embeds:[e],components});
+    const cfg = db.getConfig(interaction.guildId).buttonRoles;
+    await interaction.reply({ embeds: [ui.buttonRoleEmbed(cfg)], components: ui.buttonRoleSetupRows(cfg), ephemeral: true });
   }
 });
 
