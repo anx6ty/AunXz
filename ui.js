@@ -611,14 +611,13 @@ function embedToContainer(embedLike) {
 }
 
 // Rewrites { embeds, components, content, ephemeral } into a Components V2 payload.
-// Only converts when there are embeds AND interactive components (or `force` is set, used when
-// editing a message that is already V2). Everything else passes through untouched.
+// Every payload that contains at least one embed is converted (with or without buttons/selects).
+// Payloads without embeds pass through untouched. `force` is kept for API compatibility.
 function toComponentsV2(payload, force = false) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
   const embeds = payload.embeds;
   const rows = payload.components;
   if (!Array.isArray(embeds) || !embeds.length) return payload;
-  if (!force && (!Array.isArray(rows) || !rows.length)) return payload;
   const { embeds: _e, components: _c, content, ephemeral, flags, ...rest } = payload;
   const out = [];
   if (content) out.push(new TextDisplayBuilder().setContent(String(content).slice(0, 4000)));
