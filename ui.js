@@ -8,7 +8,9 @@
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, ChannelSelectMenuBuilder, UserSelectMenuBuilder,
-  ChannelType, PermissionFlagsBits
+  ChannelType, PermissionFlagsBits,
+  ContainerBuilder, TextDisplayBuilder, SectionBuilder, ThumbnailBuilder,
+  MediaGalleryBuilder, MediaGalleryItemBuilder, SeparatorBuilder, MessageFlags
 } = require('discord.js');
 const db = require('./database');
 
@@ -95,115 +97,6 @@ function base(title) {
 function okEmbed(title, desc) { return base(title).setColor(OK).setDescription(desc); }
 function warnEmbed(title, desc) { return base(title).setColor(WARN).setDescription(desc); }
 function errorEmbed(title, desc) { return base(title).setColor(DANGER).setDescription(desc); }
-
-
-// ---------------- DISCORD COMPONENTS V2 ----------------
-// Discord Components V2 messages cannot contain legacy `embeds`/`content`; the visual panel
-// is built from Container + Text Display + Media Gallery + Action Row components instead.
-// This helper is intentionally used at the final send/edit boundary so existing command code
-// can keep building normal EmbedBuilder instances while every embed that has controls becomes
-// one unified V2 container with the buttons/selects INSIDE that container.
-const COMPONENTS_V2_FLAG = 32768;
-const EPHEMERAL_FLAG = 64;
-
-function jsonOf(value) {
-  if (!value) return value;
-  if (typeof value.toJSON === 'function') return value.toJSON();
-  return value;
-}
-
-function embedToV2Parts(embedLike) {
-  const e = jsonOf(embedLike) || {};
-  const lines = [];
-  if (e.author?.name) lines.push(`*${e.author.name}*`);
-  if (e.title) lines.push(e.url ? `## [${e.title}](${e.url})` : `## ${e.title}`);
-  if (e.description) lines.push(e.description);
-  for (const field of (e.fields || [])) {
-    if (!field) continue;
-    lines.push(`**${field.name || ''}**\n${field.value || ''}`);
-  }
-  if (e.footer?.text) lines.push(`-# ${e.footer.text}`);
-  if (e.timestamp) lines.push(`-# ${new Date(e.timestamp).toLocaleString()}`);
-  const content = lines.join('\n\n').trim() || '\u200b';
-  const text = { type: 10, content: content.slice(0, 4000) };
-  return {
-    text,
-    thumbnail: e.thumbnail?.url ? { type: 11, media: { url: e.thumbnail.url }, description: e.thumbnail.description || undefined } : null,
-    image: e.image?.url ? { type: 12, items: [{ media: { url: e.image.url }, description: e.image.description || undefined }] } : null,
-    color: Number.isInteger(e.color) ? e.color : THEME
-  };
-}
-
-function componentsV2Payload(payload) {
-  if (!payload || typeof payload !== 'object') return payload;
-  const embeds = Array.isArray(payload.embeds) ? payload.embeds : [];
-  const components = Array.isArray(payload.components) ? payload.components : [];
-  if (!components.length) return payload;
-
-  const normalizedComponents = components.map(jsonOf);
-  let flags = Number(payload.flags) || 0;
-  flags |= COMPONENTS_V2_FLAG;
-  if (payload.ephemeral) flags |= EPHEMERAL_FLAG;
-
-  // Already a V2 container: just keep it and enforce the V2 flag.
-  if (normalizedComponents.length === 1 && normalizedComponents[0]?.type === 17) {
-    const next = { ...payload, components: normalizedComponents, flags };
-    delete next.embeds;
-    delete next.content;
-    delete next.ephemeral;
-    return next;
-  }
-
-  const container = {
-    type: 17,
-    accent_color: embeds.length ? embedToV2Parts(embeds[0]).color : THEME,
-    components: []
-  };
-
-  if (embeds.length) {
-    const parts = embeds.map(embedToV2Parts);
-    for (const part of parts) {
-      if (part.thumbnail) {
-        container.components.push({ type: 9, components: [part.text], accessory: part.thumbnail });
-      } else {
-        container.components.push(part.text);
-      }
-      if (part.image) container.components.push(part.image);
-    }
-  } else if (payload.content) {
-    container.components.push({ type: 10, content: String(payload.content).slice(0, 4000) });
-  }
-
-  // Put every existing action row (buttons/selects) INSIDE the same container.
-  for (const component of normalizedComponents) {
-    if (component?.type === 1) container.components.push(component);
-  }
-
-  // Container limit is 10 child components. Preserve controls whenever possible.
-  if (container.components.length > 10) {
-    const controls = container.components.filter(c => c.type === 1);
-    const contentParts = container.components.filter(c => c.type !== 1);
-    const room = Math.max(0, 10 - controls.length);
-    container.components = [...contentParts.slice(0, room), ...controls].slice(0, 10);
-  }
-
-  const next = { ...payload, components: [container], flags };
-  delete next.embeds;
-  delete next.content;
-  delete next.ephemeral;
-  return next;
-}
-
-function patchInteractionV2(interaction) {
-  if (!interaction || interaction.__componentsV2Patched) return interaction;
-  interaction.__componentsV2Patched = true;
-  for (const method of ['reply', 'update', 'editReply', 'followUp']) {
-    if (typeof interaction[method] !== 'function') continue;
-    const original = interaction[method].bind(interaction);
-    interaction[method] = payload => original(componentsV2Payload(payload));
-  }
-  return interaction;
-}
 
 // ---------------- HELP MENU ----------------
 const HELP_CATEGORIES = {
@@ -678,6 +571,64 @@ function embedBuilderRow(draft) {
   return rows;
 }
 
+// ---------------- COMPONENTS V2 CONVERSION ----------------
+// Converts an embed into a Components V2 Container (title/description/fields/images/footer as
+// text displays, sections and media galleries). Action rows are kept as top-level components.
+function embedToContainer(embedLike) {
+  const d = typeof embedLike.toJSON === 'function' ? embedLike.toJSON() : embedLike;
+  const container = new ContainerBuilder();
+  if (typeof d.color === 'number') container.setAccentColor(d.color);
+  const intro = [];
+  if (d.author && d.author.name) intro.push(`**${d.author.name}**`);
+  if (d.title) intro.push(d.url ? `## [${d.title}](${d.url})` : `## ${d.title}`);
+  if (d.description) intro.push(d.description);
+  const introText = intro.join('\n').slice(0, 4000);
+  if (d.thumbnail && d.thumbnail.url) {
+    container.addSectionComponents(
+      new SectionBuilder()
+        .addTextDisplayComponents(new TextDisplayBuilder().setContent(introText || '\u200b'))
+        .setThumbnailAccessory(new ThumbnailBuilder().setURL(d.thumbnail.url))
+    );
+  } else if (introText) {
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(introText));
+  }
+  if (d.fields && d.fields.length) {
+    container.addSeparatorComponents(new SeparatorBuilder().setDivider(false));
+    const text = d.fields.map(f => `**${f.name}**\n${f.value}`).join('\n\n').slice(0, 4000);
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(text));
+  }
+  if (d.image && d.image.url) {
+    container.addMediaGalleryComponents(new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(d.image.url)));
+  }
+  const foot = [];
+  if (d.footer && d.footer.text) foot.push(d.footer.text);
+  if (d.timestamp) foot.push(new Date(d.timestamp).toUTCString());
+  if (foot.length) {
+    container.addSeparatorComponents(new SeparatorBuilder().setDivider(true));
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${foot.join(' • ')}`.slice(0, 4000)));
+  }
+  return container;
+}
+
+// Rewrites { embeds, components, content, ephemeral } into a Components V2 payload.
+// Only converts when there are embeds AND interactive components (or `force` is set, used when
+// editing a message that is already V2). Everything else passes through untouched.
+function toComponentsV2(payload, force = false) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const embeds = payload.embeds;
+  const rows = payload.components;
+  if (!Array.isArray(embeds) || !embeds.length) return payload;
+  if (!force && (!Array.isArray(rows) || !rows.length)) return payload;
+  const { embeds: _e, components: _c, content, ephemeral, flags, ...rest } = payload;
+  const out = [];
+  if (content) out.push(new TextDisplayBuilder().setContent(String(content).slice(0, 4000)));
+  for (const e of embeds) out.push(embedToContainer(e));
+  if (Array.isArray(rows)) out.push(...rows);
+  let bits = (typeof flags === 'number' ? flags : 0) | MessageFlags.IsComponentsV2;
+  if (ephemeral) bits |= MessageFlags.Ephemeral;
+  return { ...rest, components: out, flags: bits };
+}
+
 module.exports.featureSetupEmbed = featureSetupEmbed;
 module.exports.featureSetupRow = featureSetupRow;
 module.exports.buttonRoleEmbed = buttonRoleEmbed;
@@ -700,6 +651,6 @@ module.exports = {
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
   featureSetupEmbed, featureSetupRow, buttonRoleEmbed, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
-  embedBuilderPreviewEmbed, embedBuilderRow,
+  embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
