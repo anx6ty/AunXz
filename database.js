@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS emoji_snapshots (
   data TEXT NOT NULL,
   createdAt INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS giveaways (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guildId TEXT NOT NULL,
+  channelId TEXT,
+  messageId TEXT,
+  hostId TEXT NOT NULL,
+  prize TEXT NOT NULL,
+  winners INTEGER NOT NULL DEFAULT 1,
+  durationMs INTEGER NOT NULL DEFAULT 86400000,
+  endsAt INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'configuring',
+  participants TEXT NOT NULL DEFAULT '[]',
+  createdAt INTEGER NOT NULL
+);
 `);
 
 // ---------- default config shape ----------
@@ -203,6 +218,42 @@ function setLevel(guildId, userId, xp, level, lastMessage) {
 function topLevels(guildId, limit = 10) {
   return topLevelsStmt.all(guildId, limit);
 }
+
+
+// ---------- giveaways ----------
+const insertGiveawayStmt = db.prepare(`
+  INSERT INTO giveaways
+  (guildId, channelId, messageId, hostId, prize, winners, durationMs, endsAt, status, participants, createdAt)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const getGiveawayStmt = db.prepare('SELECT * FROM giveaways WHERE id = ? AND guildId = ?');
+const updateGiveawayStmt = db.prepare('UPDATE giveaways SET channelId=?, messageId=?, prize=?, winners=?, durationMs=?, endsAt=?, status=?, participants=? WHERE id=? AND guildId=?');
+const listGiveawaysStmt = db.prepare('SELECT * FROM giveaways WHERE guildId = ? ORDER BY createdAt DESC LIMIT ?');
+
+function createGiveaway(guildId, hostId, data = {}) {
+  const now = Date.now();
+  const durationMs = Number(data.durationMs || 86400000);
+  const result = insertGiveawayStmt.run(
+    guildId, data.channelId || null, data.messageId || null, hostId,
+    String(data.prize || 'Giveaway'), Math.max(1, Number(data.winners || 1)),
+    durationMs, Number(data.endsAt || now + durationMs),
+    data.status || 'configuring', JSON.stringify(data.participants || []), now
+  );
+  return getGiveawayStmt.get(result.lastInsertRowid, guildId);
+}
+function getGiveaway(guildId, id) { return getGiveawayStmt.get(id, guildId); }
+function updateGiveaway(guildId, id, patch = {}) {
+  const cur = getGiveaway(guildId, id);
+  if (!cur) return null;
+  const next = { ...cur, ...patch };
+  updateGiveawayStmt.run(
+    next.channelId, next.messageId, next.prize, next.winners, next.durationMs,
+    next.endsAt, next.status, typeof next.participants === 'string' ? next.participants : JSON.stringify(next.participants || []),
+    id, guildId
+  );
+  return getGiveaway(guildId, id);
+}
+function listGiveaways(guildId, limit = 25) { return listGiveawaysStmt.all(guildId, limit); }
 
 // ---------- warns ----------
 const addWarnStmt = db.prepare('INSERT INTO warns (guildId, userId, moderatorId, reason, timestamp) VALUES (?, ?, ?, ?, ?)');
@@ -380,5 +431,6 @@ module.exports = {
   getStickyRoles, setStickyRoles,
   bumpSpam, trackJoin, recentJoinCount,
   getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
-  saveEmojiSnapshot, getEmojiSnapshot, DB_PATH, DATA_DIR
+  saveEmojiSnapshot, getEmojiSnapshot, DB_PATH, DATA_DIR,
+  createGiveaway, getGiveaway, updateGiveaway, listGiveaways,
 };
