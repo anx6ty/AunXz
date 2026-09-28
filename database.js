@@ -136,8 +136,8 @@ const DEFAULT_CONFIG = {
   },
   automod: { badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
   afk: {},
-  autorole: { enabled: false, roleId: null },
-  reactionRoles: {},
+  autorole: { enabled: false, target: 'everyone', roleId: null },
+  reactionRoles: { enabled: false, channelId: null, messageId: null, mappings: [] },
   suggestions: { enabled: false, channelId: null },
   polls: { enabled: true },
   snipeEnabled: true,
@@ -223,7 +223,8 @@ function clearWarns(guildId, userId) {
 const createTicketStmt = db.prepare('INSERT INTO tickets (channelId, guildId, userId, status, createdAt) VALUES (?, ?, ?, ?, ?)');
 const getTicketStmt = db.prepare('SELECT * FROM tickets WHERE channelId = ?');
 const setTicketStatusStmt = db.prepare('UPDATE tickets SET status = ?, claimedBy = COALESCE(?, claimedBy) WHERE channelId = ?');
-const openTicketForUserStmt = db.prepare("SELECT * FROM tickets WHERE guildId = ? AND userId = ? AND status = 'open'");
+const openTicketForUserStmt = db.prepare("SELECT * FROM tickets WHERE guildId = ? AND userId = ? AND status = 'open' ORDER BY createdAt DESC");
+const openTicketsForUserStmt = db.prepare("SELECT * FROM tickets WHERE guildId = ? AND userId = ? AND status = 'open' ORDER BY createdAt DESC");
 
 function createTicket(channelId, guildId, userId) {
   createTicketStmt.run(channelId, guildId, userId, 'open', Date.now());
@@ -231,11 +232,17 @@ function createTicket(channelId, guildId, userId) {
 function getTicket(channelId) {
   return getTicketStmt.get(channelId);
 }
+function closeTicket(channelId) {
+  db.prepare("UPDATE tickets SET status = 'closed' WHERE channelId = ?").run(channelId);
+}
 function setTicketStatus(channelId, status, claimedBy = null) {
   setTicketStatusStmt.run(status, claimedBy, channelId);
 }
 function openTicketForUser(guildId, userId) {
   return openTicketForUserStmt.get(guildId, userId);
+}
+function openTicketsForUser(guildId, userId) {
+  return openTicketsForUserStmt.all(guildId, userId);
 }
 
 // ---------- voicemaster ----------
@@ -366,7 +373,7 @@ module.exports = {
   getConfig, saveConfig,
   getLevel, setLevel, topLevels,
   addWarn, getWarns, clearWarns,
-  createTicket, getTicket, setTicketStatus, openTicketForUser,
+  createTicket, getTicket, closeTicket, setTicketStatus, openTicketForUser, openTicketsForUser,
   addVMChannel, getVMChannel, removeVMChannel,
   addToWhitelist, removeFromWhitelist, isWhitelisted,
   logAction, recentActions,
