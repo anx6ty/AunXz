@@ -573,7 +573,7 @@ function embedBuilderRow(draft) {
 
 // ---------------- COMPONENTS V2 CONVERSION ----------------
 // Converts an embed into a Components V2 Container (title/description/fields/images/footer as
-// text displays, sections and media galleries). Action rows are kept as top-level components.
+// text displays, sections and media galleries). Buttons/selects are added inside the container by toComponentsV2.
 function embedToContainer(embedLike) {
   const d = typeof embedLike.toJSON === 'function' ? embedLike.toJSON() : embedLike;
   const container = new ContainerBuilder();
@@ -621,8 +621,19 @@ function toComponentsV2(payload, force = false) {
   const { embeds: _e, components: _c, content, ephemeral, flags, ...rest } = payload;
   const out = [];
   if (content) out.push(new TextDisplayBuilder().setContent(String(content).slice(0, 4000)));
-  for (const e of embeds) out.push(embedToContainer(e));
-  if (Array.isArray(rows)) out.push(...rows);
+  const containers = embeds.map(e => embedToContainer(e));
+  const leftovers = [];
+  if (Array.isArray(rows) && rows.length) {
+    // Buttons/selects live INSIDE the last container so they render as part of the embed card.
+    const target = containers[containers.length - 1];
+    const inRows = rows.filter(r => r instanceof ActionRowBuilder || (r && (r.type === 1 || (r.data && r.data.type === 1))));
+    leftovers.push(...rows.filter(r => !inRows.includes(r)));
+    if (inRows.length) {
+      target.addSeparatorComponents(new SeparatorBuilder().setDivider(false));
+      target.addActionRowComponents(...inRows);
+    }
+  }
+  out.push(...containers, ...leftovers);
   let bits = (typeof flags === 'number' ? flags : 0) | MessageFlags.IsComponentsV2;
   if (ephemeral) bits |= MessageFlags.Ephemeral;
   return { ...rest, components: out, flags: bits };
