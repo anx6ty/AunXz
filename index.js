@@ -13,6 +13,7 @@ const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
 const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
+require('./v2patch').apply(); // Components V2 for every embed that has buttons/selects
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
 const birthdayWishesSent = new Set();
@@ -186,9 +187,9 @@ function buildFakeInteraction(message, json, tokens) {
       getUser: getter, getRole: getter, getChannel: getter, getMentionable: getter,
       getSubcommand: () => schema.subcommand
     },
-    reply: async (payload) => { fake.replied = true; return message.reply(ui.componentsV2Payload(stripEphemeral(payload))); },
-    followUp: async (payload) => message.channel.send(ui.componentsV2Payload(stripEphemeral(payload))),
-    editReply: async (payload) => message.channel.send(ui.componentsV2Payload(stripEphemeral(payload))),
+    reply: async (payload) => { fake.replied = true; return message.reply(stripEphemeral(payload)); },
+    followUp: async (payload) => message.channel.send(stripEphemeral(payload)),
+    editReply: async (payload) => message.channel.send(stripEphemeral(payload)),
     deferReply: async () => { fake.deferred = true; },
     showModal: async () => message.reply({ embeds: [ui.warnEmbed('Slash Command Needed', 'That action opens a popup form — use the `/' + json.name + '` slash command instead.')] })
   };
@@ -234,7 +235,6 @@ async function handlePrefixCommand(message) {
 // interactionCreate — slash commands, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
 client.on('interactionCreate', async (interaction) => {
-  ui.patchInteractionV2(interaction);
   try {
     if (interaction.isChatInputCommand()) {
       if (db.getConfig(interaction.guildId).blacklist.includes(interaction.user.id) && !isOwner(interaction.user.id)) {
@@ -339,7 +339,7 @@ client.on('interactionCreate', async (interaction) => {
         return btn;
       });
       const rows=buttonComponents.length?[new ActionRowBuilder().addComponents(buttonComponents)]:[];
-      await channel.send(ui.componentsV2Payload({embeds:[embed],components:rows})).catch(()=>{});
+      await channel.send({embeds:[embed],components:rows}).catch(()=>{});
       sys.embedBuilderSessions.delete(interaction.user.id);
       return interaction.update({content:`Posted in ${channel}.`,components:[]});
     }
@@ -383,7 +383,7 @@ async function handleButton(interaction) {
     const cfg=db.getConfig(interaction.guildId).birthdays; const ch=cfg.panelChannelId?interaction.guild.channels.cache.get(cfg.panelChannelId):null;
     if(!ch?.isTextBased()) return interaction.reply({embeds:[ui.errorEmbed('Panel Channel Missing','Select a panel channel first.')],ephemeral:true});
     const row=new ActionRowBuilder().addComponents(new (require('discord.js').ButtonBuilder)().setCustomId('birthday_set').setLabel('Set Birthday').setStyle(require('discord.js').ButtonStyle.Primary));
-    await ch.send(ui.componentsV2Payload({embeds:[ui.birthdaySetupEmbed(cfg)],components:[row]}));
+    await ch.send({embeds:[ui.birthdaySetupEmbed(cfg)],components:[row]});
     return interaction.reply({embeds:[ui.okEmbed('Birthday Panel Posted',`Posted in ${ch}.`)],ephemeral:true});
   }
   if (id === 'antibadword_cfg:words') return interaction.showModal(new ModalBuilder().setCustomId('antibadword_cfg_modal').setTitle('Custom Bad Words').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('words').setLabel('Words/phrases separated by commas').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((db.getConfig(interaction.guildId).antibadword.customWords||[]).join(', ').slice(0,400)))));
@@ -478,10 +478,10 @@ async function handleButton(interaction) {
     if(applicationSessions.has(interaction.user.id)) return interaction.reply({embeds:[ui.warnEmbed('Application In Progress','You already have an application in progress in your DMs.')],ephemeral:true});
     applicationSessions.set(interaction.user.id,{guildId:interaction.guildId,index:0,answers:[],waiting:false});
     const dm=await interaction.user.createDM();
-    await dm.send(ui.componentsV2Payload({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.dmIntro)],components:[new ActionRowBuilder().addComponents(
+    await dm.send({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.dmIntro)],components:[new ActionRowBuilder().addComponents(
       new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_ready').setLabel('Ready').setStyle(require('discord.js').ButtonStyle.Success),
       new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_notready').setLabel('Not Ready').setStyle(require('discord.js').ButtonStyle.Secondary)
-    )]}));
+    )]});
     return interaction.reply({embeds:[ui.okEmbed('Check your DMs','I sent you the application start message.')],ephemeral:true});
   }
   if(id==='staffapp_ready') {
@@ -525,7 +525,7 @@ async function handleButton(interaction) {
       permissionOverwrites: overwrites
     });
     db.createTicket(channel.id, interaction.guildId, interaction.user.id);
-    await channel.send(ui.componentsV2Payload({ embeds: [ui.ticketWelcomeEmbed(interaction.user, cfg)], components: [ui.ticketControlRow()] }));
+    await channel.send({ embeds: [ui.ticketWelcomeEmbed(interaction.user, cfg)], components: [ui.ticketControlRow()] });
     return interaction.reply({ embeds: [ui.okEmbed('🎫 Ticket Created', `Opened ${channel}.`)], ephemeral: true });
   }
   if (id === 'staff_controls') {
@@ -912,10 +912,10 @@ async function handleApplicationDM(message) {
   if (log?.isTextBased()) {
     const embed = ui.base('📝 Staff Application').setDescription(`Application from ${message.author} (<@${message.author.id}>)`);
     cfg.questions.slice(0, 25).forEach((q,i)=>embed.addFields({name:`${i+1}. ${q}`.slice(0,256),value:(session.answers[i]||'No answer').slice(0,1024),inline:false}));
-    await log.send(ui.componentsV2Payload({embeds:[embed],components:[new ActionRowBuilder().addComponents(
+    await log.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(
       new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:accept:${message.author.id}`).setLabel('Accept').setStyle(require('discord.js').ButtonStyle.Success),
       new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:reject:${message.author.id}`).setLabel('Reject').setStyle(require('discord.js').ButtonStyle.Danger)
-    )]})).catch(()=>{});
+    )]}).catch(()=>{});
   }
   await message.author.send('Your application has been submitted. Staff will review it and notify you.').catch(()=>{});
   applicationSessions.delete(message.author.id);
