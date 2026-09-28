@@ -60,12 +60,33 @@ async function registerCommands() {
   }
 }
 
+
+async function finishGiveaways() {
+  for (const guild of client.guilds.cache.values()) {
+    for (const g of db.listGiveaways(guild.id, 50)) {
+      if (g.status !== 'active' || Date.now() < g.endsAt) continue;
+      let participants=[]; try { participants=JSON.parse(g.participants||'[]'); } catch {}
+      const pool=participants.filter(id => guild.members.cache.has(id));
+      const shuffled=[...pool].sort(()=>Math.random()-0.5);
+      const winners=shuffled.slice(0, Math.min(g.winners, shuffled.length));
+      db.updateGiveaway(guild.id,g.id,{status:'ended'});
+      const ch=g.channelId ? guild.channels.cache.get(g.channelId) : null;
+      if (ch) {
+        const text=winners.length ? winners.map(id=>`<@${id}>`).join(', ') : 'No valid entries.';
+        await ch.send({embeds:[ui.base('🏆 Giveaway Ended').setDescription(`**Prize:** ${g.prize}\\n**Winner(s):** ${text}`)]}).catch(()=>{});
+      }
+    }
+  }
+}
+
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Database: ${db.DB_PATH}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
 });
+
+setInterval(() => finishGiveaways().catch(console.error), 15000);
 
 // ---------------------------------------------------------------------------------
 // Text-command engine — "<prefix> <cmd> ..." runs the exact same execute(interaction)
@@ -203,12 +224,39 @@ function stripEphemeral(payload) {
   return rest;
 }
 
+const TEXT_ALIASES = new Map([
+  ['i','invites'], ['invite','invites'],
+  ['si','serverinfo'], ['server','serverinfo'],
+  ['av','avatar'], ['pfp','avatar'],
+  ['ui','userinfo'], ['user','userinfo'],
+  ['ss','serverstats'], ['stats','serverstats'],
+  ['lb','leaderboard'], ['lbs','leaderboards'],
+  ['rank','rank'], ['help','help'], ['h','help'],
+  ['ga','giveaway']
+]);
+
+function normalizeCommandName(name) {
+  const key = String(name || '').toLowerCase();
+  return TEXT_ALIASES.get(key) || key;
+}
+
 async function handlePrefixCommand(message) {
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
-  if (!message.content.startsWith(prefix)) return false;
-  const tokens = tokenize(message.content.slice(prefix.length).trim());
-  const cmdName = (tokens.shift() || '').toLowerCase();
+  let content = message.content.trim();
+  const mention = new RegExp(`^<@!?${message.client.user.id}>\\s*`, 'i');
+
+  // Both "<prefix> command" and "<@bot> command" use the same command engine.
+  let isTextCommand = content.startsWith(prefix);
+  if (isTextCommand) content = content.slice(prefix.length).trim();
+  else if (mention.test(content)) {
+    content = content.replace(mention, '').trim();
+    isTextCommand = true;
+  }
+  if (!isTextCommand) return false;
+
+  const tokens = tokenize(content);
+  const cmdName = normalizeCommandName(tokens.shift() || '');
   if (!cmdName) return false;
   const cmd = commands.find(c => c.data.name === cmdName);
   if (!cmd) return false;
@@ -245,6 +293,46 @@ client.on('interactionCreate', async (interaction) => {
       const cmd = commands.find(c => c.data.name === interaction.commandName);
       if (cmd) await cmd.execute(interaction);
       return;
+    }
+
+    // Giveaway controls -------------------------------------------------------------
+    if (interaction.isButton() && interaction.customId.startsWith('giveaway_publish:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+        return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'Manage Server is required.')], ephemeral: true });
+      const id = Number(interaction.customId.split(':')[1]);
+      const g = db.getGiveaway(interaction.guildId, id);
+      if (!g || g.status !== 'configuring')
+        return interaction.reply({ embeds: [ui.errorEmbed('Giveaway Unavailable', 'That giveaway no longer exists or was already published.')], ephemeral: true });
+      const ch = interaction.guild.channels.cache.get(g.channelId) || interaction.channel;
+      const row = new (require('discord.js').ActionRowBuilder)().addComponents(
+        new (require('discord.js').ButtonBuilder)().setCustomId(`giveaway_join:${g.id}`).setLabel('🎉 Enter Giveaway').setStyle(require('discord.js').ButtonStyle.Success)
+      );
+      const msg = await ch.send({ embeds: [ui.base('🎉 Giveaway')
+        .setDescription(`**Prize:** ${g.prize}\n**Winners:** **${g.winners}**\n**Ends:** <t:${Math.floor(g.endsAt/1000)}:R>\n\nClick the button below to enter.`)
+        .setFooter({ text: `Hosted by ${interaction.user.tag} • Giveaway #${g.id}` })], components: [row] });
+      db.updateGiveaway(interaction.guildId, id, { messageId: msg.id, channelId: ch.id, status: 'active' });
+      return interaction.update({ embeds: [ui.okEmbed('🎉 Giveaway Published', `Published in ${ch}.\n\n**Prize:** ${g.prize}\n**Ends:** <t:${Math.floor(g.endsAt/1000)}:R>`)], components: [] });
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('giveaway_cancel:')) {
+      const id = Number(interaction.customId.split(':')[1]);
+      const g = db.getGiveaway(interaction.guildId, id);
+      if (!g) return interaction.reply({ embeds: [ui.errorEmbed('Not Found', 'Giveaway not found.')], ephemeral: true });
+      if (g.hostId !== interaction.user.id && !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+        return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Only the host or a server manager can cancel it.')], ephemeral: true });
+      db.updateGiveaway(interaction.guildId, id, { status: 'cancelled' });
+      return interaction.update({ embeds: [ui.okEmbed('Giveaway Cancelled', `Giveaway #${id} was cancelled.`)], components: [] });
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('giveaway_join:')) {
+      const id = Number(interaction.customId.split(':')[1]);
+      const g = db.getGiveaway(interaction.guildId, id);
+      if (!g || g.status !== 'active' || Date.now() >= g.endsAt)
+        return interaction.reply({ embeds: [ui.errorEmbed('Giveaway Ended', 'This giveaway is no longer accepting entries.')], ephemeral: true });
+      let participants = [];
+      try { participants = JSON.parse(g.participants || '[]'); } catch {}
+      const exists = participants.includes(interaction.user.id);
+      participants = exists ? participants.filter(x => x !== interaction.user.id) : [...participants, interaction.user.id];
+      db.updateGiveaway(interaction.guildId, id, { participants: JSON.stringify(participants) });
+      return interaction.reply({ embeds: [ui.okEmbed(exists ? 'Entry Removed' : '🎉 Entry Added', exists ? 'You left the giveaway.' : `You are entered! **${participants.length}** participant(s).`)], ephemeral: true });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
@@ -1172,11 +1260,14 @@ client.on('messageCreate', async (message) => {
   const cfgAll = db.getConfig(message.guild.id);
 
   // Mentioning the bot without another command gives a server-specific quick start.
-  if (message.mentions.has(client.user) && message.mentions.users.size === 1 && !message.content.trim().startsWith(cfgAll.prefix || '!')) {
-    const prefix = cfgAll.prefix || '!';
-    const latency = client.ws.ping;
-    return message.reply({ embeds: [ui.base(`🤖 ${client.user.username} — Quick Start`)
-      .setDescription(`Welcome! Use **/help** to browse all commands.\n\n**Server prefix:** \`${prefix}\`\n**Bot ping:** \`${latency}ms\`\n\nFor text commands, use \`${prefix}help\`.`)] }).catch(() => {});
+  if (message.mentions.has(client.user) && message.mentions.users.size === 1) {
+    const withoutMention = message.content.replace(new RegExp(`^<@!?${client.user.id}>\\s*`, 'i'), '').trim();
+    if (!withoutMention) {
+      const prefix = cfgAll.prefix || '!';
+      const latency = client.ws.ping;
+      return message.reply({ embeds: [ui.base(`🤖 ${client.user.username} — Quick Start`)
+        .setDescription(`Welcome! Use **/help** to browse all commands.\n\n**Server prefix:** \`${prefix}\`\n**Bot ping:** \`${latency}ms\`\n\nYou can also use **<@${client.user.id}> <command>** or **${prefix}<command>**.`)] }).catch(() => {});
+    }
   }
   // Honeypot is checked before command parsing so the no-message channel is truly a honeypot.
   if (cfgAll.honeypot.enabled && cfgAll.honeypot.channelId === message.channel.id) {
