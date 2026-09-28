@@ -3,7 +3,7 @@
 // interactionCreate to the right handler by command name.
 
 const {
-  SlashCommandBuilder, PermissionFlagsBits, ChannelType
+  SlashCommandBuilder, PermissionFlagsBits, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle
 } = require('discord.js');
 const db = require('./database');
 const ui = require('./ui');
@@ -28,6 +28,149 @@ function getImageAttachment(interaction, optionName) {
 }
 
 const commands = [];
+
+
+// ---------------------------------------------------------------------------------
+// Restored utility / server intelligence commands
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder().setName('serverinfo').setDescription('Show advanced information and statistics about this server.'),
+  async execute(interaction) {
+    const g = interaction.guild;
+    const owner = await g.fetchOwner().catch(() => null);
+    const channels = g.channels.cache;
+    const roles = g.roles.cache.filter(r => r.id !== g.id);
+    const bots = g.members.cache.filter(m => m.user.bot).size;
+    const humans = Math.max(0, g.memberCount - bots);
+    const text = channels.filter(c => c.type === ChannelType.GuildText).size;
+    const voice = channels.filter(c => c.type === ChannelType.GuildVoice).size;
+    const cats = channels.filter(c => c.type === ChannelType.GuildCategory).size;
+    const boosts = g.premiumSubscriptionCount || 0;
+    const e = ui.base(`🏠 ${g.name}`)
+      .setThumbnail(g.iconURL({ dynamic: true }))
+      .addFields(
+        { name: '📊 Members', value: `**${g.memberCount.toLocaleString()}** total\n${humans.toLocaleString()} humans • ${bots.toLocaleString()} bots`, inline: true },
+        { name: '💬 Channels', value: `**${channels.size}** total\n${text} text • ${voice} voice • ${cats} categories`, inline: true },
+        { name: '🎭 Roles', value: `**${roles.size}** custom roles`, inline: true },
+        { name: '🚀 Boosts', value: `**${boosts}** boosts\nLevel ${g.premiumTier}`, inline: true },
+        { name: '👑 Owner', value: owner ? `${owner.user.tag}\n\`${owner.id}\`` : 'Unknown', inline: true },
+        { name: '🆔 Server ID', value: `\`${g.id}\``, inline: true },
+        { name: '📅 Created', value: `<t:${Math.floor(g.createdTimestamp/1000)}:F>`, inline: false }
+      );
+    await interaction.reply({ embeds: [e] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('invites').setDescription('Show server invite statistics.')
+    .addUserOption(o => o.setName('user').setDescription('Show stats for one member')),
+  async execute(interaction) {
+    const target = interaction.options.getUser('user');
+    if (!interaction.guild.members.me.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Missing Permission', 'I need **Manage Server** to read invite usage.')], ephemeral: true });
+    }
+    const invites = await interaction.guild.invites.fetch().catch(() => null);
+    if (!invites) return interaction.reply({ embeds: [ui.errorEmbed('Invite Stats Unavailable', 'I could not read this server’s invites.')], ephemeral: true });
+    const rows = invites.filter(i => !target || i.inviter?.id === target.id).sort((a,b) => (b.uses||0)-(a.uses||0)).first(10);
+    const total = rows.reduce((n,i)=>n+(i.uses||0),0);
+    const lines = rows.length ? rows.map((i,n)=>`${n+1}. ${i.inviter || 'Unknown'} — **${i.uses||0}** uses — \`${i.code}\``) : ['No invite data found.'];
+    await interaction.reply({ embeds: [ui.base(`📨 ${target ? `${target.username}'s` : 'Server'} Invites`).setDescription(`**Tracked uses:** ${total}\n\n${lines.join('\n')}`)] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('avatar').setDescription('Show a member avatar in high resolution.')
+    .addUserOption(o => o.setName('user').setDescription('Member')),
+  async execute(interaction) {
+    const user = interaction.options.getUser('user') || interaction.user;
+    const url = user.displayAvatarURL({ size: 4096, extension: 'png', forceStatic: false });
+    await interaction.reply({ embeds: [ui.base(`🖼️ ${user.username}'s Avatar`).setImage(url).setDescription(`[Open full resolution](${url})`)] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('userinfo').setDescription('Show detailed information about a member.')
+    .addUserOption(o => o.setName('user').setDescription('Member')),
+  async execute(interaction) {
+    const user = interaction.options.getUser('user') || interaction.user;
+    const m = await interaction.guild.members.fetch(user.id).catch(() => null);
+    const roles = m ? m.roles.cache.filter(r=>r.id!==interaction.guild.id).map(r=>r.toString()).slice(-20).join(', ') || 'None' : 'Not cached';
+    await interaction.reply({ embeds: [ui.base(`👤 ${user.tag}`)
+      .setThumbnail(user.displayAvatarURL({dynamic:true}))
+      .setDescription(`**ID:** \`${user.id}\`\n**Bot:** ${user.bot ? 'Yes' : 'No'}\n**Account:** <t:${Math.floor(user.createdTimestamp/1000)}:F>\n**Joined:** ${m?.joinedTimestamp ? `<t:${Math.floor(m.joinedTimestamp/1000)}:F>` : 'Unknown'}\n**Roles:** ${roles}`)] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('serverstats').setDescription('Show advanced live server statistics.'),
+  async execute(interaction) {
+    const g = interaction.guild;
+    await g.members.fetch().catch(() => {});
+    const members = g.members.cache;
+    const online = members.filter(m => m.presence?.status && m.presence.status !== 'offline').size;
+    const bots = members.filter(m => m.user.bot).size;
+    const humans = members.size - bots;
+    const voice = members.filter(m => m.voice?.channelId).size;
+    const roleCounts = new Map();
+    for (const m of members.values()) for (const r of m.roles.cache.values()) if (r.id !== g.id) roleCounts.set(r.id,(roleCounts.get(r.id)||0)+1);
+    const topRoles = [...roleCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8).map(([id,n],i)=>`${i+1}. <@&${id}> — **${n}**`).join('\n') || 'No custom roles.';
+    await interaction.reply({ embeds: [ui.base(`📊 ${g.name} — Advanced Stats`)
+      .addFields(
+        {name:'Members',value:`Total **${members.size}**\nHumans **${humans}**\nBots **${bots}**`,inline:true},
+        {name:'Activity',value:`Online/active **${online}**\nIn voice **${voice}**`,inline:true},
+        {name:'Server',value:`Channels **${g.channels.cache.size}**\nRoles **${g.roles.cache.size-1}**\nBoosts **${g.premiumSubscriptionCount||0}` ,inline:true},
+        {name:'Most-used roles',value:topRoles,inline:false}
+      )] });
+  }
+});
+
+commands.push({
+  data: new SlashCommandBuilder().setName('leaderboards').setDescription('Show advanced server leaderboards.')
+    .addStringOption(o=>o.setName('type').setDescription('Leaderboard type').setRequired(true)
+      .addChoices({name:'XP',value:'xp'},{name:'Messages/XP',value:'messages'},{name:'Invites',value:'invites'})),
+  async execute(interaction) {
+    const type=interaction.options.getString('type');
+    if(type==='xp'||type==='messages'){
+      const rows=db.topLevels(interaction.guildId,15);
+      const lines=rows.map((r,i)=>`${i+1}. <@${r.userId}> — **${r.xp.toLocaleString()} XP** • Level **${r.level}**`);
+      return interaction.reply({embeds:[ui.base(`🏆 ${interaction.guild.name} — ${type==='xp'?'XP':'Activity'} Leaderboard`).setDescription(lines.join('\n')||'No leaderboard data yet.')]});
+    }
+    if(!interaction.guild.members.me.permissions.has(PermissionFlagsBits.ManageGuild))
+      return interaction.reply({embeds:[ui.errorEmbed('Missing Permission','I need Manage Server to read invite usage.')],ephemeral:true});
+    const invites=await interaction.guild.invites.fetch().catch(()=>null);
+    const byUser=new Map();
+    for(const i of invites?.values()||[]) if(i.inviter) byUser.set(i.inviter.id,(byUser.get(i.inviter.id)||0)+(i.uses||0));
+    const lines=[...byUser.entries()].sort((a,b)=>b[1]-a[1]).slice(0,15).map(([id,n],i)=>`${i+1}. <@${id}> — **${n} invites**`);
+    await interaction.reply({embeds:[ui.base(`🏆 ${interaction.guild.name} — Invite Leaderboard`).setDescription(lines.join('\n')||'No invite data yet.')]});
+  }
+});
+
+// Giveaway creation opens a configuration embed immediately; the buttons finish publishing it.
+commands.push({
+  data: new SlashCommandBuilder().setName('giveaway').setDescription('Create and configure a giveaway.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(s=>s.setName('create').setDescription('Create a giveaway configuration panel.')
+      .addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true))
+      .addIntegerOption(o=>o.setName('winners').setDescription('Number of winners').setMinValue(1).setMaxValue(20))
+      .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
+      .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
+  async execute(interaction) {
+    if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
+    const prize=interaction.options.getString('prize');
+    const winners=interaction.options.getInteger('winners')||1;
+    const duration=(interaction.options.getInteger('duration_minutes')||1440)*60000;
+    const channel=interaction.options.getChannel('channel')||interaction.channel;
+    const g=db.createGiveaway(interaction.guildId,interaction.user.id,{prize,winners,durationMs:duration,endsAt:Date.now()+duration,channelId:channel.id});
+    const row=new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`giveaway_publish:${g.id}`).setLabel('Publish Giveaway').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`giveaway_cancel:${g.id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger)
+    );
+    await interaction.reply({embeds:[ui.base('🎉 Giveaway Configuration')
+      .setDescription(`Configure and publish this giveaway.\n\n**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** <t:${Math.floor(g.endsAt/1000)}:R>\n**Channel:** ${channel}`)
+      .setFooter({text:`Giveaway #${g.id} • Hosted by ${interaction.user.tag}`})],components:[row],ephemeral:true});
+  }
+});
 
 // ---------------------------------------------------------------------------------
 // /help
