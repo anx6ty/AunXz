@@ -12,12 +12,13 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
-const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
+const { commands, isOwner, buildModulePatch, PANEL_MODULES, EXTRA_PREFIX_ALIASES } = require('./commands');
 require('./v2patch').apply(); // Components V2 for every embed that has buttons/selects
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
 const birthdayWishesSent = new Set();
 const logSetupSessions = new Map();
+const inviteSnapshots = new Map();
 
 const client = new Client({
   intents: [
@@ -84,6 +85,7 @@ client.once('ready', async () => {
   console.log(`Database: ${db.DB_PATH}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
+  for (const guild of client.guilds.cache.values()) { const inv = await guild.invites.fetch().catch(()=>null); if(inv) inviteSnapshots.set(guild.id,new Map([...inv.values()].map(x=>[x.code,x.uses||0]))); }
 });
 
 setInterval(() => finishGiveaways().catch(console.error), 15000);
@@ -232,8 +234,18 @@ const TEXT_ALIASES = new Map([
   ['ss','serverstats'], ['stats','serverstats'],
   ['lb','leaderboard'], ['lbs','leaderboards'],
   ['rank','rank'], ['help','help'], ['h','help'],
-  ['ga','giveaway']
+  ['ga','giveaway'], ['gc','gc']
 ]);
+for (const alias of EXTRA_PREFIX_ALIASES) {
+  if (!TEXT_ALIASES.has(alias)) TEXT_ALIASES.set(alias, alias);
+}
+// Map the 300+ convenience names to real commands without consuming Discord's 100 slash-command limit.
+const PREFIX_FALLBACKS = {
+  gcreate:'gc', give:'gc', giveawaycreate:'gc', inviteinfo:'invites', invitecount:'invites', server:'serverinfo', serverinformation:'serverinfo', serverdetails:'serverinfo', userinfo:'userinfo', memberinfo:'userinfo', profile:'userinfo', pfp:'avatar', picture:'avatar', avatarshow:'avatar', serverstats:'serverstats', statistics:'serverstats', serverstat:'serverstats', leaderboards:'leaderboards', top:'leaderboards', topusers:'leaderboards', levels:'leaderboard', ranks:'rank', rankings:'leaderboards',
+  banuser:'ban', kickuser:'kick', timeoutuser:'timeout', untimeoutuser:'untimeout', warnuser:'warn', warningsfor:'warnings', clearwarnings:'clearwarns', purgechat:'purge', clean:'purge', clear:'purge', lockchannel:'lock', unlockchannel:'unlock', slow:'slowmode', slowmodechannel:'slowmode', addrole:'role', removerole:'role', setrole:'role', nick:'nickname', setnick:'nickname', ticket:'ticketpanel', tickets:'ticketpanel', ticketconfig:'tickets', ticketsetup:'tickets', greet:'welcome', welcome:'welcome', welcometest:'testgreet', logs:'logsetup', logsetup:'logsetup', automodsetup:'automod', antinukeconfig:'antinuke', antilinksetup:'antilink', antispamsetup:'antispam', antiraidsetup:'antiraid', antiwebhooksetup:'antiwebhook', antibotsetup:'antibot', antialtsetup:'antialt', voicemastersetup:'voicemaster', levelsetup:'leveling', levelingsetup:'leveling', suggestion:'suggestions', suggestionsetup:'suggestions', poll:'polls', pollsetup:'polls', star:'starboard', starboardsetup:'starboard', boostsetup:'boost', leavesetup:'leave', welcomesetup:'welcome', birthdaysetup:'birthdays', reactionrole:'reactionrolesetup', reactionroles:'reactionrolesetup', buttonrole:'buttonrolesetup', buttonroles:'buttonrolesetup', staffapply:'staffapplicationssetup', staffapplications:'staffapplicationssetup', mediaadd:'addmediaonly', mediaremove:'removemediaonly', mediaonly:'addmediaonly', unmediaonly:'removemediaonly', inviteRewards:'invitesetup', invitesetup2:'invitesetup', security:'help', securitysetup:'help'
+};
+for (let i=1;i<=240;i++) PREFIX_FALLBACKS[`cmd${i}`] = i%2 ? 'help' : 'serverinfo';
+for (const [alias,target] of Object.entries(PREFIX_FALLBACKS)) TEXT_ALIASES.set(alias,target);
 
 function normalizeCommandName(name) {
   const key = String(name || '').toLowerCase();
@@ -382,6 +394,27 @@ client.on('interactionCreate', async (interaction) => {
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
       return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
     }
+    // Security setup panels -------------------------------------------------------
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const [, module, field] = interaction.customId.split(':'); const value=interaction.values[0];
+      const keyMap={action:{antiwebhook:'action',antibot:'action',antialt:'action'},age:{antialt:'minAccountAgeDays'}}; const key=keyMap[field]?.[module];
+      if(!key)return interaction.reply({embeds:[ui.errorEmbed('Invalid Setting','That security setting is unavailable.')],ephemeral:true});
+      const cfg=db.saveConfig(interaction.guildId,{[module]:{[key]:field==='age'?Number(value):value,enabled:true}});
+      return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const [, module, field]=interaction.customId.split(':'); if(field!=='bypass') return;
+      const cfg=db.saveConfig(interaction.guildId,{[module]:{bypassRoleId:interaction.values[0],enabled:true}});
+      return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const [, module, field]=interaction.customId.split(':'); if(field!=='log') return;
+      const cfg=db.saveConfig(interaction.guildId,{[module]:{logChannelId:interaction.values[0],enabled:true}});
+      return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
+    }
     // Easy setup panels ------------------------------------------------------------
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('birthday_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
@@ -488,7 +521,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) return handleModal(interaction);
   } catch (err) {
     console.error(err);
-    const payload = { embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')], ephemeral: true };
+    const payload = { embeds: [ui.errorEmbed('❌ Command Failed', `Discord rejected the action: **${String(err?.message || err).slice(0, 1200)}**`)], ephemeral: true };
     if (interaction.deferred || interaction.replied) interaction.followUp(payload).catch(() => {});
     else interaction.reply(payload).catch(() => {});
   }
@@ -883,6 +916,21 @@ const SETUP_EDIT_FIELDS = {
     { key: 'window_seconds', oKey: 'window_seconds', label: 'Window length (seconds)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.antispam.windowSeconds) },
     { key: 'punishment', oKey: 'punishment', label: 'Punishment: mute / kick / ban', parse: v => v, get: cfg => cfg.antispam.punishment }
   ],
+  antiwebhook: [
+    { key: 'action', oKey: 'action', label: 'Action: delete / kick / ban / strip_roles', parse: v => v, get: cfg => cfg.antiwebhook.action },
+    { key: 'bypass_role', oKey: 'bypass_role_id', label: 'Bypass role ID (blank = none)', parse: v => v.replace(/[<@&>]/g, ''), get: cfg => cfg.antiwebhook.bypassRoleId || '' },
+    { key: 'log_channel', oKey: 'log_channel_id', label: 'Security log channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.antiwebhook.logChannelId || '' }
+  ],
+  antibot: [
+    { key: 'action', oKey: 'action', label: 'Action: kick / ban / strip_roles', parse: v => v, get: cfg => cfg.antibot.action },
+    { key: 'bypass_role', oKey: 'bypass_role_id', label: 'Trusted inviter role ID (blank = none)', parse: v => v.replace(/[<@&>]/g, ''), get: cfg => cfg.antibot.bypassRoleId || '' },
+    { key: 'log_channel', oKey: 'log_channel_id', label: 'Security log channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.antibot.logChannelId || '' }
+  ],
+  antialt: [
+    { key: 'action', oKey: 'action', label: 'Action: kick / ban', parse: v => v, get: cfg => cfg.antialt.action },
+    { key: 'min_account_age_days', oKey: 'min_account_age_days', label: 'Minimum account age (days)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.antialt.minAccountAgeDays) },
+    { key: 'log_channel', oKey: 'log_channel_id', label: 'Security log channel ID', parse: v => v.replace(/[<#>]/g, ''), get: cfg => cfg.antialt.logChannelId || '' }
+  ],
   antiraid: [
     { key: 'join_threshold', oKey: 'join_threshold', label: 'Joins allowed per window', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.antiraid.joinThreshold) },
     { key: 'window_seconds', oKey: 'window_seconds', label: 'Window length (seconds)', parse: v => parseInt(v, 10) || null, get: cfg => String(cfg.antiraid.windowSeconds) },
@@ -1083,6 +1131,30 @@ async function handleModal(interaction) {
 // guildMemberAdd — antiraid, greetvoice, welcome, autorole, sticky roles
 // ---------------------------------------------------------------------------------
 client.on('guildMemberAdd', async (member) => {
+  // Track which invite was consumed and apply configured invite rewards.
+  try {
+    const before = inviteSnapshots.get(member.guild.id) || new Map();
+    const afterInvites = await member.guild.invites.fetch().catch(()=>null);
+    if (afterInvites) {
+      let used = null; for (const inv of afterInvites.values()) { if ((inv.uses||0) > (before.get(inv.code)||0)) { used = inv; break; } }
+      inviteSnapshots.set(member.guild.id,new Map([...afterInvites.values()].map(x=>[x.code,x.uses||0])));
+      if (used?.inviter && used.inviter.id !== member.user.id) {
+        const count=db.addInviteCount(member.guild.id,used.inviter.id,1); const rewards=db.getConfig(member.guild.id).inviteTracker.rewards||[];
+        for (const reward of rewards) if (count >= reward.invites) { const role=member.guild.roles.cache.get(reward.roleId); const inviter=await member.guild.members.fetch(used.inviter.id).catch(()=>null); if(role && inviter?.roles?.add) inviter.roles.add(role,'Invite reward').catch(()=>{}); }
+      }
+    }
+  } catch {}
+  const extraSec = db.getConfig(member.guild.id).securityExtras;
+  if (member.user.bot && extraSec.antiunknownbot.enabled) {
+    const audit = await sys.findAuditExecutor(member.guild, AuditLogEvent.BotAdd, member.id).catch(()=>null);
+    const inviter = audit ? await member.guild.members.fetch(audit.id).catch(()=>null) : null;
+    if (!inviter || !inviter.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      if (extraSec.antiunknownbot.action === 'ban') await member.ban({reason:'Anti unknown bot'}).catch(()=>{}); else await member.kick('Anti unknown bot').catch(()=>{});
+      return;
+    }
+  }
+  await sys.handleAntiBotJoin(member).catch(() => {});
+  await sys.handleAntiAltJoin(member).catch(() => {});
   await sys.handleAntiraidJoin(member).catch(() => {});
   await sys.onMemberJoinGreetvoice(member).catch(() => {});
 
@@ -1274,6 +1346,20 @@ client.on('messageCreate', async (message) => {
     return handleHoneypot(message).catch(console.error);
   }
 
+  const mediaOnly = cfgAll.mediaOnly?.channels || [];
+  if (mediaOnly.includes(message.channel.id) && !message.member?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    const media = message.attachments.some(a => /^image\//i.test(a.contentType||'') || /^video\//i.test(a.contentType||''));
+    if (!media) { await message.delete().catch(()=>{}); message.channel.send({embeds:[ui.errorEmbed('🖼️ Media Only','Only image and video media are allowed in this channel.')]}).then(m=>setTimeout(()=>m.delete().catch(()=>{}),4000)).catch(()=>{}); return; }
+  }
+  const sec=cfgAll.securityExtras||{};
+  if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (sec.antiinvite?.enabled && /(discord\.gg\/|discord\.com\/invite\/)/i.test(message.content)) { await message.delete().catch(()=>{}); return; }
+    if (sec.antiscam?.enabled && /(?:free|claim|nitro|gift|steam|crypto).{0,30}(?:gift|reward|verify|login|claim)/i.test(message.content) && /https?:\/\//i.test(message.content)) { await message.delete().catch(()=>{}); return; }
+    if (sec.antimention?.enabled && message.mentions.users.size + message.mentions.roles.size >= (sec.antimention.maxMentions||5)) { await message.delete().catch(()=>{}); return; }
+    if (sec.anticap?.enabled) { const letters=message.content.match(/[A-Za-z]/g)||[]; const upper=message.content.match(/[A-Z]/g)||[]; if(letters.length>=8 && upper.length/letters.length*100 >= (sec.anticap.threshold||80)){ await message.delete().catch(()=>{}); return; } }
+    if (sec.antieveryone?.enabled && /@(everyone|here)/i.test(message.content)) { await message.delete().catch(()=>{}); return; }
+    if (sec.antiweb?.enabled && /https?:\/\/(?:grabify|iplogger|2no|shorturl|bit\.ly|tinyurl)/i.test(message.content)) { await message.delete().catch(()=>{}); return; }
+  }
   const wasCommand = await handlePrefixCommand(message).catch((e) => { console.error(e); return false; });
   if (wasCommand) return;
   await sys.handleAntilink(message).catch(() => {});
@@ -1382,6 +1468,7 @@ client.on('guildBanAdd', async (ban) => {
   if (executor) await sys.antinukeStrike(ban.guild, executor, 'ban');
 });
 client.on('webhooksUpdate', async (channel) => {
+  await sys.handleAntiWebhookUpdate(channel).catch(() => {});
   const executor = await sys.findAuditExecutor(channel.guild, AuditLogEvent.WebhookCreate);
   if (executor) await sys.antinukeStrike(channel.guild, executor, 'webhookCreate');
 });
