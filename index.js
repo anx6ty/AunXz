@@ -12,13 +12,14 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
-const { commands, isOwner, buildModulePatch, PANEL_MODULES, EXTRA_PREFIX_ALIASES } = require('./commands');
+const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
 require('./v2patch').apply(); // Components V2 for every embed that has buttons/selects
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
 const birthdayWishesSent = new Set();
 const logSetupSessions = new Map();
-const inviteSnapshots = new Map();
+const rolePanelSessions = new Map(); // guild:user -> { buttonId, reactionId }
+const setupMediaSessions = new Map(); // guild:user -> { kind, panelId, field, channelId, interaction, apply, render, expiresAt }
 
 const client = new Client({
   intents: [
@@ -85,7 +86,6 @@ client.once('ready', async () => {
   console.log(`Database: ${db.DB_PATH}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { console.error('Command registration failed:', e); }
-  for (const guild of client.guilds.cache.values()) { const inv = await guild.invites.fetch().catch(()=>null); if(inv) inviteSnapshots.set(guild.id,new Map([...inv.values()].map(x=>[x.code,x.uses||0]))); }
 });
 
 setInterval(() => finishGiveaways().catch(console.error), 15000);
@@ -226,6 +226,105 @@ function stripEphemeral(payload) {
   return rest;
 }
 
+// -----------------------------------------------------------------------------
+// Command guards — disabled modules must never execute, and declared permissions
+// are enforced for both slash commands and prefix/mention commands.
+// ----------------------------------------------------------------------------∕
+const COMMAND_FEATURES = {
+  antinuke:'antinuke', antilink:'antilink', antispam:'antispam', antiraid:'antiraid',
+  antiwebhook:'antiwebhook', antibot:'antibot', antialt:'antialt', voicemaster:'voicemaster',
+  greetmessage:'greetmessage', testgreet:'greetmessage', greetvoice:'greetvoice', leveling:'leveling', tickets:'ticket',
+  ticketpanel:'ticket', ticketconfig:'ticket', claim:'ticket', close:'ticket', delete:'ticket',
+  addmembertoticket:'ticket', removemembertoticket:'ticket', automod:'automod',
+  antibadwordsetup:'antibadword', autorespondersetup:'autoresponder', autoreactorsetup:'autoreactor',
+  honeypotsetup:'honeypot', birthdaysetup:'birthdays', birthdays:'birthdays', autorole:'autorole',
+  staffapplicationssetup:'staffApplications', rank:'leveling', leaderboard:'leveling', xp:'leveling'
+};
+
+function commandSubcommand(interaction) {
+  try { return interaction.options?.getSubcommand?.(false) || null; } catch { return null; }
+}
+function commandIsSetupOnly(interaction) {
+  const name = interaction.commandName || '';
+  const sub = commandSubcommand(interaction);
+  return name === 'setup' || sub === 'setup' || /setup$/i.test(name) || /config$/i.test(name) || /panel$/i.test(name) || name === 'autorole';
+}
+function commandFeatureKey(interaction) {
+  return COMMAND_FEATURES[interaction.commandName] || null;
+}
+function featureEnabled(cfg, key) {
+  if (!key || !Object.prototype.hasOwnProperty.call(cfg, key)) return true;
+  const value = cfg[key];
+  return typeof value === 'boolean' ? value : value?.enabled !== false;
+}
+async function guardCommand(interaction, cmd) {
+  if (!interaction.guild || !interaction.member) return true;
+  const cfg = db.getConfig(interaction.guildId);
+  const json = cmd.data.toJSON();
+  const required = json.default_member_permissions;
+  if (required && !interaction.member.permissions.has(BigInt(required))) {
+    return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
+  }
+  if (!commandIsSetupOnly(interaction)) {
+    const key = commandFeatureKey(interaction);
+    if (key && !featureEnabled(cfg, key)) {
+      const setupName = key === 'ticket' ? '/tickets setup' : key === 'greetmessage' ? '/greetmessage setup' : `/${interaction.commandName} setup`;
+      return interaction.reply({ embeds:[ui.errorEmbed('Feature Disabled', `**${key}** is currently disabled. Enable it from ${setupName}.`)], ephemeral:true }).then(()=>false);
+    }
+  }
+  return true;
+}
+async function executeCommand(cmd, interaction) {
+  if (!await guardCommand(interaction, cmd)) return;
+  try {
+    await cmd.execute(interaction);
+  } catch (e) {
+    console.error(`Command ${interaction.commandName} failed:`, e);
+    const code = e?.code ? `\n**Discord code:** \`${e.code}\`` : '';
+    const message = e?.message ? String(e.message).slice(0, 1200) : 'Something went wrong while executing the command.';
+    const payload = { embeds:[ui.errorEmbed('Command Failed', `${message}${code}`)], ephemeral:true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(()=>{});
+    else await interaction.reply(payload).catch(()=>{});
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Setup media upload flow — administrators click "Send Image/GIF", then send the
+// image/GIF as the very next message in the same channel. The bot saves the CDN URL
+// and deletes the setup upload so no raw upload is left in the channel.
+// -----------------------------------------------------------------------------
+function mediaSessionKey(guildId, userId) { return `${guildId}:${userId}`; }
+function startSetupMediaUpload(interaction, opts) {
+  const key = mediaSessionKey(interaction.guildId, interaction.user.id);
+  const old = setupMediaSessions.get(key);
+  if (old?.timer) clearTimeout(old.timer);
+  const session = { ...opts, channelId: interaction.channelId, interaction, expiresAt: Date.now() + 120000 };
+  session.timer = setTimeout(() => setupMediaSessions.delete(key), 120000);
+  setupMediaSessions.set(key, session);
+  return interaction.reply({ embeds:[ui.base('🖼️ Send Image/GIF Now').setDescription(`Send the image or GIF for **${opts.label || 'this setting'}** as your next message in this channel.\n\nI will save it and delete the upload automatically.`)], ephemeral:true });
+}
+async function consumeSetupMedia(message) {
+  if (!message.guild || message.author.bot) return false;
+  const key = mediaSessionKey(message.guild.id, message.author.id);
+  const session = setupMediaSessions.get(key);
+  if (!session || session.channelId !== message.channelId) return false;
+  if (Date.now() > session.expiresAt) { setupMediaSessions.delete(key); return false; }
+  const attachment = [...message.attachments.values()].find(a => (a.contentType || '').startsWith('image/'));
+  if (!attachment) return false;
+  setupMediaSessions.delete(key);
+  if (session.timer) clearTimeout(session.timer);
+  try {
+    await session.apply(attachment.url, message);
+    await message.delete().catch(()=>{});
+    if (session.render) await session.interaction.editReply(session.render()).catch(()=>{});
+    return true;
+  } catch (e) {
+    console.error('setup media upload:', e);
+    await session.interaction.editReply({ embeds:[ui.errorEmbed('Upload Failed', e.message || 'Could not save that image/GIF.')], components:[] }).catch(()=>{});
+    return true;
+  }
+}
+
 const TEXT_ALIASES = new Map([
   ['i','invites'], ['invite','invites'],
   ['si','serverinfo'], ['server','serverinfo'],
@@ -234,18 +333,8 @@ const TEXT_ALIASES = new Map([
   ['ss','serverstats'], ['stats','serverstats'],
   ['lb','leaderboard'], ['lbs','leaderboards'],
   ['rank','rank'], ['help','help'], ['h','help'],
-  ['ga','giveaway'], ['gc','gc']
+  ['ga','giveaway']
 ]);
-for (const alias of EXTRA_PREFIX_ALIASES) {
-  if (!TEXT_ALIASES.has(alias)) TEXT_ALIASES.set(alias, alias);
-}
-// Map the 300+ convenience names to real commands without consuming Discord's 100 slash-command limit.
-const PREFIX_FALLBACKS = {
-  gcreate:'gc', give:'gc', giveawaycreate:'gc', inviteinfo:'invites', invitecount:'invites', server:'serverinfo', serverinformation:'serverinfo', serverdetails:'serverinfo', userinfo:'userinfo', memberinfo:'userinfo', profile:'userinfo', pfp:'avatar', picture:'avatar', avatarshow:'avatar', serverstats:'serverstats', statistics:'serverstats', serverstat:'serverstats', leaderboards:'leaderboards', top:'leaderboards', topusers:'leaderboards', levels:'leaderboard', ranks:'rank', rankings:'leaderboards',
-  banuser:'ban', kickuser:'kick', timeoutuser:'timeout', untimeoutuser:'untimeout', warnuser:'warn', warningsfor:'warnings', clearwarnings:'clearwarns', purgechat:'purge', clean:'purge', clear:'purge', lockchannel:'lock', unlockchannel:'unlock', slow:'slowmode', slowmodechannel:'slowmode', addrole:'role', removerole:'role', setrole:'role', nick:'nickname', setnick:'nickname', ticket:'ticketpanel', tickets:'ticketpanel', ticketconfig:'tickets', ticketsetup:'tickets', greet:'welcome', welcome:'welcome', welcometest:'testgreet', logs:'logsetup', logsetup:'logsetup', automodsetup:'automod', antinukeconfig:'antinuke', antilinksetup:'antilink', antispamsetup:'antispam', antiraidsetup:'antiraid', antiwebhooksetup:'antiwebhook', antibotsetup:'antibot', antialtsetup:'antialt', voicemastersetup:'voicemaster', levelsetup:'leveling', levelingsetup:'leveling', suggestion:'suggestions', suggestionsetup:'suggestions', poll:'polls', pollsetup:'polls', star:'starboard', starboardsetup:'starboard', boostsetup:'boost', leavesetup:'leave', welcomesetup:'welcome', birthdaysetup:'birthdays', reactionrole:'reactionrolesetup', reactionroles:'reactionrolesetup', buttonrole:'buttonrolesetup', buttonroles:'buttonrolesetup', staffapply:'staffapplicationssetup', staffapplications:'staffapplicationssetup', mediaadd:'addmediaonly', mediaremove:'removemediaonly', mediaonly:'addmediaonly', unmediaonly:'removemediaonly', inviteRewards:'invitesetup', invitesetup2:'invitesetup', security:'help', securitysetup:'help'
-};
-for (let i=1;i<=240;i++) PREFIX_FALLBACKS[`cmd${i}`] = i%2 ? 'help' : 'serverinfo';
-for (const [alias,target] of Object.entries(PREFIX_FALLBACKS)) TEXT_ALIASES.set(alias,target);
 
 function normalizeCommandName(name) {
   const key = String(name || '').toLowerCase();
@@ -284,12 +373,7 @@ async function handlePrefixCommand(message) {
     message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
     return true;
   }
-  try {
-    await cmd.execute(fake);
-  } catch (e) {
-    console.error(e);
-    message.reply({ embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')] }).catch(() => {});
-  }
+  await executeCommand(cmd, fake);
   return true;
 }
 
@@ -303,8 +387,57 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ embeds: [ui.errorEmbed('Blacklisted', 'You are blocked from using this bot.')], ephemeral: true });
       }
       const cmd = commands.find(c => c.data.name === interaction.commandName);
-      if (cmd) await cmd.execute(interaction);
+      if (cmd) await executeCommand(cmd, interaction);
       return;
+    }
+
+    // Multi-panel role manager selects ------------------------------------------------
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('buttonroles_role_select:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'button',panelId), role=interaction.guild.roles.cache.get(interaction.values[0]);
+      if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That button-role panel no longer exists.')],ephemeral:true});
+      if(!role)return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role is no longer available.')],ephemeral:true});
+      if(role.id===interaction.guild.id)return interaction.reply({embeds:[ui.errorEmbed('Invalid Role','@everyone cannot be used.')],ephemeral:true});
+      const bot=interaction.guild.members.me;
+      if(role.position>=bot.roles.highest.position)return interaction.reply({embeds:[ui.errorEmbed('Role Hierarchy',`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`)],ephemeral:true});
+      db.upsertPanel(interaction.guildId,'button',{...panel,buttons:[...(panel.buttons||[]).filter(b=>b.roleId!==role.id),{roleId:role.id,label:role.name.slice(0,80),mode:'toggle'}]});
+      rememberSelectedPanel(interaction.guildId,interaction.user.id,'button',panelId);
+      return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('reactionroles_role_select:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'reaction',panelId), role=interaction.guild.roles.cache.get(interaction.values[0]);
+      if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That reaction-role panel no longer exists.')],ephemeral:true});
+      if(!role)return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role is no longer available.')],ephemeral:true});
+      const bot=interaction.guild.members.me;
+      if(role.position>=bot.roles.highest.position)return interaction.reply({embeds:[ui.errorEmbed('Role Hierarchy',`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`)],ephemeral:true});
+      const modal=new ModalBuilder().setCustomId(`reactionroles_add_modal:${panelId}:${role.id}`).setTitle('Add Reaction Role');
+      modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('emoji').setLabel('Emoji').setPlaceholder('🎮 or <:name:id>').setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('label').setLabel('Label (optional)').setPlaceholder(role.name).setStyle(TextInputStyle.Short).setRequired(false)));
+      return interaction.showModal(modal);
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('buttonroles_cfg:channel:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const panelId=interaction.customId.split(':')[2], panel=getPanel(interaction.guildId,'button',panelId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+      db.upsertPanel(interaction.guildId,'button',{...panel,channelId:interaction.values[0]}); rememberSelectedPanel(interaction.guildId,interaction.user.id,'button',panelId); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
+    }
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('reactionroles_cfg:channel:')) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const panelId=interaction.customId.split(':')[2], panel=getPanel(interaction.guildId,'reaction',panelId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+      db.upsertPanel(interaction.guildId,'reaction',{...panel,channelId:interaction.values[0]}); rememberSelectedPanel(interaction.guildId,interaction.user.id,'reaction',panelId); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'buttonroles_cfg:select') {
+      rememberSelectedPanel(interaction.guildId,interaction.user.id,'button',interaction.values[0]); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === 'reactionroles_cfg:select') {
+      rememberSelectedPanel(interaction.guildId,interaction.user.id,'reaction',interaction.values[0]); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('buttonroles_cfg:remove_role:')) {
+      const panelId=interaction.customId.split(':')[2],panel=getPanel(interaction.guildId,'button',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+      db.upsertPanel(interaction.guildId,'button',{...panel,buttons:(panel.buttons||[]).filter(b=>b.roleId!==interaction.values[0])});rememberSelectedPanel(interaction.guildId,interaction.user.id,'button',panelId);return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('reactionroles_cfg:remove_role:')) {
+      const panelId=interaction.customId.split(':')[2],panel=getPanel(interaction.guildId,'reaction',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+      db.upsertPanel(interaction.guildId,'reaction',{...panel,mappings:(panel.mappings||[]).filter(m=>m.roleId!==interaction.values[0])});rememberSelectedPanel(interaction.guildId,interaction.user.id,'reaction',panelId);return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
     }
 
     // Giveaway controls -------------------------------------------------------------
@@ -400,52 +533,52 @@ client.on('interactionCreate', async (interaction) => {
       const [, module, field] = interaction.customId.split(':'); const value=interaction.values[0];
       const keyMap={action:{antiwebhook:'action',antibot:'action',antialt:'action'},age:{antialt:'minAccountAgeDays'}}; const key=keyMap[field]?.[module];
       if(!key)return interaction.reply({embeds:[ui.errorEmbed('Invalid Setting','That security setting is unavailable.')],ephemeral:true});
-      const cfg=db.saveConfig(interaction.guildId,{[module]:{[key]:field==='age'?Number(value):value,enabled:true}});
+      const cfg=db.saveConfig(interaction.guildId,{[module]:{[key]:field==='age'?Number(value):value}});
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const [, module, field]=interaction.customId.split(':'); if(field!=='bypass') return;
-      const cfg=db.saveConfig(interaction.guildId,{[module]:{bypassRoleId:interaction.values[0],enabled:true}});
+      const cfg=db.saveConfig(interaction.guildId,{[module]:{bypassRoleId:interaction.values[0]}});
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const [, module, field]=interaction.customId.split(':'); if(field!=='log') return;
-      const cfg=db.saveConfig(interaction.guildId,{[module]:{logChannelId:interaction.values[0],enabled:true}});
+      const cfg=db.saveConfig(interaction.guildId,{[module]:{logChannelId:interaction.values[0]}});
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
     // Easy setup panels ------------------------------------------------------------
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('birthday_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1];
-      const patch=part==='panel'?{birthdays:{panelChannelId:interaction.values[0],enabled:true}}:{birthdays:{wishChannelId:interaction.values[0],enabled:true}};
+      const patch=part==='panel'?{birthdays:{panelChannelId:interaction.values[0]}}:{birthdays:{wishChannelId:interaction.values[0]}};
       const cfg=db.saveConfig(interaction.guildId,patch).birthdays;
       return interaction.update({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1];
-      if(part==='channel') db.saveConfig(interaction.guildId,{honeypot:{channelId:interaction.values[0],enabled:true}});
+      if(part==='channel') db.saveConfig(interaction.guildId,{honeypot:{channelId:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).honeypot;
       return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
-      db.saveConfig(interaction.guildId,{antibadword:{logChannelId:interaction.values[0],enabled:true}});
+      db.saveConfig(interaction.guildId,{antibadword:{logChannelId:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).antibadword;
       return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId === 'greetvoice_cfg:voice') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
-      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{vcId:interaction.values[0],enabled:true}}).greetvoice;
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{vcId:interaction.values[0]}}).greetvoice;
       const ch=interaction.guild.channels.cache.get(cfg.vcId); const role=cfg.roleId?interaction.guild.roles.cache.get(cfg.roleId):null;
       if(role&&ch) await sys.lockRoleToSingleChannel(interaction.guild,role,ch.id).catch(()=>{});
       return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
-      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0],enabled:true}}).greetvoice;
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0]}}).greetvoice;
       const role=interaction.guild.roles.cache.get(cfg.roleId); if(role&&cfg.vcId) await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
       return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
     }
@@ -458,7 +591,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
-      db.saveConfig(interaction.guildId,{antibadword:{action:interaction.values[0],enabled:true}});
+      db.saveConfig(interaction.guildId,{antibadword:{action:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).antibadword;
       return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
     }
@@ -502,7 +635,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({content:'Select the role to use as the Greet Voice gate.',components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('greetvoice_cfg:role_select').setPlaceholder('Select gate role'))],ephemeral:true});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role_select') {
-      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0],enabled:true}}).greetvoice;
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0]}}).greetvoice;
       const role=interaction.guild.roles.cache.get(cfg.roleId); if(role&&cfg.vcId) await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
       return interaction.update({content:null,embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
     }
@@ -521,7 +654,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) return handleModal(interaction);
   } catch (err) {
     console.error(err);
-    const payload = { embeds: [ui.errorEmbed('❌ Command Failed', `Discord rejected the action: **${String(err?.message || err).slice(0, 1200)}**`)], ephemeral: true };
+    const payload = { embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')], ephemeral: true };
     if (interaction.deferred || interaction.replied) interaction.followUp(payload).catch(() => {});
     else interaction.reply(payload).catch(() => {});
   }
@@ -529,31 +662,121 @@ client.on('interactionCreate', async (interaction) => {
 
 
 
+function rolePanelKey(guildId, userId) { return `${guildId}:${userId}`; }
+function rolePanelState(guildId, userId) {
+  const key = rolePanelKey(guildId, userId);
+  const current = rolePanelSessions.get(key) || { buttonId: null, reactionId: null };
+  rolePanelSessions.set(key, current);
+  return current;
+}
+function newPanelId(prefix) { return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`; }
+function getPanel(guildId, kind, panelId) { return db.findPanel(guildId, kind, panelId); }
+function rememberSelectedPanel(guildId, userId, kind, panelId) {
+  const state=rolePanelState(guildId,userId);
+  if(kind==='button') state.buttonId=panelId; else state.reactionId=panelId;
+  rolePanelSessions.set(rolePanelKey(guildId,userId),state);
+}
+function panelManagerPayload(guildId,userId,kind) {
+  const cfg=db.getConfig(guildId), state=rolePanelState(guildId,userId);
+  const selectedId=kind==='button'?state.buttonId:state.reactionId;
+  return kind==='button'
+    ? {embeds:[ui.buttonRoleEmbed(cfg,selectedId)],components:ui.buttonRoleSetupRows(cfg,selectedId)}
+    : {embeds:[ui.reactionRoleSetupEmbed(cfg,selectedId)],components:ui.reactionRoleSetupRows(cfg,selectedId)};
+}
+function createButtonPanel() {
+  return {id:newPanelId('btn'),enabled:true,channelId:null,title:'Choose your roles',description:'Press a button to get or remove a role.',image:null,embedType:'embed',buttons:[]};
+}
+function createReactionPanel() {
+  return {id:newPanelId('react'),enabled:true,channelId:null,messageId:null,title:'Choose your roles',description:'React below to receive or remove a role.',image:null,mappings:[]};
+}
 async function postButtonRolePanel(guild, cfg) {
   if (!cfg.channelId) throw new Error('Select a panel channel first.');
-  const channel = guild.channels.cache.get(cfg.channelId);
+  if (cfg.enabled===false) throw new Error('This panel is disabled. Enable it before posting.');
+  if (!(cfg.buttons||[]).length) throw new Error('Add at least one role button first.');
+  const channel=guild.channels.cache.get(cfg.channelId);
   if (!channel?.isTextBased()) throw new Error('The configured panel channel is unavailable.');
-  const e = ui.base(cfg.title || 'Choose your roles').setDescription(cfg.description || 'Press a button to get or remove a role.');
-  if (cfg.image) e.setImage(cfg.image);
-  const buttons = cfg.buttons || [];
-  const components = [];
-  for (let i = 0; i < buttons.length; i += 5) {
-    const row = new ActionRowBuilder();
-    for (const b of buttons.slice(i, i + 5)) {
-      row.addComponents(new ButtonBuilder().setCustomId(`rolebtn:${b.roleId}`).setLabel(b.label || 'Role').setStyle(ButtonStyle.Primary));
-    }
-    components.push(row);
-  }
-  if (cfg.embedType === 'selection') {
-    const menu = new StringSelectMenuBuilder().setCustomId('role_select').setPlaceholder('Choose a role…')
-      .addOptions(buttons.slice(0, 25).map(b => ({label:(b.label||'Role').slice(0,100), value:b.roleId})));
-    components.splice(0, components.length, new ActionRowBuilder().addComponents(menu));
-  }
-  return channel.send({ embeds: [e], components });
+  const bot=guild.members.me;
+  if(!bot?.permissions.has(PermissionFlagsBits.ManageRoles) && !bot?.permissions.has(PermissionFlagsBits.Administrator)) throw new Error('I need Manage Roles to create a role panel.');
+  for(const b of cfg.buttons){const role=guild.roles.cache.get(b.roleId);if(!role)throw new Error(`The role for **${b.label||b.roleId}** no longer exists.`);if(role.position>=bot.roles.highest.position)throw new Error(`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`);}
+  const e=ui.base(cfg.title||'Choose your roles').setDescription(cfg.description||'Press a button to get or remove a role.'); if(cfg.image)e.setImage(cfg.image);
+  const components=[];
+  for(let i=0;i<cfg.buttons.length;i+=5){const row=new ActionRowBuilder();for(const b of cfg.buttons.slice(i,i+5))row.addComponents(new ButtonBuilder().setCustomId(`rolebtn:${cfg.id}:${b.roleId}`).setLabel(b.label||'Role').setStyle(ButtonStyle.Primary));components.push(row);}
+  if(cfg.embedType==='selection'){const menu=new StringSelectMenuBuilder().setCustomId(`role_select:${cfg.id}`).setPlaceholder('Choose a role…').addOptions(cfg.buttons.slice(0,25).map(b=>({label:(b.label||'Role').slice(0,100),value:b.roleId})));components.splice(0,components.length,new ActionRowBuilder().addComponents(menu));}
+  return channel.send({embeds:[e],components});
+}
+async function postReactionRolePanel(guild,cfg){
+  if(!cfg.channelId)throw new Error('Select a panel channel first.');
+  if(cfg.enabled===false)throw new Error('This panel is disabled. Enable it before posting.');
+  if(!(cfg.mappings||[]).length)throw new Error('Add at least one role mapping first.');
+  const channel=guild.channels.cache.get(cfg.channelId);if(!channel?.isTextBased())throw new Error('The configured panel channel is unavailable.');
+  const bot=guild.members.me;if(!bot?.permissions.has(PermissionFlagsBits.ManageRoles)&&!bot?.permissions.has(PermissionFlagsBits.Administrator))throw new Error('I need Manage Roles to create a role panel.');
+  for(const m of cfg.mappings){const role=guild.roles.cache.get(m.roleId);if(!role)throw new Error(`The role for **${m.label||m.roleId}** no longer exists.`);if(role.position>=bot.roles.highest.position)throw new Error(`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`);}
+  if(cfg.messageId){const old=await channel.messages.fetch(cfg.messageId).catch(()=>null);if(old)await old.delete().catch(()=>{});}
+  const e=ui.base(cfg.title||'Choose your roles').setDescription(cfg.description||'React below to receive or remove a role.');if(cfg.image)e.setImage(cfg.image);
+  const msg=await channel.send({embeds:[e]});for(const m of cfg.mappings)await msg.react(m.emoji).catch(()=>{});return msg;
 }
 
 async function handleButton(interaction) {
   const id = interaction.customId;
+
+  // Button-role / reaction-role panel manager
+  if (id === 'buttonroles_cfg:create' || id === 'reactionroles_cfg:create') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    const kind=id.startsWith('button')?'button':'reaction'; const panel=kind==='button'?createButtonPanel():createReactionPanel(); db.upsertPanel(interaction.guildId,kind,panel); rememberSelectedPanel(interaction.guildId,interaction.user.id,kind,panel.id);
+    return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,kind));
+  }
+  if (id === 'buttonroles_cfg:toggle' || id === 'buttonroles_cfg:delete') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    const state=rolePanelState(interaction.guildId,interaction.user.id),panel=getPanel(interaction.guildId,'button',state.buttonId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('No Panel Selected','Create or select a button-role panel first.')],ephemeral:true});
+    if(id.endsWith(':delete')){db.removePanel(interaction.guildId,'button',panel.id);state.buttonId=null;}else db.upsertPanel(interaction.guildId,'button',{...panel,enabled:panel.enabled===false});
+    return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
+  }
+  if (id === 'reactionroles_cfg:toggle' || id === 'reactionroles_cfg:delete') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    const state=rolePanelState(interaction.guildId,interaction.user.id),panel=getPanel(interaction.guildId,'reaction',state.reactionId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('No Panel Selected','Create or select a reaction-role panel first.')],ephemeral:true});
+    if(id.endsWith(':delete')){db.removePanel(interaction.guildId,'reaction',panel.id);state.reactionId=null;}else db.upsertPanel(interaction.guildId,'reaction',{...panel,enabled:panel.enabled===false});
+    return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
+  }
+  if (id.startsWith('buttonroles_cfg:settings:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'button',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    const modal=new ModalBuilder().setCustomId(`buttonroles_panel_modal:${panelId}`).setTitle('Button Role Panel Text');
+    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title').setLabel('Panel title').setStyle(TextInputStyle.Short).setRequired(true).setValue((panel.title||'Choose your roles').slice(0,100))),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Panel message').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((panel.description||'Press a button to get or remove a role.').slice(0,1000))),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('style').setLabel('Style: embed or selection').setStyle(TextInputStyle.Short).setRequired(true).setValue(panel.embedType||'embed')));
+    return interaction.showModal(modal);
+  }
+  if (id.startsWith('reactionroles_cfg:settings:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'reaction',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    const modal=new ModalBuilder().setCustomId(`reactionroles_panel_modal:${panelId}`).setTitle('Reaction Role Panel Text');
+    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title').setLabel('Panel title').setStyle(TextInputStyle.Short).setRequired(true).setValue((panel.title||'Choose your roles').slice(0,100))),new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Panel message').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((panel.description||'React below to receive or remove a role.').slice(0,1000))));
+    return interaction.showModal(modal);
+  }
+  if (id.startsWith('buttonroles_cfg:addrole:')) {
+    const panelId=id.split(':')[2]; return interaction.reply({embeds:[ui.base('🎭 Select Role').setDescription('Choose the role to add. No role ID is needed.')],components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`buttonroles_role_select:${panelId}`).setPlaceholder('Select a role…'))],ephemeral:true});
+  }
+  if (id.startsWith('reactionroles_cfg:addrole:')) {
+    const panelId=id.split(':')[2]; return interaction.reply({embeds:[ui.base('🎭 Select Role').setDescription('Choose the role to add. I will ask for the emoji next.')],components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`reactionroles_role_select:${panelId}`).setPlaceholder('Select a role…'))],ephemeral:true});
+  }
+  if (id.startsWith('buttonroles_cfg:upload:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'button',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    return startSetupMediaUpload(interaction,{label:'the button-role panel',apply:async url=>db.upsertPanel(interaction.guildId,'button',{...panel,image:url}),render:()=>panelManagerPayload(interaction.guildId,interaction.user.id,'button')});
+  }
+  if (id.startsWith('buttonroles_cfg:remove_image:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'button',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true}); db.upsertPanel(interaction.guildId,'button',{...panel,image:null}); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
+  }
+  if (id.startsWith('buttonroles_cfg:post:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'button',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    try{const msg=await postButtonRolePanel(interaction.guild,panel);db.upsertPanel(interaction.guildId,'button',{...panel,messageId:msg.id});return interaction.reply({embeds:[ui.okEmbed('✅ Panel Posted',`Button-role panel posted in <#${msg.channel.id}>.`)],ephemeral:true});}catch(e){return interaction.reply({embeds:[ui.errorEmbed('Cannot Post Panel',e.message)],ephemeral:true});}
+  }
+  if (id.startsWith('reactionroles_cfg:upload:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'reaction',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    return startSetupMediaUpload(interaction,{label:'the reaction-role panel',apply:async url=>db.upsertPanel(interaction.guildId,'reaction',{...panel,image:url}),render:()=>panelManagerPayload(interaction.guildId,interaction.user.id,'reaction')});
+  }
+  if (id.startsWith('reactionroles_cfg:remove_image:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'reaction',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true}); db.upsertPanel(interaction.guildId,'reaction',{...panel,image:null}); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
+  }
+  if (id.startsWith('reactionroles_cfg:post:')) {
+    const panelId=id.split(':')[2],panel=getPanel(interaction.guildId,'reaction',panelId);if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    try{const msg=await postReactionRolePanel(interaction.guild,panel);db.upsertPanel(interaction.guildId,'reaction',{...panel,messageId:msg.id});return interaction.reply({embeds:[ui.okEmbed('✅ Panel Posted',`Reaction-role panel posted in <#${msg.channel.id}>.`)],ephemeral:true});}catch(e){return interaction.reply({embeds:[ui.errorEmbed('Cannot Post Panel',e.message)],ephemeral:true});}
+  }
 
   if (id === 'buttonroles_cfg:panel') {
     const cfg=db.getConfig(interaction.guildId).buttonRoles;
@@ -683,16 +906,39 @@ async function handleButton(interaction) {
   }
 
   if (id.startsWith('rolebtn:')) {
-    const roleId=id.split(':')[1]; const role=interaction.guild.roles.cache.get(roleId);
+    const parts=id.split(':');
+    const panelId=parts.length>=3?parts[1]:null;
+    const roleId=parts.length>=3?parts[2]:parts[1];
+    const cfg=db.getConfig(interaction.guildId);
+    const panel=panelId ? getPanel(interaction.guildId,'button',panelId) : null;
+    if(panel && panel.enabled===false) return interaction.reply({embeds:[ui.errorEmbed('Panel Disabled','This role panel is currently disabled.')],ephemeral:true});
+    const role=interaction.guild.roles.cache.get(roleId);
     if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Missing','That role no longer exists.')],ephemeral:true});
+    if(role.id===interaction.guild.id) return interaction.reply({embeds:[ui.errorEmbed('Invalid Role','@everyone cannot be assigned.')],ephemeral:true});
+    const bot=interaction.guild.members.me;
+    if(!bot || role.position>=bot.roles.highest.position) return interaction.reply({embeds:[ui.errorEmbed('Role Hierarchy',`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`)],ephemeral:true});
     const member=interaction.member;
-    if(member.roles.cache.has(role.id)){ await member.roles.remove(role).catch(()=>{}); return interaction.reply({embeds:[ui.okEmbed('Role Removed',`${role} removed from you.`)],ephemeral:true}); }
-    await member.roles.add(role).catch(()=>{}); return interaction.reply({embeds:[ui.okEmbed('Role Added',`${role} added to you.`)],ephemeral:true});
+    try {
+      if(member.roles.cache.has(role.id)){ await member.roles.remove(role); return interaction.reply({embeds:[ui.okEmbed('Role Removed',`${role} removed from you.`)],ephemeral:true}); }
+      await member.roles.add(role); return interaction.reply({embeds:[ui.okEmbed('Role Added',`${role} added to you.`)],ephemeral:true});
+    } catch(e) {
+      return interaction.reply({embeds:[ui.errorEmbed('Role Update Failed',`${e?.message || 'Discord rejected the role change.'}${e?.code?`\n**Discord code:** \`${e.code}\``:''}`)],ephemeral:true});
+    }
   }
-  if (id==='role_select') {
-    const roleId=interaction.values[0]; const role=interaction.guild.roles.cache.get(roleId); if(!role) return interaction.reply({content:'Role missing.',ephemeral:true});
-    if(interaction.member.roles.cache.has(role.id)) await interaction.member.roles.remove(role).catch(()=>{}); else await interaction.member.roles.add(role).catch(()=>{});
-    return interaction.reply({embeds:[ui.okEmbed('Role Updated',`${role} has been toggled.`)],ephemeral:true});
+  if (id.startsWith('role_select:') || id==='role_select') {
+    const panelId=id.includes(':')?id.split(':')[1]:null;
+    const roleId=interaction.values[0]; const role=interaction.guild.roles.cache.get(roleId);
+    if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Missing','That role no longer exists.')],ephemeral:true});
+    const panel=panelId?getPanel(interaction.guildId,'button',panelId):null;
+    if(panel && panel.enabled===false) return interaction.reply({embeds:[ui.errorEmbed('Panel Disabled','This role panel is currently disabled.')],ephemeral:true});
+    const bot=interaction.guild.members.me;
+    if(!bot || role.position>=bot.roles.highest.position) return interaction.reply({embeds:[ui.errorEmbed('Role Hierarchy',`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`)],ephemeral:true});
+    try {
+      if(interaction.member.roles.cache.has(role.id)) await interaction.member.roles.remove(role); else await interaction.member.roles.add(role);
+      return interaction.reply({embeds:[ui.okEmbed('Role Updated',`${role} has been toggled.`)],ephemeral:true});
+    } catch(e) {
+      return interaction.reply({embeds:[ui.errorEmbed('Role Update Failed',`${e?.message || 'Discord rejected the role change.'}${e?.code?`\n**Discord code:** \`${e.code}\``:''}`)],ephemeral:true});
+    }
   }
   if (id==='staffapp_apply') {
     const cfg=db.getConfig(interaction.guildId).staffApplications;
@@ -985,6 +1231,35 @@ async function openVMModal(interaction, id) {
 }
 
 async function handleModal(interaction) {
+  if (interaction.customId.startsWith('buttonroles_panel_modal:')) {
+    const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'button',panelId);
+    if(!panel) return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    const title=interaction.fields.getTextInputValue('title').trim() || 'Choose your roles';
+    const description=interaction.fields.getTextInputValue('description').trim() || 'Press a button to get or remove a role.';
+    const style=/^selection$/i.test(interaction.fields.getTextInputValue('style').trim())?'selection':'embed';
+    const cfg=db.upsertPanel(interaction.guildId,'button',{...panel,title,description,embedType:style});
+    return interaction.reply({embeds:[ui.buttonRoleEmbed(db.getConfig(interaction.guildId),panelId)],components:ui.buttonRoleSetupRows(db.getConfig(interaction.guildId),panelId),ephemeral:true});
+  }
+  if (interaction.customId.startsWith('reactionroles_panel_modal:')) {
+    const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'reaction',panelId);
+    if(!panel) return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
+    const title=interaction.fields.getTextInputValue('title').trim() || 'Choose your roles';
+    const description=interaction.fields.getTextInputValue('description').trim() || 'React below to receive or remove a role.';
+    db.upsertPanel(interaction.guildId,'reaction',{...panel,title,description});
+    const cfg=db.getConfig(interaction.guildId);
+    return interaction.reply({embeds:[ui.reactionRoleSetupEmbed(cfg,panelId)],components:ui.reactionRoleSetupRows(cfg,panelId),ephemeral:true});
+  }
+  if (interaction.customId.startsWith('reactionroles_add_modal:')) {
+    const [,panelId,roleId]=interaction.customId.split(':');
+    const panel=getPanel(interaction.guildId,'reaction',panelId);
+    if(!panel) return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That reaction-role panel no longer exists.')],ephemeral:true});
+    const emoji=interaction.fields.getTextInputValue('emoji').trim();
+    const role=interaction.guild.roles.cache.get(roleId);
+    if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role no longer exists.')],ephemeral:true});
+    db.upsertPanel(interaction.guildId,'reaction',{...panel,mappings:[...(panel.mappings||[]).filter(x=>x.roleId!==roleId),{emoji,roleId,label:(interaction.fields.getTextInputValue('label').trim()||role.name).slice(0,80)}]});
+    const cfg=db.getConfig(interaction.guildId);
+    return interaction.reply({embeds:[ui.reactionRoleSetupEmbed(cfg,panelId)],components:ui.reactionRoleSetupRows(cfg,panelId),ephemeral:true});
+  }
   if (interaction.customId === 'buttonroles_panel_modal') {
     const title=interaction.fields.getTextInputValue('title').trim();
     const description=interaction.fields.getTextInputValue('description').trim();
@@ -1005,12 +1280,12 @@ async function handleModal(interaction) {
   }
   if (interaction.customId === 'automod_words_modal') {
     const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300);
-    const cfg=db.saveConfig(interaction.guildId,{automod:{badWords:words,badWordFilter:true,enabled:true}}).automod;
+    const cfg=db.saveConfig(interaction.guildId,{automod:{badWords:words,badWordFilter:true}}).automod;
     return interaction.reply({embeds:[ui.automodSetupEmbed(cfg)],components:ui.automodSetupRows(cfg),ephemeral:true});
   }
   if (interaction.customId === 'automod_caps_modal') {
     const n=Math.max(1,Math.min(100,parseInt(interaction.fields.getTextInputValue('threshold'),10)||70));
-    const cfg=db.saveConfig(interaction.guildId,{automod:{capsThreshold:n,capsFilter:true,enabled:true}}).automod;
+    const cfg=db.saveConfig(interaction.guildId,{automod:{capsThreshold:n,capsFilter:true}}).automod;
     return interaction.reply({embeds:[ui.automodSetupEmbed(cfg)],components:ui.automodSetupRows(cfg),ephemeral:true});
   }
   if (interaction.customId === 'reactionroles_message_modal') {
@@ -1035,9 +1310,9 @@ async function handleModal(interaction) {
     return interaction.reply({embeds:[ui.reactionRoleSetupEmbed(cfg)],components:ui.reactionRoleSetupRows(cfg),ephemeral:true});
   }
   if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg),ephemeral:true}); }
-  if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words,enabled:true}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'honeypot_cfg_dm_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{honeypot:{dmMessage:msg||'You were removed. {invite}'}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
-  if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt,enabled:true}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'autoresponder_add_modal') {
     const match=interaction.fields.getTextInputValue('match').trim();
     const mode=/^exact$/i.test(interaction.fields.getTextInputValue('mode').trim())?'exact':'contains';
@@ -1045,7 +1320,7 @@ async function handleModal(interaction) {
     if(!match || !response) return interaction.reply({embeds:[ui.errorEmbed('Missing Info','Both a trigger phrase and a response are required.')],ephemeral:true});
     const cfg=db.getConfig(interaction.guildId).autoresponder;
     const triggers=[...(cfg.triggers||[]), { id:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, match, mode, response }];
-    const next=db.saveConfig(interaction.guildId,{autoresponder:{triggers,enabled:true}}).autoresponder;
+    const next=db.saveConfig(interaction.guildId,{autoresponder:{triggers}}).autoresponder;
     return interaction.reply({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next),ephemeral:true});
   }
   if (interaction.customId === 'autoreactor_add_modal') {
@@ -1055,7 +1330,7 @@ async function handleModal(interaction) {
     if(!match || !emojis.length) return interaction.reply({embeds:[ui.errorEmbed('Missing Info','A trigger phrase and at least one emoji are required.')],ephemeral:true});
     const cfg=db.getConfig(interaction.guildId).autoreactor;
     const triggers=[...(cfg.triggers||[]), { id:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`, match, mode, emojis }];
-    const next=db.saveConfig(interaction.guildId,{autoreactor:{triggers,enabled:true}}).autoreactor;
+    const next=db.saveConfig(interaction.guildId,{autoreactor:{triggers}}).autoreactor;
     return interaction.reply({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next),ephemeral:true});
   }
   if (interaction.customId === 'embedbuilder_text_modal') {
@@ -1131,28 +1406,6 @@ async function handleModal(interaction) {
 // guildMemberAdd — antiraid, greetvoice, welcome, autorole, sticky roles
 // ---------------------------------------------------------------------------------
 client.on('guildMemberAdd', async (member) => {
-  // Track which invite was consumed and apply configured invite rewards.
-  try {
-    const before = inviteSnapshots.get(member.guild.id) || new Map();
-    const afterInvites = await member.guild.invites.fetch().catch(()=>null);
-    if (afterInvites) {
-      let used = null; for (const inv of afterInvites.values()) { if ((inv.uses||0) > (before.get(inv.code)||0)) { used = inv; break; } }
-      inviteSnapshots.set(member.guild.id,new Map([...afterInvites.values()].map(x=>[x.code,x.uses||0])));
-      if (used?.inviter && used.inviter.id !== member.user.id) {
-        const count=db.addInviteCount(member.guild.id,used.inviter.id,1); const rewards=db.getConfig(member.guild.id).inviteTracker.rewards||[];
-        for (const reward of rewards) if (count >= reward.invites) { const role=member.guild.roles.cache.get(reward.roleId); const inviter=await member.guild.members.fetch(used.inviter.id).catch(()=>null); if(role && inviter?.roles?.add) inviter.roles.add(role,'Invite reward').catch(()=>{}); }
-      }
-    }
-  } catch {}
-  const extraSec = db.getConfig(member.guild.id).securityExtras;
-  if (member.user.bot && extraSec.antiunknownbot.enabled) {
-    const audit = await sys.findAuditExecutor(member.guild, AuditLogEvent.BotAdd, member.id).catch(()=>null);
-    const inviter = audit ? await member.guild.members.fetch(audit.id).catch(()=>null) : null;
-    if (!inviter || !inviter.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      if (extraSec.antiunknownbot.action === 'ban') await member.ban({reason:'Anti unknown bot'}).catch(()=>{}); else await member.kick('Anti unknown bot').catch(()=>{});
-      return;
-    }
-  }
   await sys.handleAntiBotJoin(member).catch(() => {});
   await sys.handleAntiAltJoin(member).catch(() => {});
   await sys.handleAntiraidJoin(member).catch(() => {});
@@ -1305,17 +1558,30 @@ async function handleReactionRole(reaction, user, adding) {
     if (reaction.partial) await reaction.fetch();
     const guild = reaction.message.guild;
     if (!guild) return;
-    const cfg = db.getConfig(guild.id).reactionRoles;
-    if (!cfg.enabled || cfg.messageId !== reaction.message.id) return;
+    const all = db.getConfig(guild.id);
+    const panels = Array.isArray(all.reactionRolePanels) ? all.reactionRolePanels : [];
+    let panel = panels.find(p => p.messageId === reaction.message.id);
+    let mappings = panel?.mappings || [];
+    if (!panel) {
+      const legacy = all.reactionRoles;
+      if (legacy.enabled === false || legacy.messageId !== reaction.message.id) return;
+      panel = legacy;
+      mappings = legacy.mappings || [];
+    }
+    if (panel.enabled === false) return;
     const key = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
-    const mapping = (cfg.mappings || []).find(x => x.emoji === key || x.emoji === reaction.emoji.name);
+    const mapping = mappings.find(x => x.emoji === key || x.emoji === reaction.emoji.name);
     if (!mapping) return;
     const member = await guild.members.fetch(user.id);
     const role = guild.roles.cache.get(mapping.roleId);
-    if (!role) return;
+    const bot = guild.members.me;
+    if (!role || !bot || role.position >= bot.roles.highest.position) {
+      await reaction.users.remove(user.id).catch(() => {});
+      return;
+    }
     if (adding) await member.roles.add(role);
     else await member.roles.remove(role);
-  } catch (e) { console.error('reaction role:', e); }
+  } catch (e) { console.error('reaction role action failed:', e); }
 }
 client.on('messageReactionAdd', (reaction, user) => handleReactionRole(reaction, user, true));
 client.on('messageReactionRemove', (reaction, user) => handleReactionRole(reaction, user, false));
@@ -1330,6 +1596,9 @@ client.on('messageCreate', async (message) => {
   if (!message.guild) return handleApplicationDM(message).catch(console.error);
 
   const cfgAll = db.getConfig(message.guild.id);
+
+  // Setup image/GIF uploads are consumed before command parsing and removed after saving.
+  if (await consumeSetupMedia(message)) return;
 
   // Mentioning the bot without another command gives a server-specific quick start.
   if (message.mentions.has(client.user) && message.mentions.users.size === 1) {
@@ -1346,20 +1615,6 @@ client.on('messageCreate', async (message) => {
     return handleHoneypot(message).catch(console.error);
   }
 
-  const mediaOnly = cfgAll.mediaOnly?.channels || [];
-  if (mediaOnly.includes(message.channel.id) && !message.member?.permissions.has(PermissionFlagsBits.ManageChannels)) {
-    const media = message.attachments.some(a => /^image\//i.test(a.contentType||'') || /^video\//i.test(a.contentType||''));
-    if (!media) { await message.delete().catch(()=>{}); message.channel.send({embeds:[ui.errorEmbed('🖼️ Media Only','Only image and video media are allowed in this channel.')]}).then(m=>setTimeout(()=>m.delete().catch(()=>{}),4000)).catch(()=>{}); return; }
-  }
-  const sec=cfgAll.securityExtras||{};
-  if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
-    if (sec.antiinvite?.enabled && /(discord\.gg\/|discord\.com\/invite\/)/i.test(message.content)) { await message.delete().catch(()=>{}); return; }
-    if (sec.antiscam?.enabled && /(?:free|claim|nitro|gift|steam|crypto).{0,30}(?:gift|reward|verify|login|claim)/i.test(message.content) && /https?:\/\//i.test(message.content)) { await message.delete().catch(()=>{}); return; }
-    if (sec.antimention?.enabled && message.mentions.users.size + message.mentions.roles.size >= (sec.antimention.maxMentions||5)) { await message.delete().catch(()=>{}); return; }
-    if (sec.anticap?.enabled) { const letters=message.content.match(/[A-Za-z]/g)||[]; const upper=message.content.match(/[A-Z]/g)||[]; if(letters.length>=8 && upper.length/letters.length*100 >= (sec.anticap.threshold||80)){ await message.delete().catch(()=>{}); return; } }
-    if (sec.antieveryone?.enabled && /@(everyone|here)/i.test(message.content)) { await message.delete().catch(()=>{}); return; }
-    if (sec.antiweb?.enabled && /https?:\/\/(?:grabify|iplogger|2no|shorturl|bit\.ly|tinyurl)/i.test(message.content)) { await message.delete().catch(()=>{}); return; }
-  }
   const wasCommand = await handlePrefixCommand(message).catch((e) => { console.error(e); return false; });
   if (wasCommand) return;
   await sys.handleAntilink(message).catch(() => {});
@@ -1432,48 +1687,4 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     const desc = newState.channelId
       ? `${newState.member} joined <#${newState.channelId}>`
       : `${newState.member} left <#${oldState.channelId}>`;
-    log.send({ embeds: [ui.base('🔊 Voice Update').setDescription(desc)] }).catch(() => {});
-  }
-});
-
-// ---------------------------------------------------------------------------------
-// Antinuke event hooks
-// ---------------------------------------------------------------------------------
-client.on('channelDelete', async (channel) => {
-  if (!channel.guild) return;
-  const executor = await sys.findAuditExecutor(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
-  if (executor) await sys.antinukeStrike(channel.guild, executor, 'channelDelete');
-});
-client.on('channelCreate', async (channel) => {
-  if (!channel.guild) return;
-  await sys.onChannelCreateGreetvoiceSync(channel).catch(() => {});
-  const executor = await sys.findAuditExecutor(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
-  if (executor) await sys.antinukeStrike(channel.guild, executor, 'channelCreate');
-});
-client.on('roleDelete', async (role) => {
-  const executor = await sys.findAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
-  if (executor) await sys.antinukeStrike(role.guild, executor, 'roleDelete');
-});
-client.on('roleCreate', async (role) => {
-  const executor = await sys.findAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
-  if (executor) await sys.antinukeStrike(role.guild, executor, 'roleCreate');
-});
-client.on('roleUpdate', async (oldRole, newRole) => {
-  if (oldRole.permissions.bitfield === newRole.permissions.bitfield) return;
-  const executor = await sys.findAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
-  if (executor) await sys.antinukeStrike(newRole.guild, executor, 'roleUpdate');
-});
-client.on('guildBanAdd', async (ban) => {
-  const executor = await sys.findAuditExecutor(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
-  if (executor) await sys.antinukeStrike(ban.guild, executor, 'ban');
-});
-client.on('webhooksUpdate', async (channel) => {
-  await sys.handleAntiWebhookUpdate(channel).catch(() => {});
-  const executor = await sys.findAuditExecutor(channel.guild, AuditLogEvent.WebhookCreate);
-  if (executor) await sys.antinukeStrike(channel.guild, executor, 'webhookCreate');
-});
-
-process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
-setInterval(() => sendBirthdayWishes().catch(console.error), 60 * 60 * 1000);
-
-client.login(process.env.DISCORD_TOKEN);
+    log.send({ embeds: [ui.base('🔊 Voice Update').setDescription(desc)] }).ca
