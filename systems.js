@@ -5,7 +5,8 @@
 const { PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
 const {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
-  AudioPlayerStatus, VoiceConnectionStatus, StreamType, entersState, getVoiceConnection
+  AudioPlayerStatus, VoiceConnectionStatus, StreamType, entersState, getVoiceConnection,
+  generateDependencyReport
 } = require('@discordjs/voice');
 const googleTTS = require('google-tts-api');
 const db = require('./database');
@@ -70,21 +71,54 @@ function downloadAudio(url) {
 async function playTTSInChannel(guild, vcId, prompt) {
   const channel = guild.channels.cache.get(vcId);
   if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Welcome voice channel was not found.');
+
+  const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+  if (!me?.permissionsIn(channel).has(PermissionFlagsBits.Connect)) {
+    throw new Error(`I cannot **Connect** to ${channel}.`);
+  }
+  if (!me.permissionsIn(channel).has(PermissionFlagsBits.Speak)) {
+    throw new Error(`I cannot **Speak** in ${channel}.`);
+  }
+
   const connection = await joinAndStayInVC(channel);
-  const text = String(prompt || 'Welcome!').slice(0, 200);
+  const text = String(prompt || 'Welcome!').trim().slice(0, 200) || 'Welcome!';
   const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
   const buffer = await downloadAudio(url);
   if (!buffer.length) throw new Error('TTS returned an empty audio file.');
-  const player = createAudioPlayer();
-  connection.subscribe(player);
-  const resource = createAudioResource(Readable.from(buffer), { inputType: StreamType.Arbitrary });
+
+  // MP3 is an arbitrary input, so @discordjs/voice must transcode it through FFmpeg
+  // and then encode it to Opus before Discord can play it.
+  const player = createAudioPlayer({ behaviors: { noSubscriber: 'stop' } });
+  const subscription = connection.subscribe(player);
+  if (!subscription) throw new Error('The bot could not subscribe its audio player to the voice connection.');
+
+  const resource = createAudioResource(Readable.from(buffer), {
+    inputType: StreamType.Arbitrary,
+    silencePaddingFrames: 5
+  });
+
   await new Promise((resolve, reject) => {
     let settled = false;
-    const finish = err => { if (settled) return; settled = true; clearTimeout(timer); err ? reject(err) : resolve(); };
-    const timer = setTimeout(() => { try { player.stop(true); } catch {} finish(); }, 25000);
+    const finish = err => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { player.stop(true); } catch {}
+      err ? reject(err) : resolve();
+    };
+    const timer = setTimeout(() => finish(new Error('TTS playback timed out after 25 seconds.')), 25000);
     player.once(AudioPlayerStatus.Idle, () => finish());
-    player.once('error', err => finish(err));
-    try { player.play(resource); } catch (e) { finish(e); }
+    player.once('error', err => finish(new Error(`Voice audio playback failed: ${err.message || err}`)));
+    try {
+      player.play(resource);
+    } catch (e) {
+      finish(e);
+    }
+  }).catch(err => {
+    let dependency = '';
+    try { dependency = generateDependencyReport(); } catch {}
+    if (dependency) console.error('[AunXz] Voice dependency report:\n' + dependency);
+    throw err;
   });
 }
 
@@ -306,19 +340,23 @@ async function onVoiceJoinGreetvoice(oldState, newState) {
   const role = guild.roles.cache.get(cfg.roleId);
   if (!role || !member.roles.cache.has(role.id)) return; // only gate members still holding the role
 
+  let played = false;
   try {
     await playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
+    played = true;
   } catch (e) {
-    console.error('greetvoice TTS failed:', e.message);
+    console.error('greetvoice TTS failed:', e);
     const log = await getLogChannel(guild, 'voice');
     if (log) {
       log.send({ embeds: [ui.errorEmbed('🔇 Greetvoice TTS Failed',
-        `Could not play the greeting for ${member}: \`${e.message}\`.\n` +
-        'If this keeps happening, make sure dependencies are installed (`npm install`) — the bot needs `ffmpeg-static` ' +
-        'to transcode the TTS audio.')] }).catch(() => {});
+        `Could not play the greeting for ${member}: \`${String(e.message || e).slice(0, 700)}\`.\n` +
+        'Check that the bot can **Connect** and **Speak** in the greeting VC and that FFmpeg + an Opus encoder are installed.')] }).catch(() => {});
     }
   }
-  // after the prompt finishes (playTTSInChannel resolves when playback ends), disconnect + strip role
+
+  // Only release the gate after successful playback. If audio failed, keep the role so
+  // the member can retry by leaving/rejoining the greeting VC instead of silently losing it.
+  if (!played) return;
   const freshMember = await guild.members.fetch(member.id).catch(() => null);
   if (freshMember && freshMember.voice.channelId === cfg.vcId) {
     await freshMember.voice.disconnect('greetvoice complete').catch(() => {});
@@ -399,6 +437,42 @@ async function handleVoicemasterJoin(oldState, newState) {
   }
 }
 
+// ===================================================================================
+// EXTRA SECURITY: ANTI-WEBHOOK / ANTI-BOT / ANTI-ALT
+// ===================================================================================
+async function securityLog(guild, cfg, title, description) {
+  const channel = cfg.logChannelId ? guild.channels.cache.get(cfg.logChannelId) : await getLogChannel(guild, 'antinuke');
+  if (channel?.isTextBased()) await channel.send({ embeds: [ui.errorEmbed(title, description)] }).catch(() => {});
+}
+async function handleAntiBotJoin(member) {
+  const cfg=db.getConfig(member.guild.id).antibot; if(!cfg.enabled||!member.user.bot)return;
+  if(cfg.bypassRoleId){
+    const logs=await member.guild.fetchAuditLogs({type:AuditLogEvent.BotAdd,limit:5}).catch(()=>null);
+    const entry=logs?.entries.find(e=>e.target?.id===member.id && Date.now()-e.createdTimestamp<15000);
+    const inviter=entry?.executor ? await member.guild.members.fetch(entry.executor.id).catch(()=>null) : null;
+    if(inviter?.roles.cache.has(cfg.bypassRoleId))return;
+  }
+  if(cfg.action==='ban') await member.ban({reason:'Anti-Bot protection'}).catch(()=>{}); else if(cfg.action==='strip_roles') await member.roles.set([],'Anti-Bot protection').catch(()=>{}); else await member.kick('Anti-Bot protection').catch(()=>{});
+  await securityLog(member.guild,cfg,'🤖 Anti-Bot Triggered',`**Bot:** ${member.user.tag} (<@${member.id}>)\n**Action:** ${cfg.action}`);
+}
+async function handleAntiAltJoin(member) {
+  const cfg=db.getConfig(member.guild.id).antialt; if(!cfg.enabled||member.user.bot)return;
+  const ageDays=(Date.now()-member.user.createdTimestamp)/86400000; if(ageDays>=Number(cfg.minAccountAgeDays||0))return;
+  if(cfg.action==='ban') await member.ban({reason:'Anti-Alt: account too new'}).catch(()=>{}); else await member.kick('Anti-Alt: account too new').catch(()=>{});
+  await securityLog(member.guild,cfg,'🛡️ Anti-Alt Triggered',`**User:** ${member.user.tag} (<@${member.id}>)\n**Account age:** ${ageDays.toFixed(1)} days\n**Minimum:** ${cfg.minAccountAgeDays} days\n**Action:** ${cfg.action}`);
+}
+async function handleAntiWebhookUpdate(channel) {
+  const cfg=db.getConfig(channel.guild.id).antiwebhook; if(!cfg.enabled)return;
+  const executor=await findAuditExecutor(channel.guild,AuditLogEvent.WebhookCreate,null).catch(()=>null); if(!executor||executor.id===channel.client.user?.id)return;
+  const member=await channel.guild.members.fetch(executor.id).catch(()=>null); if(!member)return;
+  if(cfg.bypassRoleId&&member.roles.cache.has(cfg.bypassRoleId))return;
+  try {
+    const hooks=await channel.fetchWebhooks().catch(()=>null);
+    if(hooks) for(const [,hook] of hooks) if(hook.owner?.id===executor.id) await hook.delete('Anti-Webhook protection').catch(()=>{});
+    if(cfg.action==='ban') await member.ban({reason:'Anti-Webhook protection'}).catch(()=>{}); else if(cfg.action==='kick') await member.kick('Anti-Webhook protection').catch(()=>{}); else if(cfg.action==='strip_roles') await member.roles.set([],'Anti-Webhook protection').catch(()=>{});
+  } finally { await securityLog(channel.guild,cfg,'🪝 Anti-Webhook Triggered',`**Executor:** ${executor.tag||executor.username} (<@${executor.id}>)\n**Channel:** ${channel}\n**Action:** ${cfg.action}`); }
+}
+
 // ---------------------------------------------------------------------------------
 // autoresponder / autoreactor — simple keyword-triggered text replies and emoji reactions.
 // Both share the same trigger shape: { id, match, mode: 'exact'|'contains' }.
@@ -442,6 +516,7 @@ module.exports = {
   joinAndStayInVC, playTTSInChannel,
   antinukeStrike, findAuditExecutor, getLogChannel,
   handleAntiraidJoin,
+  handleAntiBotJoin, handleAntiAltJoin, handleAntiWebhookUpdate,
   handleAntilink,
   handleAntispam,
   lockRoleToSingleChannel, onChannelCreateGreetvoiceSync, onMemberJoinGreetvoice, onVoiceJoinGreetvoice,
