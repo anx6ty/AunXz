@@ -585,16 +585,31 @@ function honeypotSetupRow(cfg) { return [
   new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('honeypot_cfg:cleanup').setPlaceholder(`Cleanup: ${cfg.cleanupWindow||'none'}`).addOptions({label:'No cleanup',value:'none'},{label:'Last 10 minutes',value:'10m'},{label:'Last 1 hour',value:'1h'},{label:'Last 24 hours',value:'24h'})),
   new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('honeypot_cfg:invite').setLabel(cfg.createInvite?'Invite DM: ON':'Invite DM: OFF').setStyle(cfg.createInvite?ButtonStyle.Success:ButtonStyle.Secondary).setEmoji(emoji('link')), new ButtonBuilder().setCustomId('honeypot_cfg:dm').setLabel('Set Kick DM').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')))
 ]; }
-function greetVoiceSetupEmbed(cfg) { return featureSetupEmbed('Greet Voice', 'New members receive the gate role, join the selected voice channel, hear the TTS greeting, then are disconnected and released. The feature only runs when Status is Enabled.', [
-  {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
-  {name:'Role',value:cfg.roleId?`<@&${cfg.roleId}>`:'Not set',inline:true},
-  {name:'Voice',value:cfg.vcId?`<#${cfg.vcId}>`:'Not set',inline:true},
-  {name:'Prompt',value:cfg.ttsPrompt||'Not set',inline:false}
-]); }
+function greetVoiceSetupEmbed(cfg) {
+  const mode = cfg.mode === 'audio' ? 'Uploaded audio' : 'TTS';
+  const audio = cfg.audioPath ? 'Uploaded and saved' : 'Not uploaded';
+  return featureSetupEmbed('Greet Voice', 'New members receive the gate role, join the selected voice channel, hear the configured greeting, then are disconnected and released. The feature only runs when Status is Enabled.', [
+    {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
+    {name:'Mode',value:mode,inline:true},
+    {name:'Role',value:cfg.roleId?`<@&${cfg.roleId}>`:'Not set',inline:true},
+    {name:'Voice',value:cfg.vcId?`<#${cfg.vcId}>`:'Not set',inline:true},
+    {name:'TTS Prompt',value:cfg.ttsPrompt||'Not set',inline:false},
+    {name:'Audio',value:audio,inline:false}
+  ]);
+}
 function greetVoiceSetupRow(cfg) { return [
   new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('greetvoice_cfg:voice').setPlaceholder('1. Select greeting voice channel').setChannelTypes(ChannelType.GuildVoice)),
-  new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('greetvoice_cfg:role').setLabel('2. Select Gate Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')), new ButtonBuilder().setCustomId('greetvoice_cfg:prompt').setLabel('3. Set TTS Prompt').setStyle(ButtonStyle.Primary).setEmoji(emoji('voice')), new ButtonBuilder().setCustomId('greetvoice_cfg:test').setLabel('Test Voice').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))),
-  new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('greetvoice_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled')))
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('greetvoice_cfg:role').setLabel('2. Select Gate Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:prompt').setLabel('Set TTS Prompt').setStyle(ButtonStyle.Primary).setEmoji(emoji('voice')),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:audio').setLabel('Upload Audio').setStyle(ButtonStyle.Primary).setEmoji('🎵'),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:test').setLabel('Test').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
+  ),
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('greetvoice_cfg:mode').setLabel(`Mode: ${cfg.mode === 'audio' ? 'Audio' : 'TTS'}`).setStyle(ButtonStyle.Secondary).setEmoji('🔄'),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:remove_audio').setLabel('Remove Audio').setStyle(ButtonStyle.Danger).setDisabled(!cfg.audioPath).setEmoji('🗑️'),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled'))
+  )
 ]; }
 
 // ---------------- AUTORESPONDER ----------------
