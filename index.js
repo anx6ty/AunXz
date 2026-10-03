@@ -631,6 +631,21 @@ client.on('interactionCreate', async (interaction) => {
       sys.embedBuilderSessions.delete(interaction.user.id);
       return interaction.update({content:`Posted in ${channel}.`,components:[]});
     }
+    if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:toggle') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const current=db.getConfig(interaction.guildId).greetvoice;
+      const nextEnabled=!current.enabled;
+      if (nextEnabled && (!current.vcId || !current.roleId || !current.ttsPrompt)) {
+        return interaction.reply({embeds:[ui.errorEmbed('Not Ready','Select a voice channel, gate role, and TTS prompt before enabling Greet Voice.')],ephemeral:true});
+      }
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{enabled:nextEnabled}}).greetvoice;
+      if (cfg.enabled) {
+        const role=interaction.guild.roles.cache.get(cfg.roleId);
+        if (!role) return interaction.reply({embeds:[ui.errorEmbed('Setup Error','The saved gate role no longer exists. Select the role again.')],ephemeral:true});
+        await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
+      }
+      return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+    }
     if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:role') {
       return interaction.reply({content:'Select the role to use as the Greet Voice gate.',components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('greetvoice_cfg:role_select').setPlaceholder('Select gate role'))],ephemeral:true});
     }
@@ -1659,32 +1674,4 @@ client.on('messageCreate', async (message) => {
   if (auto.enabled) {
     const letters = message.content.match(/[A-Za-z]/g) || [];
     const upper = message.content.match(/[A-Z]/g) || [];
-    const capsPct = letters.length ? (upper.length / letters.length) * 100 : 0;
-    if (auto.capsFilter && letters.length >= 8 && capsPct >= (auto.capsThreshold || 70)) {
-      await message.delete().catch(()=>{});
-      return;
-    }
-    if (auto.inviteFilter && /(discord\.gg\/|discord\.com\/invite\/)/i.test(message.content)) {
-      await message.delete().catch(()=>{});
-      return;
-    }
-  }
-
-
-});
-
-// ---------------------------------------------------------------------------------
-// voiceStateUpdate — greetvoice TTS gate, voicemaster join-to-create
-// ---------------------------------------------------------------------------------
-client.on('voiceStateUpdate', async (oldState, newState) => {
-  if (newState.channelId && newState.channelId !== oldState.channelId) {
-    await sys.onVoiceJoinGreetvoice(oldState, newState).catch(() => {});
-  }
-  await sys.handleVoicemasterJoin(oldState, newState).catch(() => {});
-
-  const log = await sys.getLogChannel(newState.guild, 'voice');
-  if (log && newState.channelId !== oldState.channelId) {
-    const desc = newState.channelId
-      ? `${newState.member} joined <#${newState.channelId}>`
-      : `${newState.member} left <#${oldState.channelId}>`;
-    log.send({ embeds: [ui.base('🔊 Voice Update').setDescription(desc)] }).ca
+    const capsPct = letters.length ? (upper.length / letters.len
