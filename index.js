@@ -43,9 +43,16 @@ async function registerCommands() {
   const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
   const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
 
+  // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
+  // propagate on first deploy; instant after that on updates within the same command set).
   await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: publicBody });
   console.log(`Registered ${publicBody.length} global commands.`);
 
+  // Owner-only commands are deliberately NOT registered globally — they're guild-scoped to a
+  // single "home" server (OWNER_GUILD_ID, falling back to GUILD_ID for backward compatibility)
+  // so they don't show up as slash commands in every server the bot joins. They're still usable
+  // everywhere as text commands (<prefix>eval ..., <prefix>maintenance ...) since execute()
+  // itself checks isOwner() regardless of how it was invoked.
   const ownerGuildId = process.env.OWNER_GUILD_ID || process.env.GUILD_ID;
   if (ownerGuildId && ownerBody.length) {
     await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, ownerGuildId), { body: ownerBody });
@@ -54,6 +61,7 @@ async function registerCommands() {
     console.log(`OWNER_GUILD_ID not set — ${ownerBody.length} owner-only command(s) not registered as slash commands (still usable as text commands, e.g. !eval).`);
   }
 }
+
 
 async function finishGiveaways() {
   for (const guild of client.guilds.cache.values()) {
@@ -97,6 +105,8 @@ function tokenize(str) {
   return tokens;
 }
 
+// Walks a command's option tree to find which subcommand/group (if any) the user typed,
+// consuming those tokens, and returns the flat list of leaf (non-subcommand) options left to fill.
 function findOptionsSchema(json, tokens) {
   let options = json.options || [];
   let group = null, subcommand = null;
@@ -136,10 +146,12 @@ function resolveOptionValue(type, raw, message) {
       const id = raw.replace(/[<#>]/g, '');
       return message.mentions.channels.get(id) || message.guild.channels.cache.get(id) || null;
     }
-    default: return raw;
+    default: return raw; // STRING and anything else passes through as text
   }
 }
 
+// Positionally fills leaf options from tokens. The last option, if it's a STRING, greedily
+// swallows every remaining token (so reasons/messages/prompts don't need quotes).
 function parseLeafArgs(leafOptions, tokens) {
   const raw = {};
   for (let i = 0; i < leafOptions.length; i++) {
@@ -217,7 +229,7 @@ function stripEphemeral(payload) {
 // -----------------------------------------------------------------------------
 // Command guards — disabled modules must never execute, and declared permissions
 // are enforced for both slash commands and prefix/mention commands.
-// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------∕
 const COMMAND_FEATURES = {
   antinuke:'antinuke', antilink:'antilink', antispam:'antispam', antiraid:'antiraid',
   antiwebhook:'antiwebhook', antibot:'antibot', antialt:'antialt', voicemaster:'voicemaster',
@@ -278,17 +290,24 @@ async function executeCommand(cmd, interaction) {
 
 // -----------------------------------------------------------------------------
 // Setup media upload flow — administrators click "Send Image/GIF", then send the
-// image/GIF as the very next message in the same channel.
+// image/GIF as the very next message in the same channel. The bot saves the CDN URL
+// and deletes the setup upload so no raw upload is left in the channel.
 // -----------------------------------------------------------------------------
 function mediaSessionKey(guildId, userId) { return `${guildId}:${userId}`; }
 function startSetupMediaUpload(interaction, opts) {
   const key = mediaSessionKey(interaction.guildId, interaction.user.id);
   const old = setupMediaSessions.get(key);
   if (old?.timer) clearTimeout(old.timer);
-  const session = { ...opts, channelId: interaction.channelId, interaction, expiresAt: Date.now() + 120000 };
+  const session = { mediaType: 'image', ...opts, channelId: interaction.channelId, interaction, expiresAt: Date.now() + 120000 };
   session.timer = setTimeout(() => setupMediaSessions.delete(key), 120000);
   setupMediaSessions.set(key, session);
-  return interaction.reply({ embeds:[ui.base('🖼️ Send Image/GIF Now').setDescription(`Send the image or GIF for **${opts.label || 'this setting'}** as your next message in this channel.\n\nI will save it and delete the upload automatically.`)], ephemeral:true });
+  const label = opts.label || 'this setting';
+  const what = session.mediaType === 'audio' ? 'audio file' : 'image or GIF';
+  return interaction.reply({
+    embeds:[ui.base(session.mediaType === 'audio' ? '🎵 Send Audio Now' : '🖼️ Send Image/GIF Now')
+      .setDescription(`Send the ${what} for **${label}** as your next message in this channel.\n\nI will save it and delete the upload automatically.`)],
+    ephemeral:true
+  });
 }
 async function consumeSetupMedia(message) {
   if (!message.guild || message.author.bot) return false;
@@ -296,18 +315,23 @@ async function consumeSetupMedia(message) {
   const session = setupMediaSessions.get(key);
   if (!session || session.channelId !== message.channelId) return false;
   if (Date.now() > session.expiresAt) { setupMediaSessions.delete(key); return false; }
-  const attachment = [...message.attachments.values()].find(a => (a.contentType || '').startsWith('image/'));
+  const attachment = [...message.attachments.values()].find(a => {
+    const type = String(a.contentType || '').toLowerCase();
+    const name = String(a.name || '').toLowerCase();
+    if (session.mediaType === 'audio') return type.startsWith('audio/') || /\.(mp3|wav|ogg|oga|opus|webm|m4a|aac|flac)$/i.test(name);
+    return type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(name);
+  });
   if (!attachment) return false;
   setupMediaSessions.delete(key);
   if (session.timer) clearTimeout(session.timer);
   try {
-    await session.apply(attachment.url, message);
+    await session.apply(session.mediaType === 'audio' ? attachment : attachment.url, message);
     await message.delete().catch(()=>{});
     if (session.render) await session.interaction.editReply(session.render()).catch(()=>{});
     return true;
   } catch (e) {
     console.error('setup media upload:', e);
-    await session.interaction.editReply({ embeds:[ui.errorEmbed('Upload Failed', e.message || 'Could not save that image/GIF.')], components:[] }).catch(()=>{});
+    await session.interaction.editReply({ embeds:[ui.errorEmbed('Upload Failed', e.message || 'Could not save that upload.')], components:[] }).catch(()=>{});
     return true;
   }
 }
@@ -334,6 +358,7 @@ async function handlePrefixCommand(message) {
   let content = message.content.trim();
   const mention = new RegExp(`^<@!?${message.client.user.id}>\\s*`, 'i');
 
+  // Both "<prefix> command" and "<@bot> command" use the same command engine.
   let isTextCommand = content.startsWith(prefix);
   if (isTextCommand) content = content.slice(prefix.length).trim();
   else if (mention.test(content)) {
@@ -366,7 +391,21 @@ async function handlePrefixCommand(message) {
 // ---------------------------------------------------------------------------------
 // interactionCreate — slash commands, buttons, select menus, modals
 // ---------------------------------------------------------------------------------
+function startInteractionWatchdog(interaction) {
+  if (!interaction?.isRepliable?.() || interaction.isAutocomplete?.()) return () => {};
+  const originalReply = interaction.reply?.bind(interaction);
+  const originalUpdate = interaction.update?.bind(interaction);
+  if (originalReply) interaction.reply = payload => interaction.deferred ? interaction.editReply(payload) : originalReply(payload);
+  if (originalUpdate) interaction.update = payload => interaction.deferred ? interaction.editReply(payload) : originalUpdate(payload);
+  const timer = setTimeout(() => {
+    if (interaction.replied || interaction.deferred) return;
+    interaction.deferReply({ephemeral:true}).catch(() => {});
+  }, 2200);
+  return () => clearTimeout(timer);
+}
+
 client.on('interactionCreate', async (interaction) => {
+  const stopInteractionWatchdog = startInteractionWatchdog(interaction);
   try {
     if (interaction.isChatInputCommand()) {
       if (db.getConfig(interaction.guildId).blacklist.includes(interaction.user.id) && !isOwner(interaction.user.id)) {
@@ -377,6 +416,7 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // Multi-panel role manager selects ------------------------------------------------
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('buttonroles_role_select:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'button',panelId), role=interaction.guild.roles.cache.get(interaction.values[0]);
@@ -425,6 +465,7 @@ client.on('interactionCreate', async (interaction) => {
       db.upsertPanel(interaction.guildId,'reaction',{...panel,mappings:(panel.mappings||[]).filter(m=>m.roleId!==interaction.values[0])});rememberSelectedPanel(interaction.guildId,interaction.user.id,'reaction',panelId);return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
     }
 
+    // Giveaway controls -------------------------------------------------------------
     if (interaction.isButton() && interaction.customId.startsWith('giveaway_publish:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'Manage Server is required.')], ephemeral: true });
@@ -502,6 +543,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'vm_kick_pick') return handleVMKickPick(interaction);
+    if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_category_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -510,6 +552,7 @@ client.on('interactionCreate', async (interaction) => {
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
       return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
     }
+    // Security setup panels -------------------------------------------------------
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const [, module, field] = interaction.customId.split(':'); const value=interaction.values[0];
@@ -530,6 +573,7 @@ client.on('interactionCreate', async (interaction) => {
       const cfg=db.saveConfig(interaction.guildId,{[module]:{logChannelId:interaction.values[0]}});
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
+    // Easy setup panels ------------------------------------------------------------
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('birthday_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1];
@@ -553,15 +597,11 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChannelSelectMenu() && interaction.customId === 'greetvoice_cfg:voice') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const cfg=db.saveConfig(interaction.guildId,{greetvoice:{vcId:interaction.values[0]}}).greetvoice;
-      const ch=interaction.guild.channels.cache.get(cfg.vcId); const role=cfg.roleId?interaction.guild.roles.cache.get(cfg.roleId):null;
-      if(role&&ch) await sys.lockRoleToSingleChannel(interaction.guild,role,ch.id).catch(()=>{});
-      return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
-    }
-    if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role') {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
-      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0]}}).greetvoice;
-      const role=interaction.guild.roles.cache.get(cfg.roleId); if(role&&cfg.vcId) await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
-      return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+      await interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)}).catch(()=>{});
+      const ch=interaction.guild.channels.cache.get(cfg.vcId);
+      const role=cfg.roleId?interaction.guild.roles.cache.get(cfg.roleId):null;
+      if(role&&ch) sys.lockRoleToSingleChannel(interaction.guild,role,ch.id).catch(err=>console.error('greetvoice role sync:',err));
+      return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
@@ -616,24 +656,32 @@ client.on('interactionCreate', async (interaction) => {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const current=db.getConfig(interaction.guildId).greetvoice;
       const nextEnabled=!current.enabled;
-      if (nextEnabled && (!current.vcId || !current.roleId || !current.ttsPrompt)) {
-        return interaction.reply({embeds:[ui.errorEmbed('Not Ready','Select a voice channel, gate role, and TTS prompt before enabling Greet Voice.')],ephemeral:true});
+      if (nextEnabled && (!current.vcId || !current.roleId || (!current.ttsPrompt && !current.audioPath))) {
+        return interaction.reply({embeds:[ui.errorEmbed('Not Ready','Select a voice channel, gate role, and either set a TTS prompt or upload an audio greeting before enabling Greet Voice.')],ephemeral:true});
       }
       const cfg=db.saveConfig(interaction.guildId,{greetvoice:{enabled:nextEnabled}}).greetvoice;
+      await interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)}).catch(()=>{});
       if (cfg.enabled) {
         const role=interaction.guild.roles.cache.get(cfg.roleId);
-        if (!role) return interaction.reply({embeds:[ui.errorEmbed('Setup Error','The saved gate role no longer exists. Select the role again.')],ephemeral:true});
-        await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
+        if (role) sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(err=>console.error('greetvoice role sync:',err));
       }
-      return interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+      return;
     }
     if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:role') {
       return interaction.reply({content:'Select the role to use as the Greet Voice gate.',components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('greetvoice_cfg:role_select').setPlaceholder('Select gate role'))],ephemeral:true});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role_select') {
-      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:interaction.values[0]}}).greetvoice;
-      const role=interaction.guild.roles.cache.get(cfg.roleId); if(role&&cfg.vcId) await sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(()=>{});
-      return interaction.update({content:null,embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const role=interaction.guild.roles.cache.get(interaction.values[0]);
+      const bot=interaction.guild.members.me;
+      if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role no longer exists.')],ephemeral:true});
+      if(role.id===interaction.guild.id) return interaction.reply({embeds:[ui.errorEmbed('Invalid Role','@everyone cannot be used as the Greet Voice gate role.')],ephemeral:true});
+      if(!bot?.permissions.has(PermissionFlagsBits.ManageRoles) && !bot?.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Bot Permission','I need **Manage Roles** before I can assign the Greet Voice gate role.')],ephemeral:true});
+      if(role.position >= bot.roles.highest.position) return interaction.reply({embeds:[ui.errorEmbed('Role Hierarchy',`I cannot assign **${role.name}** because it is equal to or higher than my highest role. Move my bot role above it.`)],ephemeral:true});
+      const cfg=db.saveConfig(interaction.guildId,{greetvoice:{roleId:role.id}}).greetvoice;
+      await interaction.update({content:null,embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)}).catch(()=>{});
+      if(cfg.vcId) sys.lockRoleToSingleChannel(interaction.guild,role,cfg.vcId).catch(err=>console.error('greetvoice role sync:',err));
+      return;
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_channel_select') {
@@ -653,8 +701,12 @@ client.on('interactionCreate', async (interaction) => {
     const payload = { embeds: [ui.errorEmbed('Error', 'Something went wrong running that.')], ephemeral: true };
     if (interaction.deferred || interaction.replied) interaction.followUp(payload).catch(() => {});
     else interaction.reply(payload).catch(() => {});
+  } finally {
+    stopInteractionWatchdog();
   }
 });
+
+
 
 function rolePanelKey(guildId, userId) { return `${guildId}:${userId}`; }
 function rolePanelState(guildId, userId) {
@@ -713,6 +765,7 @@ async function postReactionRolePanel(guild,cfg){
 async function handleButton(interaction) {
   const id = interaction.customId;
 
+  // Button-role / reaction-role panel manager
   if (id === 'buttonroles_cfg:create' || id === 'reactionroles_cfg:create') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     const kind=id.startsWith('button')?'button':'reaction'; const panel=kind==='button'?createButtonPanel():createReactionPanel(); db.upsertPanel(interaction.guildId,kind,panel); rememberSelectedPanel(interaction.guildId,interaction.user.id,kind,panel.id);
@@ -829,8 +882,40 @@ async function handleButton(interaction) {
   if (id === 'honeypot_cfg:invite') { const cfg=db.getConfig(interaction.guildId).honeypot; const next=db.saveConfig(interaction.guildId,{honeypot:{createInvite:!cfg.createInvite}}).honeypot; return interaction.update({embeds:[ui.honeypotSetupEmbed(next)],components:ui.honeypotSetupRow(next)}); }
   if (id === 'honeypot_cfg:dm') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_dm_modal').setTitle('Honeypot Kick DM').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('DM text; use {invite}').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(db.getConfig(interaction.guildId).honeypot.dmMessage.slice(0,400)))));
   if (id === 'greetvoice_cfg:prompt') return interaction.showModal(new ModalBuilder().setCustomId('greetvoice_cfg_prompt_modal').setTitle('Greet Voice TTS').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prompt').setLabel('Text spoken in the voice channel').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((db.getConfig(interaction.guildId).greetvoice.ttsPrompt||'Welcome!').slice(0,400)))));
-  if (id === 'greetvoice_cfg:test') { const cfg=db.getConfig(interaction.guildId).greetvoice; if(!cfg.vcId||!cfg.ttsPrompt) return interaction.reply({embeds:[ui.errorEmbed('Not Configured','Select a voice channel and set a TTS prompt first.')],ephemeral:true}); await interaction.deferReply({ephemeral:true}); try { await sys.playTTSInChannel(interaction.guild,cfg.vcId,cfg.ttsPrompt); return interaction.editReply({embeds:[ui.okEmbed('Greet Voice Test Complete','The TTS prompt finished playing.')]}); } catch(e) { return interaction.editReply({embeds:[ui.errorEmbed('Greet Voice Failed',String(e.message||e))]}); } }
+  if (id === 'greetvoice_cfg:audio') {
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    return startSetupMediaUpload(interaction,{mediaType:'audio',label:'the Greet Voice audio greeting',apply:async attachment=>{
+      const cfg=db.getConfig(interaction.guildId).greetvoice;
+      const old=cfg.audioPath;
+      const saved=await sys.saveGreetvoiceAudio(interaction.guildId,attachment);
+      db.saveConfig(interaction.guildId,{greetvoice:{audioPath:saved,mode:'audio'}});
+      if(old && old!==saved) await sys.removeGreetvoiceAudio(old);
+    },render:()=>{const cfg=db.getConfig(interaction.guildId).greetvoice;return {embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)};}});
+  }
+  if (id === 'greetvoice_cfg:remove_audio') {
+    const cfg=db.getConfig(interaction.guildId).greetvoice;
+    if(cfg.audioPath) await sys.removeGreetvoiceAudio(cfg.audioPath);
+    const next=db.saveConfig(interaction.guildId,{greetvoice:{audioPath:null,mode:'tts'}}).greetvoice;
+    return interaction.update({embeds:[ui.greetVoiceSetupEmbed(next)],components:ui.greetVoiceSetupRow(next)});
+  }
+  if (id === 'greetvoice_cfg:mode') {
+    const cfg=db.getConfig(interaction.guildId).greetvoice;
+    if(!cfg.audioPath && !cfg.ttsPrompt) return interaction.reply({embeds:[ui.errorEmbed('Nothing To Play','Set a TTS prompt or upload an audio file first.')],ephemeral:true});
+    const nextMode=cfg.mode==='audio' ? 'tts' : 'audio';
+    if(nextMode==='audio' && !cfg.audioPath) return interaction.reply({embeds:[ui.errorEmbed('No Audio','Upload an audio greeting first, then switch the mode to Audio.')],ephemeral:true});
+    if(nextMode==='tts' && !cfg.ttsPrompt) return interaction.reply({embeds:[ui.errorEmbed('No TTS Prompt','Set a TTS prompt first, then switch the mode to TTS.')],ephemeral:true});
+    const next=db.saveConfig(interaction.guildId,{greetvoice:{mode:nextMode}}).greetvoice;
+    return interaction.update({embeds:[ui.greetVoiceSetupEmbed(next)],components:ui.greetVoiceSetupRow(next)});
+  }
+  if (id === 'greetvoice_cfg:test') {
+    const cfg=db.getConfig(interaction.guildId).greetvoice;
+    if(!cfg.vcId||(!cfg.ttsPrompt&&!cfg.audioPath)) return interaction.reply({embeds:[ui.errorEmbed('Not Configured','Select a voice channel and set a TTS prompt or upload an audio greeting first.')],ephemeral:true});
+    await interaction.deferReply({ephemeral:true});
+    try { await sys.playGreetvoiceGreeting(interaction.guild,cfg); return interaction.editReply({embeds:[ui.okEmbed('Greet Voice Test Complete','The configured greeting finished playing.')]}); }
+    catch(e) { return interaction.editReply({embeds:[ui.errorEmbed('Greet Voice Failed',String(e.message||e))]}); }
+  }
 
+  // ---- Auto Responder setup panel ----
   if (id === 'autoresponder_cfg:toggle') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{enabled:!cfg.enabled}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
   if (id === 'autoresponder_cfg:case') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{ignoreCase:!cfg.ignoreCase}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
   if (id === 'autoresponder_cfg:add') {
@@ -844,6 +929,7 @@ async function handleButton(interaction) {
     return interaction.showModal(modal);
   }
 
+  // ---- Auto Reactor setup panel ----
   if (id === 'autoreactor_cfg:toggle') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{enabled:!cfg.enabled}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
   if (id === 'autoreactor_cfg:case') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{ignoreCase:!cfg.ignoreCase}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
   if (id === 'autoreactor_cfg:add') {
@@ -857,6 +943,7 @@ async function handleButton(interaction) {
     return interaction.showModal(modal);
   }
 
+  // ---- Embed builder ----
   if (id === 'embedbuilder:text') {
     const draft = sys.embedBuilderSessions.get(interaction.user.id) || { title:'', description:'', color:'', footer:'' };
     const modal=new ModalBuilder().setCustomId('embedbuilder_text_modal').setTitle('Edit Embed Text');
@@ -962,6 +1049,7 @@ async function handleButton(interaction) {
     return interaction.showModal(modal);
   }
 
+  // ---- Tickets ----
   if (id === 'ticket_open') {
     const cfg = db.getConfig(interaction.guildId).ticket;
     if (!cfg.enabled) return interaction.reply({ embeds: [ui.errorEmbed('Tickets Disabled', 'Ask an admin to run `/tickets setup`.')], ephemeral: true });
@@ -971,6 +1059,7 @@ async function handleButton(interaction) {
       if (existingChannel) {
         return interaction.reply({ embeds: [ui.warnEmbed('Ticket Exists', `You already have an open ticket: <#${existing.channelId}>`)], ephemeral: true });
       }
+      // The channel was deleted, but the old DB row remained open. Repair every stale row.
       db.closeTicket(existing.channelId);
     }
 
@@ -1005,6 +1094,7 @@ async function handleButton(interaction) {
     if (!ticket) return interaction.reply({ embeds: [ui.errorEmbed('Not a Ticket', 'This only works inside a ticket channel.')], ephemeral: true });
     const claiming = !ticket.claimedBy;
     db.setTicketStatus(interaction.channel.id, ticket.status, claiming ? interaction.user.id : null);
+    // "unclaim" clears claimedBy explicitly since setTicketStatus's COALESCE won't null it out.
     if (!claiming) db.db.prepare('UPDATE tickets SET claimedBy = NULL WHERE channelId = ?').run(interaction.channel.id);
     const updated = db.getTicket(interaction.channel.id);
     await interaction.update({ embeds: [ui.staffControlsEmbed(updated)], components: ui.staffControlsRow(!!updated.claimedBy) });
@@ -1039,17 +1129,20 @@ async function handleButton(interaction) {
     return;
   }
 
+  // ---- Voicemaster: dedicated setup panel (admin-only, from /voicemaster setup) ----
   if (id === 'vm_setup_category' || id === 'vm_setup_channel' || id === 'vm_setup_toggle') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     }
     if (id === 'vm_setup_category') return interaction.reply({ embeds: [ui.vmCategoryPromptEmbed()], components: [ui.vmCategorySelectRow()], ephemeral: true });
     if (id === 'vm_setup_channel') return interaction.reply({ embeds: [ui.vmChannelPromptEmbed()], components: [ui.vmChannelSelectRow()], ephemeral: true });
+    // toggle
     const current = db.getConfig(interaction.guildId).voicemaster.enabled;
     const cfg = db.saveConfig(interaction.guildId, { voicemaster: { enabled: !current } });
     return interaction.update({ embeds: [ui.vmSetupEmbed(cfg)], components: [ui.vmSetupRow(cfg)] });
   }
 
+  // ---- Voicemaster: per-channel owner controls (Lock/Hide/Rename/Limit/Kick/Transfer) ----
   if (id.startsWith('vm_')) {
     const vc = interaction.member.voice.channel;
     if (!vc || !db.getVMChannel(vc.id)) return interaction.reply({ embeds: [ui.errorEmbed('No Channel', 'Join a voicemaster channel first.')], ephemeral: true });
@@ -1085,6 +1178,7 @@ async function handleButton(interaction) {
     if (id === 'vm_rename' || id === 'vm_limit' || id === 'vm_transfer') return openVMModal(interaction, id);
   }
 
+  // ---- Setup panel (toggle / edit) ----
   if (id.startsWith('setup_toggle:') || id.startsWith('setup_edit:')) {
     const [action, sub] = id.split(':');
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -1113,6 +1207,8 @@ async function handleVMKickPick(interaction) {
   return interaction.update({ embeds: [ui.vmKickedEmbed(member.user.tag)], components: [] });
 }
 
+// Handles the UserSelectMenu opened by the Staff Controls "Add Member" / "Remove Member"
+// buttons — grants or revokes that member's view/send access on the ticket channel.
 async function handleTicketMemberSelect(interaction, action) {
   const ticket = db.getTicket(interaction.channel.id);
   if (!ticket) return interaction.update({ embeds: [ui.errorEmbed('Not a Ticket', 'This only works inside a ticket channel.')], components: [] });
@@ -1125,6 +1221,9 @@ async function handleTicketMemberSelect(interaction, action) {
   return interaction.update({ embeds: [ui.okEmbed('➖ Member Removed', `<@${userId}> can no longer see this ticket.`)], components: [] });
 }
 
+// Field spec for each panel module's "Edit Settings" modal. `oKey` matches the flat key
+// buildModulePatch() (in commands.js) expects; `parse` turns the raw text field into that
+// shape (IDs are stored as plain strings, buildModulePatch only ever needs `.id`).
 const SETUP_EDIT_FIELDS = {
   antinuke: [
     { key: 'punishment', oKey: 'punishment', label: 'Punishment: ban / kick / strip_roles', parse: v => v, get: cfg => cfg.antinuke.punishment },
@@ -1290,7 +1389,7 @@ async function handleModal(interaction) {
   if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'honeypot_cfg_dm_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{honeypot:{dmMessage:msg||'You were removed. {invite}'}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
-  if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt,mode:'tts'}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'autoresponder_add_modal') {
     const match=interaction.fields.getTextInputValue('match').trim();
     const mode=/^exact$/i.test(interaction.fields.getTextInputValue('mode').trim())?'exact':'contains';
@@ -1381,7 +1480,7 @@ async function handleModal(interaction) {
 }
 
 // ---------------------------------------------------------------------------------
-// guildMemberAdd / Remove / Update
+// guildMemberAdd — antiraid, greetvoice, welcome, autorole, sticky roles
 // ---------------------------------------------------------------------------------
 client.on('guildMemberAdd', async (member) => {
   await sys.handleAntiBotJoin(member).catch(() => {});
@@ -1444,6 +1543,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     if (ch?.isTextBased()) ch.send({ embeds: [ui.okEmbed('🚀 Server Boost!', text)] }).catch(() => {});
   }
 });
+
 
 function escapeRegex(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
@@ -1578,102 +1678,3 @@ client.on('messageCreate', async (message) => {
   if (await consumeSetupMedia(message)) return;
 
   // Mentioning the bot without another command gives a server-specific quick start.
-  if (message.mentions.has(client.user) && message.mentions.users.size === 1) {
-    const withoutMention = message.content.replace(new RegExp(`^<@!?${client.user.id}>\\s*`, 'i'), '').trim();
-    if (!withoutMention) {
-      const prefix = cfgAll.prefix || '!';
-      const latency = client.ws.ping;
-      return message.reply({ embeds: [ui.base(`🤖 ${client.user.username} — Quick Start`)
-        .setDescription(`Welcome! Use **/help** to browse all commands.\n\n**Server prefix:** \`${prefix}\`\n**Bot ping:** \`${latency}ms\`\n\nYou can also use **<@${client.user.id}> <command>** or **${prefix}<command>**.`)] }).catch(() => {});
-    }
-  }
-  // Honeypot is checked before command parsing so the no-message channel is truly a honeypot.
-  if (cfgAll.honeypot.enabled && cfgAll.honeypot.channelId === message.channel.id) {
-    return handleHoneypot(message).catch(console.error);
-  }
-
-  const wasCommand = await handlePrefixCommand(message).catch((e) => { console.error(e); return false; });
-  if (wasCommand) return;
-  await sys.handleAntilink(message).catch(() => {});
-  await sys.handleAntispam(message).catch(() => {});
-  await sys.handleLevelingMessage(message).catch(() => {});
-  await sys.handleAutoresponder(message).catch(() => {});
-  await sys.handleAutoreactor(message).catch(() => {});
-
-  const auto = cfgAll.automod;
-  const anti = cfgAll.antibadword;
-  const builtInBadWords = [
-    'fuck','fucker','fucking','motherfucker','shit','shitting','bitch','bastard','asshole','dick','piss','cunt','whore','slut','crap','damn',
-    'chutiya','chutiye','chutia','chut','madarchod','madharchod','mc','bc','bhenchod','behenchod','gaand','gand','gandu','randi','harami','haramzada','kamina','kaminey','kamine','bakwas','sala','saala','sali','saali','maa ki chut','ma ki chut','teri maa','teri ma','lund','laude','loda','choot','chod','chodna','chodde','jhant','jhaant','bhosdike','bhosdi','bhosda','benchod','bhen ke lode','behen ke lode','teri behen','teri bahan',
-    'گالی','گالیوں','حرامی','کمینہ','کمینے','چوت','چوتیا','بکواس','لعنتی','گندا','گندی','ماں کی چوت','بہن چود','بھنچود','لنڈ','گاندو',
-    'kurwa','kurwo','puta','putain','merde','scheisse','arschloch','cazzo','stronzo','mierda','carajo','joder','blyat','сука','хуй','ебать','пизда',
-    'くそ','ばか','死ね','くそったれ','씨발','병신','좆','개새끼','操你','他妈的','妈的','草泥马','肏','操'
-  ];
-  const normalizeBadWordText = value => String(value || '').normalize('NFKC').toLowerCase()
-    .replace(/[0-9@!$*+_=~`^|\\]/g, ch => ({'0':'o','1':'i','3':'e','4':'a','5':'s','6':'g','7':'t','8':'b','9':'g','@':'a','!':'i','$':'s','*':'','+':'','_':'','=':'','~':'','`':'','^':'','|':'','\\':''}[ch] ?? ch))
-    .replace(/[.\-_,*~`]+/g,' ')
-    .replace(/\s+/g,' ').trim();
-  const textNorm = normalizeBadWordText(message.content);
-  const compact = textNorm.replace(/\s+/g,'');
-  const words = [...builtInBadWords, ...(anti.customWords || []), ...(auto.badWords || [])].filter(Boolean);
-  const badHit = words.some(w => {
-    const n = normalizeBadWordText(w); if (!n) return false;
-    const re = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegex(n)}(?:$|[^\\p{L}\\p{N}])`, 'iu');
-    return re.test(textNorm) || (n.length >= 4 && compact.includes(n.replace(/\s+/g,'')));
-  });
-  if ((anti.enabled || auto.badWordFilter) && badHit) {
-    const content = message.content.slice(0, 500);
-    await message.delete().catch(() => {});
-    const log = anti.logChannelId ? message.guild.channels.cache.get(anti.logChannelId) : await sys.getLogChannel(message.guild, 'message');
-    if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('🚫 Anti Bad Word', `**User:** ${message.author}\n**Channel:** ${message.channel}\n**Message:** ${content || '(attachment only)'}`)]}).catch(()=>{});
-    if (anti.action === 'timeout') {
-      const member = await message.guild.members.fetch(message.author.id).catch(()=>null);
-      member?.timeout(60_000, 'Anti bad word').catch(()=>{});
-    }
-    return;
-  }
-
-  // AutoMod filters are independent switches.
-  if (auto.enabled !== false) {
-    const letters = message.content.replace(/[^A-Za-z]/g, '');
-    if (auto.capsFilter && letters.length >= 8) {
-      const caps = letters.replace(/[^A-Z]/g, '').length;
-      if ((caps / letters.length) * 100 >= (auto.capsThreshold || 70)) {
-        await message.delete().catch(() => {});
-        const log = await sys.getLogChannel(message.guild, 'message');
-        if (log?.isTextBased()) log.send({ embeds: [ui.errorEmbed('🔠 Caps Filter', `**User:** ${message.author}\n**Channel:** ${message.channel}`)] }).catch(() => {});
-        return;
-      }
-    }
-    if (auto.inviteFilter && /(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i.test(message.content)) {
-      if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
-        await message.delete().catch(() => {});
-        const log = await sys.getLogChannel(message.guild, 'message');
-        if (log?.isTextBased()) log.send({ embeds: [ui.errorEmbed('🔗 Invite Filter', `**User:** ${message.author}\n**Channel:** ${message.channel}`)] }).catch(() => {});
-        return;
-      }
-    }
-  }
-});
-
-// ---------------------------------------------------------------------------------
-// voiceStateUpdate — Voicemaster hub → temp channel creation, auto-cleanup,
-// greetvoice gate handling. All logic lives in systems.js; this just forwards.
-// ---------------------------------------------------------------------------------
-client.on('voiceStateUpdate', async (oldState, newState) => {
-  await sys.handleVoiceStateUpdate(oldState, newState).catch(err => console.error('voiceStateUpdate:', err));
-});
-
-// ---------------------------------------------------------------------------------
-// Periodic tasks
-// ---------------------------------------------------------------------------------
-setInterval(() => sendBirthdayWishes().catch(console.error), 60 * 60 * 1000);
-sendBirthdayWishes().catch(() => {});
-
-// ---------------------------------------------------------------------------------
-// Login — without this the bot never connects, even if syntax is clean.
-// ---------------------------------------------------------------------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('Failed to log in:', err);
-  process.exit(1);
-});
