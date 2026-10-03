@@ -27,6 +27,38 @@ function getImageAttachment(interaction, optionName) {
   return attachment;
 }
 
+function botMember(interaction) {
+  return interaction.guild?.members?.me || interaction.guild?.members?.cache?.get(interaction.client.user.id) || null;
+}
+
+function actionPermissionError(interaction, permission, label) {
+  const member = interaction.member;
+  if (!member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+    return ui.errorEmbed('Missing Permissions', `You need **${label}** to use this action.`);
+  }
+  const bot = botMember(interaction);
+  if (!bot?.permissions?.has(permission) && !bot?.permissions?.has(PermissionFlagsBits.Administrator)) {
+    return ui.errorEmbed('Bot Missing Permissions', `I need **${label}** before I can perform this action.`);
+  }
+  return null;
+}
+
+function hierarchyError(interaction, target, actionLabel) {
+  const bot = botMember(interaction);
+  if (!bot || !target) return null;
+  if (target.id === interaction.guild.ownerId) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} the server owner.`);
+  if (target.id === interaction.client.user.id) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} myself.`);
+  if (target.roles?.highest?.position >= bot.roles.highest.position) return ui.errorEmbed('Role Hierarchy', `I cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than my highest role.`);
+  if (interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
+    return ui.errorEmbed('Role Hierarchy', `You cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than your highest role.`);
+  }
+  return null;
+}
+
+function actionPreflight(interaction, target, permission, permissionLabel, actionLabel) {
+  return actionPermissionError(interaction, permission, permissionLabel) || hierarchyError(interaction, target, actionLabel);
+}
+
 const commands = [];
 
 
@@ -153,8 +185,7 @@ commands.push({
       .addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true))
       .addIntegerOption(o=>o.setName('winners').setDescription('Number of winners').setMinValue(1).setMaxValue(20))
       .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
-      .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))
-      .addRoleOption(o=>o.setName('required_role').setDescription('Role required to enter (optional)'))),
+      .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
   async execute(interaction) {
     if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
@@ -162,48 +193,16 @@ commands.push({
     const winners=interaction.options.getInteger('winners')||1;
     const duration=(interaction.options.getInteger('duration_minutes')||1440)*60000;
     const channel=interaction.options.getChannel('channel')||interaction.channel;
-    const requiredRole=interaction.options.getRole('required_role');
-    const g=db.createGiveaway(interaction.guildId,interaction.user.id,{prize,winners,durationMs:duration,endsAt:Date.now()+duration,channelId:channel.id,requiredRoleId:requiredRole?.id||null});
+    const g=db.createGiveaway(interaction.guildId,interaction.user.id,{prize,winners,durationMs:duration,endsAt:Date.now()+duration,channelId:channel.id});
     const row=new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`giveaway_publish:${g.id}`).setLabel('Publish Giveaway').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`giveaway_cancel:${g.id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger)
     );
     await interaction.reply({embeds:[ui.base('🎉 Giveaway Configuration')
-      .setDescription(`Configure and publish this giveaway.\n\n**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** <t:${Math.floor(g.endsAt/1000)}:R>\n**Channel:** ${channel}${requiredRole ? `\n**Required role:** ${requiredRole}` : ''}`)
+      .setDescription(`Configure and publish this giveaway.\n\n**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** <t:${Math.floor(g.endsAt/1000)}:R>\n**Channel:** ${channel}`)
       .setFooter({text:`Giveaway #${g.id} • Hosted by ${interaction.user.tag}`})],components:[row],ephemeral:true});
   }
 });
-
-// Short-form slash commands. Discord command names are lowercase, so `!I` is exposed as `/i`.
-commands.push({ data: new SlashCommandBuilder().setName('i').setDescription('Show invite statistics.').addUserOption(o=>o.setName('user').setDescription('Optional member')), async execute(i){
-  const u=i.options.getUser('user'); if(!i.guild.members.me.permissions.has(PermissionFlagsBits.ManageGuild)) return i.reply({embeds:[ui.errorEmbed('Missing Permission','I need **Manage Server** to read invite usage.')],ephemeral:true});
-  const invites=await i.guild.invites.fetch().catch(()=>null); if(!invites) return i.reply({embeds:[ui.errorEmbed('Invite Stats Unavailable','I could not read this server’s invites.')],ephemeral:true});
-  const rows=invites.filter(x=>!u||x.inviter?.id===u.id).sort((a,b)=>(b.uses||0)-(a.uses||0)).first(10);
-  return i.reply({embeds:[ui.base(`📨 ${u?`${u.username}'s`:'Server'} Invites`).setDescription(rows.map((x,n)=>`${n+1}. ${x.inviter||'Unknown'} — **${x.uses||0}** uses`).join('\n')||'No invite data found.')]});
-}});
-commands.push({ data: new SlashCommandBuilder().setName('si').setDescription('Show server information.'), async execute(i){ return commands.find(c=>c.data.name==='serverinfo').execute(i); }});
-commands.push({ data: new SlashCommandBuilder().setName('gc').setDescription('Open the easy giveaway creation panel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild), async execute(i){
-  if(!i.member.permissions.has(PermissionFlagsBits.ManageGuild)) return i.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
-  const g=db.createGiveaway(i.guildId,i.user.id,{prize:'Giveaway',winners:1,durationMs:86400000,endsAt:Date.now()+86400000,channelId:i.channel.id});
-  const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`giveaway_publish:${g.id}`).setLabel('Publish Giveaway').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`giveaway_cancel:${g.id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger));
-  return i.reply({embeds:[ui.base('🎉 Giveaway Configuration').setDescription('Use this panel to create the giveaway easily.\n\n**Prize:** Giveaway\n**Winners:** 1\n**Duration:** 24 hours\n**Channel:** '+i.channel)],components:[row],ephemeral:true});
-}});
-commands.push({ data:new SlashCommandBuilder().setName('giveawaycreate').setDescription('Open the easy giveaway creation panel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild), async execute(i){ return commands.find(c=>c.data.name==='gc').execute(i); }});
-
-commands.push({
- data:new SlashCommandBuilder().setName('invitesetup').setDescription('Configure invite rewards.').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-  .addSubcommand(s=>s.setName('setup').setDescription('Set an invite reward role.').addIntegerOption(o=>o.setName('invites').setDescription('Invites required').setRequired(true).setMinValue(1).setMaxValue(10000)).addRoleOption(o=>o.setName('role').setDescription('Reward role').setRequired(true))),
- async execute(i){ if(!requireAdmin(i))return; const n=i.options.getInteger('invites'), r=i.options.getRole('role'); const cfg=db.getConfig(i.guildId); const rewards=(cfg.inviteTracker.rewards||[]).filter(x=>x.invites!==n); rewards.push({invites:n,roleId:r.id}); rewards.sort((a,b)=>a.invites-b.invites); db.saveConfig(i.guildId,{inviteTracker:{enabled:true,rewards}}); return i.reply({embeds:[ui.okEmbed('🎁 Invite Reward Added',`Members will receive ${r} after **${n} invites**.`)]}); }
-});
-
-commands.push({ data:new SlashCommandBuilder().setName('addmediaonly').setDescription('Make a channel media-only.').setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels).addChannelOption(o=>o.setName('channel').setDescription('Channel').setRequired(true).addChannelTypes(ChannelType.GuildText)), async execute(i){ if(!i.member.permissions.has(PermissionFlagsBits.ManageChannels))return i.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Channels is required.')],ephemeral:true}); const c=i.options.getChannel('channel'); const list=db.getConfig(i.guildId).mediaOnly.channels||[]; if(!list.includes(c.id))list.push(c.id); db.saveConfig(i.guildId,{mediaOnly:{channels:list}}); return i.reply({embeds:[ui.okEmbed('🖼️ Media-Only Enabled',`${c} now only accepts image/video media.`)]}); }});
-commands.push({ data:new SlashCommandBuilder().setName('removemediaonly').setDescription('Remove a channel from media-only mode.').setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels).addChannelOption(o=>o.setName('channel').setDescription('Channel').setRequired(true).addChannelTypes(ChannelType.GuildText)), async execute(i){ if(!i.member.permissions.has(PermissionFlagsBits.ManageChannels))return i.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Channels is required.')],ephemeral:true}); const c=i.options.getChannel('channel'); const list=(db.getConfig(i.guildId).mediaOnly.channels||[]).filter(id=>id!==c.id); db.saveConfig(i.guildId,{mediaOnly:{channels:list}}); return i.reply({embeds:[ui.okEmbed('🗑️ Media-Only Disabled',`${c} is no longer media-only.`)]}); }});
-
-// Seven lightweight security setup panels. Each setting is also enforced in message/member events in index.js.
-const EXTRA_SECURITY = {
-  antiinvite:'Block Discord invites', antimention:'Limit mass mentions', anticap:'Block excessive caps', antiscam:'Block suspicious scam links', antieveryone:'Block @everyone/@here mentions', antiunknownbot:'Restrict bots added by untrusted users', antiweb:'Block common malicious web links'
-};
-for(const [name,desc] of Object.entries(EXTRA_SECURITY)){ commands.push({ data:new SlashCommandBuilder().setName(name).setDescription(desc+'.').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(s=>s.setName('setup').setDescription('Enable or disable this security module.').addStringOption(o=>o.setName('state').setDescription('State').setRequired(true).addChoices({name:'enable',value:'enable'},{name:'disable',value:'disable'}))), async execute(i){ if(!requireAdmin(i))return; const enabled=i.options.getString('state')==='enable'; db.saveConfig(i.guildId,{securityExtras:{[name]:{...db.getConfig(i.guildId).securityExtras[name],enabled}}}); return i.reply({embeds:[ui.configSummaryEmbed(name,{enabled})]}); }}); }
 
 // ---------------------------------------------------------------------------------
 // /help
@@ -224,7 +223,7 @@ const GENERIC_MODULES = [
 ];
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'antiwebhook', 'antibot', 'antialt', 'voicemaster', 'greetvoice', 'greetmessage',
-  'leveling', 'tickets', 'logs', 'antiinvite', 'antimention', 'anticap', 'antiscam', 'antieveryone', 'antiunknownbot', 'antiweb', ...GENERIC_MODULES
+  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
 ];
 const GENERIC_COMMANDS = {
   welcome: 'welcome', leave: 'leave', boost: 'boost', starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
@@ -532,11 +531,11 @@ commands.push({
 
 // /reactionrolesetup — one panel for channel, message and fully editable reaction-role mappings.
 commands.push({
-  data: new SlashCommandBuilder().setName('reactionrolesetup').setDescription('Open the fully customizable reaction-role setup panel.')
+  data: new SlashCommandBuilder().setName('reactionrolesetup').setDescription('Open the multi-panel reaction-role manager.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
-    const cfg = db.getConfig(interaction.guildId).reactionRoles;
+    const cfg = db.getConfig(interaction.guildId);
     await interaction.reply({ embeds: [ui.reactionRoleSetupEmbed(cfg)], components: ui.reactionRoleSetupRows(cfg), ephemeral: true });
   }
 });
@@ -577,11 +576,11 @@ function parseButtonRoles(text) {
 }
 
 commands.push({
-  data: new SlashCommandBuilder().setName('buttonrolesetup').setDescription('Open the fully customizable button-role setup panel.')
+  data: new SlashCommandBuilder().setName('buttonrolesetup').setDescription('Open the multi-panel button-role manager.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
-    const cfg = db.getConfig(interaction.guildId).buttonRoles;
+    const cfg = db.getConfig(interaction.guildId);
     await interaction.reply({ embeds: [ui.buttonRoleEmbed(cfg)], components: ui.buttonRoleSetupRows(cfg), ephemeral: true });
   }
 });
@@ -699,24 +698,6 @@ commands.push({
 });
 
 // ---------------------------------------------------------------------------------
-// Moderation safety / hierarchy validation
-// ---------------------------------------------------------------------------------
-function moderationTargetCheck(interaction, member, permission, action) {
-  if (!interaction.member.permissions.has(permission)) {
-    return `You need **${String(permission).replace('Manage','Manage ')}** permission to ${action}.`;
-  }
-  const me = interaction.guild.members.me;
-  if (!me) return 'I could not resolve my server member record. Please try again.';
-  if (!me.permissions.has(permission)) return `I need **${permission === PermissionFlagsBits.BanMembers ? 'Ban Members' : permission === PermissionFlagsBits.KickMembers ? 'Kick Members' : permission === PermissionFlagsBits.ModerateMembers ? 'Moderate Members' : 'the required permission'}** to ${action}.`;
-  if (member && member.id === interaction.guild.ownerId) return 'I cannot perform that action on the server owner.';
-  if (member && member.id !== interaction.member.id && interaction.member.id !== interaction.guild.ownerId && interaction.member.roles.highest.comparePositionTo(member.roles.highest) <= 0) return `You cannot ${action} **${member.user.tag}** because their highest role is equal to or higher than yours.`;
-  if (member && !member.manageable && (permission === PermissionFlagsBits.BanMembers || permission === PermissionFlagsBits.KickMembers || permission === PermissionFlagsBits.ModerateMembers)) {
-    return `I cannot ${action} **${member.user.tag}** because their highest role is equal to or higher than mine.`;
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------------
 // Moderation
 // ---------------------------------------------------------------------------------
 function modLog(interaction, embed) {
@@ -732,10 +713,14 @@ commands.push({
     const user = interaction.options.getUser('user');
     const reason = interaction.options.getString('reason') || 'No reason provided';
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-    const check = moderationTargetCheck(interaction, member, PermissionFlagsBits.BanMembers, 'ban this member');
-    if (check) return interaction.reply({ embeds: [ui.errorEmbed('❌ Action Failed', check)], ephemeral: true });
-    try { await interaction.guild.members.ban(user.id, { reason }); } catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('❌ Ban Failed', `Discord rejected the action: **${e.message}**`)], ephemeral: true }); }
-    const embed = ui.errorEmbed('🔨 Member Banned', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
+    const preflight = actionPreflight(interaction, member, PermissionFlagsBits.BanMembers, 'Ban Members', 'ban');
+    if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
+    try {
+      await interaction.guild.members.ban(user.id, { reason });
+    } catch (e) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Ban Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true });
+    }
+    const embed = ui.okEmbed('🔨 Member Banned', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
     await interaction.reply({ embeds: [embed] });
     modLog(interaction, embed);
   }
@@ -750,10 +735,14 @@ commands.push({
     const user = interaction.options.getUser('user');
     const reason = interaction.options.getString('reason') || 'No reason provided';
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-    const check = moderationTargetCheck(interaction, member, PermissionFlagsBits.KickMembers, 'kick this member');
-    if (check) return interaction.reply({ embeds: [ui.errorEmbed('❌ Action Failed', check)], ephemeral: true });
-    try { await member.kick(reason); } catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('❌ Kick Failed', `Discord rejected the action: **${e.message}**`)], ephemeral: true }); }
-    const embed = ui.errorEmbed('👢 Member Kicked', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
+    const preflight = actionPreflight(interaction, member, PermissionFlagsBits.KickMembers, 'Kick Members', 'kick');
+    if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
+    try {
+      await member.kick(reason);
+    } catch (e) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Kick Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true });
+    }
+    const embed = ui.okEmbed('👢 Member Kicked', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
     await interaction.reply({ embeds: [embed] });
     modLog(interaction, embed);
   }
@@ -770,9 +759,13 @@ commands.push({
     const minutes = interaction.options.getInteger('minutes');
     const reason = interaction.options.getString('reason') || 'No reason provided';
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-    const check = moderationTargetCheck(interaction, member, PermissionFlagsBits.ModerateMembers, 'timeout this member');
-    if (check) return interaction.reply({ embeds: [ui.errorEmbed('❌ Action Failed', check)], ephemeral: true });
-    try { await member.timeout(minutes * 60_000, reason); } catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('❌ Timeout Failed', `Discord rejected the action: **${e.message}**`)], ephemeral: true }); }
+    const preflight = actionPreflight(interaction, member, PermissionFlagsBits.ModerateMembers, 'Moderate Members', 'timeout');
+    if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
+    try {
+      await member.timeout(minutes * 60_000, reason);
+    } catch (e) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Timeout Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true });
+    }
     const embed = ui.warnEmbed('⏱️ Member Timed Out', `**User:** ${user.tag}\n**Duration:** ${minutes}m\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
     await interaction.reply({ embeds: [embed] });
     modLog(interaction, embed);
@@ -786,9 +779,10 @@ commands.push({
   async execute(interaction) {
     const user = interaction.options.getUser('user');
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-    const check = moderationTargetCheck(interaction, member, PermissionFlagsBits.ModerateMembers, 'remove this timeout');
-    if (check) return interaction.reply({ embeds: [ui.errorEmbed('❌ Action Failed', check)], ephemeral: true });
-    try { await member.timeout(null); } catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('❌ Timeout Removal Failed', `Discord rejected the action: **${e.message}**`)], ephemeral: true }); }
+    const preflight = actionPreflight(interaction, member, PermissionFlagsBits.ModerateMembers, 'Moderate Members', 'remove the timeout from');
+    if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
+    try { await member.timeout(null); }
+    catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('Timeout Removal Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true }); }
     await interaction.reply({ embeds: [ui.okEmbed('✅ Timeout Removed', `${user} can speak again.`)] });
   }
 });
@@ -840,7 +834,7 @@ commands.push({
     const user = interaction.options.getUser('user');
     const msgs = await interaction.channel.messages.fetch({ limit: amount });
     const filtered = user ? msgs.filter(m => m.author.id === user.id) : msgs;
-    await interaction.channel.bulkDelete(filtered, true).catch(() => {});
+    try { await interaction.channel.bulkDelete(filtered, true); } catch (e) { return interaction.reply({ embeds:[ui.errorEmbed('Purge Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral:true }); }
     await interaction.reply({ embeds: [ui.okEmbed('🧹 Purged', `Deleted ${filtered.size} messages.`)], ephemeral: true });
   }
 });
@@ -849,7 +843,7 @@ commands.push({
   data: new SlashCommandBuilder().setName('lock').setDescription('Lock the current channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
   async execute(interaction) {
-    await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: false });
+    try { await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: false }); } catch (e) { return interaction.reply({ embeds:[ui.errorEmbed('Lock Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral:true }); }
     await interaction.reply({ embeds: [ui.warnEmbed('🔒 Channel Locked', `${interaction.channel} has been locked.`)] });
   }
 });
@@ -857,7 +851,7 @@ commands.push({
   data: new SlashCommandBuilder().setName('unlock').setDescription('Unlock the current channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
   async execute(interaction) {
-    await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: null });
+    try { await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: null }); } catch (e) { return interaction.reply({ embeds:[ui.errorEmbed('Unlock Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral:true }); }
     await interaction.reply({ embeds: [ui.okEmbed('🔓 Channel Unlocked', `${interaction.channel} has been unlocked.`)] });
   }
 });
@@ -882,12 +876,15 @@ commands.push({
     const user = interaction.options.getUser('user');
     const role = interaction.options.getRole('role');
     const member = await interaction.guild.members.fetch(user.id);
-    const me = interaction.guild.members.me;
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.reply({embeds:[ui.errorEmbed('❌ Action Failed','You need **Manage Roles**.')],ephemeral:true});
-    if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.reply({embeds:[ui.errorEmbed('❌ Action Failed','I need **Manage Roles**.')],ephemeral:true});
-    if (!role.editable || (member && member.roles.highest.comparePositionTo(role) < 0 && sub === 'remove')) return interaction.reply({embeds:[ui.errorEmbed('❌ Action Failed','That role is above my highest role or cannot be managed by me.')],ephemeral:true});
-    if (role.position >= me.roles.highest.position) return interaction.reply({embeds:[ui.errorEmbed('❌ Action Failed','I cannot manage that role because it is at or above my highest role.')],ephemeral:true});
-    try { if (sub === 'add') await member.roles.add(role); else await member.roles.remove(role); } catch (e) { return interaction.reply({embeds:[ui.errorEmbed('❌ Role Update Failed', `Discord rejected the action: **${e.message}**`)],ephemeral:true}); }
+    const perm = actionPermissionError(interaction, PermissionFlagsBits.ManageRoles, 'Manage Roles');
+    if (perm) return interaction.reply({ embeds: [perm], ephemeral: true });
+    const bot = botMember(interaction);
+    if (role.position >= bot.roles.highest.position) return interaction.reply({ embeds: [ui.errorEmbed('Role Hierarchy', `I cannot ${sub} **${role.name}** because that role is equal to or higher than my highest role.`)], ephemeral: true });
+    if (interaction.member.id !== interaction.guild.ownerId && role.position >= interaction.member.roles.highest.position) return interaction.reply({ embeds: [ui.errorEmbed('Role Hierarchy', `You cannot ${sub} **${role.name}** because it is equal to or higher than your highest role.`)], ephemeral: true });
+    const targetCheck = hierarchyError(interaction, member, sub === 'add' ? 'add roles to' : 'remove roles from');
+    if (targetCheck) return interaction.reply({ embeds: [targetCheck], ephemeral: true });
+    try { if (sub === 'add') await member.roles.add(role); else await member.roles.remove(role); }
+    catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('Role Action Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true }); }
     await interaction.reply({ embeds: [ui.okEmbed('✅ Role Updated', `${role} ${sub === 'add' ? 'added to' : 'removed from'} ${user}.`)] });
   }
 });
@@ -901,7 +898,9 @@ commands.push({
     const user = interaction.options.getUser('user');
     const nickname = interaction.options.getString('nickname') || null;
     const member = await interaction.guild.members.fetch(user.id);
-    await member.setNickname(nickname).catch(() => {});
+    const targetCheck = hierarchyError(interaction, member, 'change the nickname of');
+    if (targetCheck) return interaction.reply({ embeds:[targetCheck], ephemeral:true });
+    try { await member.setNickname(nickname); } catch (e) { return interaction.reply({ embeds:[ui.errorEmbed('Nickname Update Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral:true }); }
     await interaction.reply({ embeds: [ui.okEmbed('✅ Nickname Updated', `${user}'s nickname is now **${nickname || user.username}**.`)] });
   }
 });
@@ -1261,9 +1260,4 @@ commands.push({
   }
 });
 
-const EXTRA_PREFIX_ALIASES = [
-  'gcreate','give','giveawaycreate','inviteinfo','invitecount','server','serverinformation','serverdetails','userinfo','memberinfo','profile','pfp','picture','avatarshow','serverstats','statistics','serverstat','leaderboards','top','topusers','levels','ranks','rankings',
-  'banuser','kickuser','timeoutuser','untimeoutuser','warnuser','warningsfor','clearwarnings','purgechat','clean','clear','lockchannel','unlockchannel','slow','slowmodechannel','addrole','removerole','setrole','nick','setnick','ticket','tickets','ticketconfig','ticketsetup','greet','welcome','welcometest','logs','logsetup','automodsetup','antinukeconfig','antilinksetup','antispamsetup','antiraidsetup','antiwebhooksetup','antibotsetup','antialtsetup','voicemastersetup','levelsetup','levelingsetup','suggestion','suggestionsetup','poll','pollsetup','star','starboardsetup','boostsetup','leavesetup','welcomesetup','birthdaysetup','reactionrole','reactionroles','buttonrole','buttonroles','staffapply','staffapplications','mediaadd','mediaremove','mediaonly','unmediaonly','inviteRewards','invitesetup2','security','securitysetup',
-  ...Array.from({length:240},(_,i)=>`cmd${i+1}`)
-];
-module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES, EXTRA_PREFIX_ALIASES };
+module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
