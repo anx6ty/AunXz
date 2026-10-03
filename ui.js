@@ -7,7 +7,7 @@
 
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, ChannelSelectMenuBuilder, UserSelectMenuBuilder,
+  StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder,
   ChannelType, PermissionFlagsBits,
   ContainerBuilder, TextDisplayBuilder, SectionBuilder, ThumbnailBuilder,
   MediaGalleryBuilder, MediaGalleryItemBuilder, SeparatorBuilder, MessageFlags
@@ -106,11 +106,14 @@ const HELP_CATEGORIES = {
       '**/antilink setup** — delete/warn/mute, domain whitelist, bypass role\n' +
       '**/antispam setup** — message/mention/emoji flood limits\n' +
       '**/antiraid setup** — join-rate lockdown, min account age\n' +
+      '**/antiwebhook setup** — webhook action, bypass role, security log\n' +
+      '**/antibot setup** — bot action, bypass role, security log\n' +
+      '**/antialt setup** — minimum account age, action, security log\n' +
       '**/whitelist add|remove** — exempt trusted staff from antinuke'
   },
   voice: {
     name: 'Voice', emojiKey: 'voice',
-    desc: '**/greetvoicesetup** — role-gated VC greeting with TTS\n' +
+    desc: '**/greetvoice setup** — role-gated VC greeting with TTS\n' +
       '**/voicemaster setup** — join-to-create hub channel & category'
   },
   moderation: {
@@ -135,7 +138,7 @@ const HELP_CATEGORIES = {
   },
   logging: {
     name: 'Logging', emojiKey: 'logs',
-    desc: '**/logsetup** — select a log type and destination channel'
+    desc: '**/logs setup** — route mod/message/member/voice/antinuke/server logs to channels'
   },
   automation: {
     name: 'Automation & Content', emojiKey: 'tools',
@@ -145,9 +148,7 @@ const HELP_CATEGORIES = {
       '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
       '**/antibadwordsetup** — multilingual profanity filter\n' +
       '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
-      '**/birthdaysetup** — birthday panel + automatic wishes\n' +
-      '**/buttonrolesetup** — fully customizable button-role panel\n' +
-      '**/reactionrolesetup** — fully customizable reaction-role panel'
+      '**/birthdaysetup** — birthday panel + automatic wishes'
   },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
@@ -382,6 +383,9 @@ const SETUP_MODULE_META = {
   antilink: { emojiKey: 'link', title: 'Antilink', cfgKey: 'antilink' },
   antispam: { emojiKey: 'spam', title: 'Antispam', cfgKey: 'antispam' },
   antiraid: { emojiKey: 'raid', title: 'Antiraid', cfgKey: 'antiraid' },
+  antiwebhook: { emojiKey: 'shield', title: 'Anti-Webhook', cfgKey: 'antiwebhook' },
+  antibot: { emojiKey: 'shield', title: 'Anti-Bot', cfgKey: 'antibot' },
+  antialt: { emojiKey: 'shield', title: 'Anti-Alt', cfgKey: 'antialt' },
   voicemaster: { emojiKey: 'voice', title: 'Voicemaster', cfgKey: 'voicemaster' },
   greetmessage: { emojiKey: 'wave', title: 'Greet Message', cfgKey: 'greetmessage' },
   leveling: { emojiKey: 'level', title: 'Leveling', cfgKey: 'leveling' },
@@ -405,13 +409,23 @@ function setupPanelEmbed(sub, cfg) {
 }
 
 function setupPanelRow(sub, cfg) {
-  const meta = SETUP_MODULE_META[sub];
-  const enabled = cfg[meta.cfgKey].enabled;
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled ? 'Disable' : 'Enable')
-      .setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? emoji('disabled') : emoji('enabled')),
-    new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings'))
-  );
+  const meta = SETUP_MODULE_META[sub]; const enabled = cfg[meta.cfgKey].enabled;
+  if (['antiwebhook','antibot','antialt'].includes(sub)) {
+    const rows=[new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled?'Disable':'Enable').setStyle(enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(enabled?emoji('disabled'):emoji('enabled')),
+      new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings'))
+    )];
+    if(sub==='antiwebhook'){
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antiwebhook:action').setPlaceholder('Choose webhook action…').addOptions({label:'Delete webhook',value:'delete',emoji:'🗑️'},{label:'Kick creator',value:'kick',emoji:'👢'},{label:'Ban creator',value:'ban',emoji:'🔨'},{label:'Strip roles',value:'strip_roles',emoji:'🔒'}),new RoleSelectMenuBuilder().setCustomId('security_cfg:antiwebhook:bypass').setPlaceholder('Select trusted inviter role…')));
+    } else if(sub==='antibot'){
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antibot:action').setPlaceholder('Choose unapproved bot action…').addOptions({label:'Kick',value:'kick',emoji:'👢'},{label:'Ban',value:'ban',emoji:'🔨'},{label:'Strip roles',value:'strip_roles',emoji:'🔒'}),new RoleSelectMenuBuilder().setCustomId('security_cfg:antibot:bypass').setPlaceholder('Select bypass role…')));
+    } else {
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antialt:action').setPlaceholder('Choose new-account action…').addOptions({label:'Kick',value:'kick',emoji:'👢'},{label:'Ban',value:'ban',emoji:'🔨'}),new StringSelectMenuBuilder().setCustomId('security_cfg:antialt:age').setPlaceholder('Minimum account age…').addOptions([1,3,7,14,30,60,90].map(v=>({label:`${v} day${v===1?'':'s'}`,value:String(v)})))));
+    }
+    rows.push(new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`security_cfg:${sub}:log`).setPlaceholder('Select security log channel…').addChannelTypes(ChannelType.GuildText)));
+    return rows;
+  }
+  return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled?'Disable':'Enable').setStyle(enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(enabled?emoji('disabled'):emoji('enabled')),new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')))];
 }
 
 // ---------------- VOICEMASTER: KICK-FROM-VC SELECTION ----------------
@@ -449,89 +463,97 @@ function featureSetupRow(prefix, buttons=['edit','post']) {
     return new ButtonBuilder().setCustomId(`${prefix}:${k}`).setLabel(label).setStyle(style === 'test' ? ButtonStyle.Secondary : style).setEmoji(emoji(key));
   }));
 }
-function buttonRoleEmbed(cfg) { return featureSetupEmbed('Button Roles', 'Choose a role button below. Each button can add, remove, or toggle a role.', [
-  {name:'Panel',value:`${cfg.title || 'Choose your roles'}
-${cfg.description || ''}`,inline:false},
-  {name:'Buttons',value:String((cfg.buttons||[]).length),inline:true}, {name:'Style',value:cfg.embedType||'embed',inline:true}
-]); }
-
-function buttonRoleSetupRows(cfg) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId('buttonroles_cfg:channel').setPlaceholder(cfg.channelId ? 'Change panel channel' : 'Select panel channel').setChannelTypes(ChannelType.GuildText)
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('buttonroles_cfg:panel').setLabel('Edit Panel').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
-      new ButtonBuilder().setCustomId('buttonroles_cfg:buttons').setLabel('Edit Buttons').setStyle(ButtonStyle.Primary).setEmoji(emoji('tools')),
-      new ButtonBuilder().setCustomId('buttonroles_cfg:post').setLabel('Post / Refresh').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
-    )
-  ];
+function selectedPanel(cfg, kind, selectedId) {
+  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
+  const list = Array.isArray(cfg[key]) ? cfg[key] : [];
+  return list.find(p => p.id === selectedId) || list[0] || null;
 }
-function automodSetupEmbed(cfg) {
-  return featureSetupEmbed('AutoMod', 'Fully customize what AutoMod checks and what it does when a message matches.', [
-    {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
-    {name:'Bad words',value:cfg.badWordFilter?'Enabled':'Disabled',inline:true},
-    {name:'Caps filter',value:cfg.capsFilter?`Enabled (${cfg.capsThreshold || 70}%)`:'Disabled',inline:true},
-    {name:'Invite filter',value:cfg.inviteFilter?'Enabled':'Disabled',inline:true},
-    {name:'Custom words',value:String((cfg.badWords||[]).length),inline:true}
+function panelStatus(panel) { return panel?.enabled === false ? `${emoji('disabled')} Disabled` : `${emoji('enabled')} Enabled`; }
+function buttonRoleEmbed(cfg, selectedId) {
+  const panels = Array.isArray(cfg.buttonRolePanels) ? cfg.buttonRolePanels : [];
+  const panel = selectedPanel(cfg, 'button', selectedId);
+  const list = panels.slice(0, 12).map((p, i) => `${i + 1}. **${p.title || `Panel ${i + 1}`}** — ${p.enabled === false ? 'Disabled' : 'Enabled'} — ${p.buttons?.length || 0} role(s)${p.messageId ? ' • posted' : ''}`).join('\n') || 'No panels yet. Press **Create Panel**.';
+  return featureSetupEmbed('Button Roles', 'Create multiple independent role panels. Roles are selected with Discord’s native role picker — no role IDs to copy.', [
+    {name:'Panels',value:list,inline:false},
+    {name:'Selected',value:panel ? `${panel.title || 'Untitled'}
+${panel.channelId ? `<#${panel.channelId}>` : 'Channel not set'}
+${panelStatus(panel)}` : 'None',inline:false},
+    {name:'Role buttons',value:panel ? String((panel.buttons||[]).length) : '0',inline:true},
+    {name:'Style',value:panel?.embedType||'embed',inline:true}
   ]);
 }
-function automodSetupRows(cfg) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder().setCustomId('automod_cfg:status').setPlaceholder(cfg.enabled?'AutoMod: ON':'AutoMod: OFF')
-        .addOptions({label:'Enable AutoMod',value:'enable',emoji:emoji('enabled')},{label:'Disable AutoMod',value:'disable',emoji:emoji('disabled')})
-    ),
-    new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder().setCustomId('automod_cfg:filter').setPlaceholder('Choose a filter to toggle')
-        .addOptions({label:`Bad words: ${cfg.badWordFilter?'ON':'OFF'}`,value:'badwords'},{label:`Caps filter: ${cfg.capsFilter?'ON':'OFF'}`,value:'caps'},{label:`Invite filter: ${cfg.inviteFilter?'ON':'OFF'}`,value:'invites'})
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('automod_cfg:words').setLabel('Edit Bad Words').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
-      new ButtonBuilder().setCustomId('automod_cfg:caps').setLabel('Caps Threshold').setStyle(ButtonStyle.Secondary).setEmoji(emoji('spam'))
-    )
-  ];
+function buttonRoleSetupRows(cfg, selectedId) {
+  const panels = Array.isArray(cfg.buttonRolePanels) ? cfg.buttonRolePanels : [];
+  const panel = selectedPanel(cfg, 'button', selectedId);
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('buttonroles_cfg:create').setLabel('Create Panel').setStyle(ButtonStyle.Success).setEmoji(emoji('add')),
+    new ButtonBuilder().setCustomId('buttonroles_cfg:toggle').setLabel(panel?.enabled === false ? 'Enable' : 'Disable').setStyle(panel?.enabled === false ? ButtonStyle.Success : ButtonStyle.Danger).setDisabled(!panel),
+    new ButtonBuilder().setCustomId('buttonroles_cfg:delete').setLabel('Delete').setStyle(ButtonStyle.Danger).setEmoji(emoji('delete')).setDisabled(!panel)
+  )];
+  if (panels.length) rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('buttonroles_cfg:select').setPlaceholder('Select a button-role panel…')
+      .addOptions(panels.slice(0,25).map((p,i)=>({label:(p.title || `Panel ${i+1}`).slice(0,100),value:p.id,description:`${p.buttons?.length||0} role(s) • ${p.enabled === false ? 'disabled' : 'enabled'}`})))
+  ));
+  if (panel) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
+      new ButtonBuilder().setCustomId(`buttonroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+      new ButtonBuilder().setCustomId(`buttonroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
+    ));
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`buttonroles_cfg:upload:${panel.id}`).setLabel('Send Image/GIF').setStyle(ButtonStyle.Secondary).setEmoji('🖼️'),
+      new ButtonBuilder().setCustomId(`buttonroles_cfg:remove_image:${panel.id}`).setLabel('Remove Image').setStyle(ButtonStyle.Secondary).setDisabled(!panel.image),
+      new ButtonBuilder().setCustomId(`buttonroles_cfg:post:${panel.id}`).setLabel(panel.messageId ? 'Post Again' : 'Post Panel').setStyle(ButtonStyle.Success)
+    ));
+    const roles = panel.buttons || [];
+    if (roles.length) rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId(`buttonroles_cfg:remove_role:${panel.id}`).setPlaceholder('Remove a role button…')
+        .addOptions(roles.slice(0,25).map((r,i)=>({label:(r.label || `Role ${i+1}`).slice(0,100),value:r.roleId})))
+    ));
+  }
+  return rows.slice(0,5);
 }
-function logSetupEmbed(cfg) {
-  const configured = Object.entries(cfg || {}).filter(([,v])=>v).length;
-  return featureSetupEmbed('Logging Setup', 'Use the two selectors below: choose a log type, then choose its destination channel.', [
-    {name:'Configured routes',value:`${configured} / ${Object.keys(cfg||{}).length}`,inline:true}
+function reactionRoleSetupEmbed(cfg, selectedId) {
+  const panels = Array.isArray(cfg.reactionRolePanels) ? cfg.reactionRolePanels : [];
+  const panel = selectedPanel(cfg, 'reaction', selectedId);
+  const list = panels.slice(0,12).map((p,i)=>`${i+1}. **${p.title || `Panel ${i+1}`}** — ${p.enabled === false ? 'Disabled' : 'Enabled'} — ${p.mappings?.length || 0} role(s)${p.messageId ? ' • posted' : ''}`).join('\n') || 'No panels yet. Press **Create Panel**.';
+  return featureSetupEmbed('Reaction Roles', 'Create multiple independent reaction-role panels. Roles are selected with Discord’s native role picker — no role IDs to copy.', [
+    {name:'Panels',value:list,inline:false},
+    {name:'Selected',value:panel ? `${panel.title || 'Untitled'}
+${panel.channelId ? `<#${panel.channelId}>` : 'Channel not set'}
+${panelStatus(panel)}` : 'None',inline:false},
+    {name:'Mappings',value:panel ? String((panel.mappings||[]).length) : '0',inline:true},
+    {name:'Message',value:panel?.messageId ? `#${panel.messageId}` : 'Not posted',inline:true}
   ]);
 }
-function logSetupRows(cfg) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder().setCustomId('logsetup:type').setPlaceholder('1️⃣ Select log type')
-        .addOptions(
-          {label:'Moderation',value:'mod'},{label:'Messages',value:'message'},{label:'Members',value:'member'},
-          {label:'Voice',value:'voice'},{label:'Antinuke',value:'antinuke'},{label:'Server',value:'server'},
-          {label:'Tickets',value:'ticket'},{label:'Joins / Leaves',value:'join'}
-        )
-    ),
-    new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId('logsetup:channel').setPlaceholder('2️⃣ Select destination channel').setChannelTypes(ChannelType.GuildText)
-    )
-  ];
-}
-function reactionRoleSetupEmbed(cfg) {
-  return featureSetupEmbed('Reaction Roles', 'Configure a message and map emoji reactions to roles. Members can add/remove the mapped role by reacting.', [
-    {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
-    {name:'Channel',value:cfg.channelId?`<#${cfg.channelId}>`:'Not set',inline:true},
-    {name:'Message',value:cfg.messageId?`\`${cfg.messageId}\``:'Not set',inline:true},
-    {name:'Mappings',value:String((cfg.mappings||[]).length),inline:true}
-  ]);
-}
-function reactionRoleSetupRows(cfg) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId('reactionroles_cfg:channel').setPlaceholder('Select reaction-role channel').setChannelTypes(ChannelType.GuildText)
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('reactionroles_cfg:message').setLabel('Set Message ID').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
-      new ButtonBuilder().setCustomId('reactionroles_cfg:mappings').setLabel('Edit Reactions').setStyle(ButtonStyle.Primary).setEmoji(emoji('tools')),
-      new ButtonBuilder().setCustomId('reactionroles_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled'))
-    )
-  ];
+function reactionRoleSetupRows(cfg, selectedId) {
+  const panels = Array.isArray(cfg.reactionRolePanels) ? cfg.reactionRolePanels : [];
+  const panel = selectedPanel(cfg, 'reaction', selectedId);
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('reactionroles_cfg:create').setLabel('Create Panel').setStyle(ButtonStyle.Success).setEmoji(emoji('add')),
+    new ButtonBuilder().setCustomId('reactionroles_cfg:toggle').setLabel(panel?.enabled === false ? 'Enable' : 'Disable').setStyle(panel?.enabled === false ? ButtonStyle.Success : ButtonStyle.Danger).setDisabled(!panel),
+    new ButtonBuilder().setCustomId('reactionroles_cfg:delete').setLabel('Delete').setStyle(ButtonStyle.Danger).setEmoji(emoji('delete')).setDisabled(!panel)
+  )];
+  if (panels.length) rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('reactionroles_cfg:select').setPlaceholder('Select a reaction-role panel…')
+      .addOptions(panels.slice(0,25).map((p,i)=>({label:(p.title || `Panel ${i+1}`).slice(0,100),value:p.id,description:`${p.mappings?.length||0} role(s) • ${p.enabled === false ? 'disabled' : 'enabled'}`})))
+  ));
+  if (panel) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
+      new ButtonBuilder().setCustomId(`reactionroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+      new ButtonBuilder().setCustomId(`reactionroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
+    ));
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`reactionroles_cfg:post:${panel.id}`).setLabel(panel.messageId ? 'Post Again' : 'Post Panel').setStyle(ButtonStyle.Success)
+    ));
+    const roles = panel.mappings || [];
+    if (roles.length) rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId(`reactionroles_cfg:remove_role:${panel.id}`).setPlaceholder('Remove a reaction-role mapping…')
+        .addOptions(roles.slice(0,25).map((r,i)=>({label:(r.label || r.emoji || `Role ${i+1}`).slice(0,100),value:r.roleId})) )
+    ));
+  }
+  return rows.slice(0,5);
 }
 function staffApplicationEmbed(cfg) { return featureSetupEmbed('Staff Applications', 'Members press Apply, receive a DM, choose Ready, then answer your questions one by one.', [
   {name:'Questions',value:String((cfg.questions||[]).length),inline:true}, {name:'Application log',value:cfg.logChannelId ? `<#${cfg.logChannelId}>`:'Not set',inline:true}
@@ -740,7 +762,7 @@ module.exports = {
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
-  featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, automodSetupEmbed, automodSetupRows, logSetupEmbed, logSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
+  featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
   embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
