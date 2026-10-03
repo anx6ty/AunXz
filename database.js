@@ -89,13 +89,6 @@ CREATE TABLE IF NOT EXISTS join_tracker (
   timestamp INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS invite_stats (
-  guildId TEXT NOT NULL,
-  userId TEXT NOT NULL,
-  invites INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (guildId, userId)
-);
-
 CREATE TABLE IF NOT EXISTS emoji_overrides (
   name TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -119,8 +112,7 @@ CREATE TABLE IF NOT EXISTS giveaways (
   endsAt INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'configuring',
   participants TEXT NOT NULL DEFAULT '[]',
-  createdAt INTEGER NOT NULL,
-  requiredRoleId TEXT
+  createdAt INTEGER NOT NULL
 );
 `);
 
@@ -146,7 +138,6 @@ ensureColumn('giveaways', 'endsAt', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('giveaways', 'status', "TEXT NOT NULL DEFAULT 'configuring'");
 ensureColumn('giveaways', 'participants', "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn('giveaways', 'createdAt', 'INTEGER NOT NULL DEFAULT 0');
-ensureColumn('giveaways', 'requiredRoleId', 'TEXT');
 
 // Repair old rows that were created before the new fields existed.
 db.prepare("UPDATE giveaways SET durationMs = 86400000 WHERE durationMs IS NULL OR durationMs <= 0").run();
@@ -191,12 +182,14 @@ const DEFAULT_CONFIG = {
   afk: {},
   autorole: { enabled: false, target: 'everyone', roleId: null },
   reactionRoles: { enabled: false, channelId: null, messageId: null, mappings: [] },
+  reactionRolePanels: [],
   suggestions: { enabled: false, channelId: null },
   polls: { enabled: true },
   snipeEnabled: true,
   nsfwFilter: { enabled: false },
   birthdays: { enabled: false, panelChannelId: null, wishChannelId: null, wishMessage: 'Happy Birthday {user}! 🎂', entries: {} },
   buttonRoles: { enabled: false, channelId: null, title: 'Choose your roles', description: 'Press a button to get or remove a role.', image: null, embedType: 'embed', buttons: [] },
+  buttonRolePanels: [],
   staffApplications: { enabled: false, panelChannelId: null, logChannelId: null, title: 'Staff Applications', description: 'Click Apply to start your application.', questions: [], dmIntro: 'Are you ready to start your staff application?', acceptingRoleId: null },
   antibadword: { enabled: false, logChannelId: null, customWords: [], action: 'delete' },
   autoresponder: { enabled: false, ignoreCase: true, triggers: [] },
@@ -206,17 +199,7 @@ const DEFAULT_CONFIG = {
   antibot: { enabled: false, action: 'kick', bypassRoleId: null, logChannelId: null },
   antialt: { enabled: false, action: 'kick', minAccountAgeDays: 7, logChannelId: null },
   starboard: { enabled: false, channelId: null, threshold: 3 },
-  inviteTracker: { enabled: false, rewards: [] },
-  mediaOnly: { channels: [] },
-  securityExtras: {
-    antiinvite: { enabled: false, bypassRoleId: null },
-    antimention: { enabled: false, maxMentions: 5 },
-    anticap: { enabled: false, threshold: 80 },
-    antiscam: { enabled: false },
-    antieveryone: { enabled: false },
-    antiunknownbot: { enabled: false, action: 'kick' },
-    antiweb: { enabled: false }
-  },
+  inviteTracker: { enabled: false },
   maintenance: false,
   blacklist: []
 };
@@ -239,10 +222,48 @@ const upsertConfigStmt = db.prepare(`
   ON CONFLICT(guildId) DO UPDATE SET data = @data
 `);
 
+function normalizeRolePanels(config) {
+  const out = config;
+  if (!Array.isArray(out.buttonRolePanels)) out.buttonRolePanels = [];
+  if (!Array.isArray(out.reactionRolePanels)) out.reactionRolePanels = [];
+
+  // Migrate the old single-panel format in memory. The next save persists the new format.
+  if (!out.buttonRolePanels.length && out.buttonRoles && (
+    out.buttonRoles.channelId || (out.buttonRoles.buttons || []).length || out.buttonRoles.title || out.buttonRoles.image
+  )) {
+    out.buttonRolePanels.push({
+      id: 'legacy-button-panel',
+      enabled: out.buttonRoles.enabled !== false,
+      channelId: out.buttonRoles.channelId || null,
+      title: out.buttonRoles.title || 'Choose your roles',
+      description: out.buttonRoles.description || 'Press a button to get or remove a role.',
+      image: out.buttonRoles.image || null,
+      embedType: out.buttonRoles.embedType || 'embed',
+      buttons: Array.isArray(out.buttonRoles.buttons) ? [...out.buttonRoles.buttons] : []
+    });
+  }
+
+  if (!out.reactionRolePanels.length && out.reactionRoles && (
+    out.reactionRoles.channelId || out.reactionRoles.messageId || (out.reactionRoles.mappings || []).length
+  )) {
+    out.reactionRolePanels.push({
+      id: 'legacy-reaction-panel',
+      enabled: out.reactionRoles.enabled !== false,
+      channelId: out.reactionRoles.channelId || null,
+      messageId: out.reactionRoles.messageId || null,
+      title: 'Choose your roles',
+      description: 'React below to receive or remove a role.',
+      mappings: Array.isArray(out.reactionRoles.mappings) ? [...out.reactionRoles.mappings] : []
+    });
+  }
+
+  return out;
+}
+
 function getConfig(guildId) {
   const row = getConfigStmt.get(guildId);
   const stored = row ? JSON.parse(row.data) : {};
-  return deepMerge(DEFAULT_CONFIG, stored);
+  return normalizeRolePanels(deepMerge(DEFAULT_CONFIG, stored));
 }
 
 function saveConfig(guildId, partial) {
@@ -274,11 +295,11 @@ function topLevels(guildId, limit = 10) {
 // ---------- giveaways ----------
 const insertGiveawayStmt = db.prepare(`
   INSERT INTO giveaways
-  (guildId, channelId, messageId, hostId, prize, winners, durationMs, endsAt, status, participants, createdAt, requiredRoleId)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  (guildId, channelId, messageId, hostId, prize, winners, durationMs, endsAt, status, participants, createdAt)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const getGiveawayStmt = db.prepare('SELECT * FROM giveaways WHERE id = ? AND guildId = ?');
-const updateGiveawayStmt = db.prepare('UPDATE giveaways SET channelId=?, messageId=?, prize=?, winners=?, durationMs=?, endsAt=?, status=?, participants=?, requiredRoleId=? WHERE id=? AND guildId=?');
+const updateGiveawayStmt = db.prepare('UPDATE giveaways SET channelId=?, messageId=?, prize=?, winners=?, durationMs=?, endsAt=?, status=?, participants=? WHERE id=? AND guildId=?');
 const listGiveawaysStmt = db.prepare('SELECT * FROM giveaways WHERE guildId = ? ORDER BY createdAt DESC LIMIT ?');
 
 function createGiveaway(guildId, hostId, data = {}) {
@@ -288,7 +309,7 @@ function createGiveaway(guildId, hostId, data = {}) {
     guildId, data.channelId || null, data.messageId || null, hostId,
     String(data.prize || 'Giveaway'), Math.max(1, Number(data.winners || 1)),
     durationMs, Number(data.endsAt || now + durationMs),
-    data.status || 'configuring', JSON.stringify(data.participants || []), now, data.requiredRoleId || null
+    data.status || 'configuring', JSON.stringify(data.participants || []), now
   );
   return getGiveawayStmt.get(result.lastInsertRowid, guildId);
 }
@@ -300,11 +321,35 @@ function updateGiveaway(guildId, id, patch = {}) {
   updateGiveawayStmt.run(
     next.channelId, next.messageId, next.prize, next.winners, next.durationMs,
     next.endsAt, next.status, typeof next.participants === 'string' ? next.participants : JSON.stringify(next.participants || []),
-    next.requiredRoleId || null, id, guildId
+    id, guildId
   );
   return getGiveaway(guildId, id);
 }
 function listGiveaways(guildId, limit = 25) { return listGiveawaysStmt.all(guildId, limit); }
+
+// ---------- role panel helpers ----------
+function findPanel(guildId, kind, panelId) {
+  const cfg = getConfig(guildId);
+  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
+  return (cfg[key] || []).find(p => p.id === panelId) || null;
+}
+
+function upsertPanel(guildId, kind, panel) {
+  const cfg = getConfig(guildId);
+  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
+  const list = [...(cfg[key] || [])];
+  const index = list.findIndex(p => p.id === panel.id);
+  if (index >= 0) list[index] = { ...list[index], ...panel };
+  else list.push(panel);
+  return saveConfig(guildId, { [key]: list });
+}
+
+function removePanel(guildId, kind, panelId) {
+  const cfg = getConfig(guildId);
+  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
+  const list = (cfg[key] || []).filter(p => p.id !== panelId);
+  return saveConfig(guildId, { [key]: list });
+}
 
 // ---------- warns ----------
 const addWarnStmt = db.prepare('INSERT INTO warns (guildId, userId, moderatorId, reason, timestamp) VALUES (?, ?, ?, ?, ?)');
@@ -427,20 +472,6 @@ function recentJoinCount(guildId, windowSeconds) {
   return recentJoinsStmt.get(guildId, Date.now() - windowSeconds * 1000).c;
 }
 
-// ---------- invite rewards ----------
-const getInviteStatsStmt = db.prepare('SELECT * FROM invite_stats WHERE guildId = ? AND userId = ?');
-const upsertInviteStatsStmt = db.prepare(`
-  INSERT INTO invite_stats (guildId, userId, invites) VALUES (?, ?, ?)
-  ON CONFLICT(guildId, userId) DO UPDATE SET invites = excluded.invites
-`);
-function getInviteCount(guildId, userId) { return getInviteStatsStmt.get(guildId, userId)?.invites || 0; }
-function addInviteCount(guildId, userId, amount = 1) {
-  const next = getInviteCount(guildId, userId) + Number(amount || 1);
-  upsertInviteStatsStmt.run(guildId, userId, next);
-  return next;
-}
-function setInviteCount(guildId, userId, count) { upsertInviteStatsStmt.run(guildId, userId, Math.max(0, Number(count || 0))); }
-
 // ---------- emoji overrides (bot-wide, owner-configurable via /emoji) ----------
 const getEmojiStmt = db.prepare('SELECT value FROM emoji_overrides WHERE name = ?');
 const setEmojiStmt = db.prepare(`
@@ -486,7 +517,7 @@ function getEmojiSnapshot(code) {
 
 module.exports = {
   db, DEFAULT_CONFIG,
-  getConfig, saveConfig,
+  getConfig, saveConfig, findPanel, upsertPanel, removePanel,
   getLevel, setLevel, topLevels,
   addWarn, getWarns, clearWarns,
   createTicket, getTicket, closeTicket, setTicketStatus, openTicketForUser, openTicketsForUser,
@@ -494,7 +525,7 @@ module.exports = {
   addToWhitelist, removeFromWhitelist, isWhitelisted,
   logAction, recentActions,
   getStickyRoles, setStickyRoles,
-  bumpSpam, trackJoin, recentJoinCount, getInviteCount, addInviteCount, setInviteCount,
+  bumpSpam, trackJoin, recentJoinCount,
   getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
   saveEmojiSnapshot, getEmojiSnapshot, DB_PATH, DATA_DIR,
   createGiveaway, getGiveaway, updateGiveaway, listGiveaways,
