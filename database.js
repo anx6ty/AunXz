@@ -156,7 +156,7 @@ const DEFAULT_CONFIG = {
   welcome: { enabled: false, channel: null, message: 'Welcome {user} to {server}! You are member #{count}.', autoroleId: null },
   leave: { enabled: false, channel: null, message: '{user} has left the server.' },
   boost: { enabled: false, channel: null, message: '{user} just boosted the server! Thank you! 🚀' },
-  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null },
+  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null, audioPath: null, mode: 'tts' },
   greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!', image: null },
   antinuke: {
     enabled: false, punishment: 'ban', // ban | kick | strip_roles
