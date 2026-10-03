@@ -1671,7 +1671,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  if (auto.enabled) {
-    const letters = message.content.match(/[A-Za-z]/g) || [];
-    const upper = message.content.match(/[A-Z]/g) || [];
-    const capsPct = letters.length ? (upper.length / letters.len
+  // AutoMod filters are independent switches. The old file was truncated here,
+  // leaving an unfinished expression and preventing Node from starting.
+  if (auto.enabled !== false) {
+    const letters = 
