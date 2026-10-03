@@ -3,6 +3,8 @@
 // system testable/readable on its own.
 
 const { PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 const {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
   AudioPlayerStatus, VoiceConnectionStatus, StreamType, entersState, getVoiceConnection,
@@ -12,6 +14,19 @@ const googleTTS = require('google-tts-api');
 const db = require('./database');
 const ui = require('./ui');
 const { Readable } = require('stream');
+
+// Make the bundled ffmpeg-static binary discoverable to prism-media/@discordjs/voice.
+try {
+  const ffmpegPath = require('ffmpeg-static');
+  if (ffmpegPath) {
+    process.env.FFMPEG_BIN = ffmpegPath;
+    process.env.FFMPEG_PATH = ffmpegPath;
+    const ffmpegDir = path.dirname(ffmpegPath);
+    process.env.PATH = `${ffmpegDir}${path.delimiter}${process.env.PATH || ''}`;
+  }
+} catch (e) {
+  console.warn('[AunXz] ffmpeg-static could not be loaded:', e.message);
+}
 
 // Keep one persistent connection per guild so the bot "won't leave" the greetvoice VC.
 const persistentConnections = new Map(); // guildId -> connection
@@ -68,7 +83,37 @@ function downloadAudio(url) {
   });
 }
 
-async function playTTSInChannel(guild, vcId, prompt) {
+function binaryDownload(url, label = 'audio') {
+  return new Promise((resolve, reject) => {
+    const client = String(url).startsWith('http://') ? require('http') : require('https');
+    const request = client.get(url, { headers: { 'User-Agent': 'AunXz/1.0' } }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return binaryDownload(res.headers.location, label).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`${label} download failed with HTTP ${res.statusCode}.`));
+      }
+      const chunks = [];
+      let size = 0;
+      res.on('data', chunk => {
+        size += chunk.length;
+        if (size > 25 * 1024 * 1024) {
+          request.destroy(new Error(`${label} is larger than 25 MB.`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    request.setTimeout(20000, () => request.destroy(new Error(`${label} download timed out.`)));
+    request.on('error', reject);
+  });
+}
+
+async function playAudioInput(guild, vcId, input, label = 'audio') {
   const channel = guild.channels.cache.get(vcId);
   if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Welcome voice channel was not found.');
 
@@ -81,18 +126,11 @@ async function playTTSInChannel(guild, vcId, prompt) {
   }
 
   const connection = await joinAndStayInVC(channel);
-  const text = String(prompt || 'Welcome!').trim().slice(0, 200) || 'Welcome!';
-  const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
-  const buffer = await downloadAudio(url);
-  if (!buffer.length) throw new Error('TTS returned an empty audio file.');
-
-  // MP3 is an arbitrary input, so @discordjs/voice must transcode it through FFmpeg
-  // and then encode it to Opus before Discord can play it.
   const player = createAudioPlayer({ behaviors: { noSubscriber: 'stop' } });
   const subscription = connection.subscribe(player);
   if (!subscription) throw new Error('The bot could not subscribe its audio player to the voice connection.');
 
-  const resource = createAudioResource(Readable.from(buffer), {
+  const resource = createAudioResource(input, {
     inputType: StreamType.Arbitrary,
     silencePaddingFrames: 5
   });
@@ -106,20 +144,57 @@ async function playTTSInChannel(guild, vcId, prompt) {
       try { player.stop(true); } catch {}
       err ? reject(err) : resolve();
     };
-    const timer = setTimeout(() => finish(new Error('TTS playback timed out after 25 seconds.')), 25000);
+    const timer = setTimeout(() => finish(new Error(`${label} playback timed out after 45 seconds.`)), 45000);
     player.once(AudioPlayerStatus.Idle, () => finish());
     player.once('error', err => finish(new Error(`Voice audio playback failed: ${err.message || err}`)));
-    try {
-      player.play(resource);
-    } catch (e) {
-      finish(e);
-    }
+    try { player.play(resource); } catch (e) { finish(e); }
   }).catch(err => {
     let dependency = '';
     try { dependency = generateDependencyReport(); } catch {}
     if (dependency) console.error('[AunXz] Voice dependency report:\n' + dependency);
     throw err;
   });
+}
+
+async function playTTSInChannel(guild, vcId, prompt) {
+  const text = String(prompt || 'Welcome!').trim().slice(0, 200) || 'Welcome!';
+  const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+  const buffer = await binaryDownload(url, 'TTS audio');
+  if (!buffer.length) throw new Error('TTS returned an empty audio file.');
+  return playAudioInput(guild, vcId, Readable.from(buffer), 'TTS');
+}
+
+async function saveGreetvoiceAudio(guildId, attachment) {
+  if (!attachment?.url) throw new Error('No audio attachment was provided.');
+  const name = String(attachment.name || '').toLowerCase();
+  const type = String(attachment.contentType || '').toLowerCase();
+  const audioByType = type.startsWith('audio/');
+  const audioByExt = /\.(mp3|wav|ogg|oga|opus|webm|m4a|aac|flac)$/i.test(name);
+  if (!audioByType && !audioByExt) throw new Error('Please upload an audio file such as MP3, WAV, OGG, M4A, AAC, or FLAC.');
+
+  const dir = path.join(db.DATA_DIR, 'greetvoice');
+  await fs.promises.mkdir(dir, { recursive: true });
+  const extMatch = name.match(/\.[a-z0-9]+$/i);
+  const ext = extMatch ? extMatch[0].toLowerCase() : '.audio';
+  const target = path.join(dir, `${guildId}${ext}`);
+  const buffer = await binaryDownload(attachment.url, 'Greet Voice audio');
+  await fs.promises.writeFile(target, buffer);
+  return target;
+}
+
+async function removeGreetvoiceAudio(audioPath) {
+  if (!audioPath) return;
+  const resolved = path.resolve(audioPath);
+  const root = path.resolve(path.join(db.DATA_DIR, 'greetvoice'));
+  if (!resolved.startsWith(root + path.sep)) return;
+  await fs.promises.unlink(resolved).catch(() => {});
+}
+
+async function playGreetvoiceGreeting(guild, cfg) {
+  if (cfg.mode === 'audio' && cfg.audioPath) return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
+  if (cfg.ttsPrompt) return playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
+  if (cfg.audioPath) return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
+  throw new Error('No TTS prompt or uploaded audio is configured.');
 }
 
 // ===================================================================================
@@ -300,14 +375,22 @@ async function handleAntispam(message) {
 // GREETVOICE — role lockdown + TTS join/leave gate
 // ===================================================================================
 async function lockRoleToSingleChannel(guild, role, allowedChannelId) {
+  const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+  if (!me?.permissions.has(PermissionFlagsBits.ManageRoles) && !me?.permissions.has(PermissionFlagsBits.Administrator)) {
+    throw new Error('I need **Manage Roles** to configure the Greet Voice gate role.');
+  }
+  if (role.position >= me.roles.highest.position) {
+    throw new Error(`I cannot manage **${role.name}** because it is equal to or higher than my highest role.`);
+  }
+  const jobs = [];
   for (const [, channel] of guild.channels.cache) {
     if (!channel.permissionOverwrites) continue;
-    if (channel.id === allowedChannelId) {
-      await channel.permissionOverwrites.edit(role, { ViewChannel: true, Connect: true }).catch(() => {});
-    } else {
-      await channel.permissionOverwrites.edit(role, { ViewChannel: false }).catch(() => {});
-    }
+    const patch = channel.id === allowedChannelId
+      ? { ViewChannel: true, Connect: true }
+      : { ViewChannel: false };
+    jobs.push(channel.permissionOverwrites.edit(role, patch));
   }
+  await Promise.allSettled(jobs);
 }
 
 // Called from channelCreate — keeps the greetvoice role locked out of any brand new channel.
@@ -328,7 +411,17 @@ async function onMemberJoinGreetvoice(member) {
   if (!cfg.enabled || !cfg.roleId || !cfg.vcId) return;
   const role = member.guild.roles.cache.get(cfg.roleId);
   if (!role) return;
-  await member.roles.add(role, 'greetvoice gate').catch(() => {});
+  const bot = member.guild.members.me;
+  if (!bot?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= bot.roles.highest.position) {
+    const log = await getLogChannel(member.guild, 'voice');
+    if (log) log.send({ embeds: [ui.errorEmbed('🔊 Greet Voice Role Failed', `I cannot assign <@&${role.id}>. Give me **Manage Roles** and move my bot role above the gate role.`)] }).catch(() => {});
+    return;
+  }
+  const added = await member.roles.add(role, 'greetvoice gate').then(() => true).catch(() => false);
+  if (!added) {
+    const log = await getLogChannel(member.guild, 'voice');
+    if (log) log.send({ embeds: [ui.errorEmbed('🔊 Greet Voice Role Failed', `Discord rejected the role assignment for ${member}. Check my **Manage Roles** permission and role hierarchy.`)] }).catch(() => {});
+  }
 }
 
 // TTS playback handled here so events.js just calls this on voiceStateUpdate.
@@ -342,7 +435,7 @@ async function onVoiceJoinGreetvoice(oldState, newState) {
 
   let played = false;
   try {
-    await playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
+    await playGreetvoiceGreeting(guild, cfg);
     played = true;
   } catch (e) {
     console.error('greetvoice TTS failed:', e);
@@ -362,6 +455,11 @@ async function onVoiceJoinGreetvoice(oldState, newState) {
     await freshMember.voice.disconnect('greetvoice complete').catch(() => {});
   }
   await freshMember?.roles.remove(role, 'greetvoice complete').catch(() => {});
+}
+
+async function handleVoiceStateUpdate(oldState, newState) {
+  await handleVoicemasterJoin(oldState, newState);
+  await onVoiceJoinGreetvoice(oldState, newState);
 }
 
 // ===================================================================================
@@ -513,7 +611,7 @@ async function handleAutoreactor(message) {
 const embedBuilderSessions = new Map();
 
 module.exports = {
-  joinAndStayInVC, playTTSInChannel,
+  joinAndStayInVC, playTTSInChannel, playAudioInput, playGreetvoiceGreeting, saveGreetvoiceAudio, removeGreetvoiceAudio,
   antinukeStrike, findAuditExecutor, getLogChannel,
   handleAntiraidJoin,
   handleAntiBotJoin, handleAntiAltJoin, handleAntiWebhookUpdate,
@@ -521,7 +619,7 @@ module.exports = {
   handleAntispam,
   lockRoleToSingleChannel, onChannelCreateGreetvoiceSync, onMemberJoinGreetvoice, onVoiceJoinGreetvoice,
   xpForLevel, handleLevelingMessage,
-  handleVoicemasterJoin,
+  handleVoicemasterJoin, handleVoiceStateUpdate,
   handleAutoresponder, handleAutoreactor,
   embedBuilderSessions
 };
