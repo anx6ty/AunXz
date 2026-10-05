@@ -1677,4 +1677,210 @@ client.on('messageCreate', async (message) => {
   // Setup image/GIF uploads are consumed before command parsing and removed after saving.
   if (await consumeSetupMedia(message)) return;
 
-  // Mentioning the bot without another command gives a server-specific quick start.
+   // Mentioning the bot without another command gives a server-specific quick start.
+  const mentionOnly = new RegExp(`^<@!?${client.user.id}>\\s*$`);
+
+  if (mentionOnly.test(message.content.trim())) {
+    const prefix = cfgAll.prefix || '!';
+    return message.reply({
+      embeds: [
+        ui.base(`🤖 ${client.user.username}`)
+          .setDescription(
+            `Welcome to **${message.guild.name}**!\n\n` +
+            `Start with **${prefix}help** or **/help** to see what I can do.\n\n` +
+            `**Server Prefix:** \`${prefix}\`\n` +
+            `**Bot Ping:** \`${client.ws.ping}ms\``
+          )
+      ]
+    }).catch(() => {});
+  }
+
+  const handled = await handlePrefixCommand(message).catch(err => {
+    console.error('Prefix command error:', err);
+    return false;
+  });
+  if (handled) return;
+
+  const cfg = db.getConfig(message.guild.id);
+
+  // Anti-link
+  if (
+    cfg.antilink.enabled &&
+    /(?:https?:\/\/|www\.|discord\.gg\/|discord(?:app)?\.com\/invite\/)/i.test(message.content) &&
+    !message.member?.permissions.has(PermissionFlagsBits.ManageMessages)
+  ) {
+    await message.delete().catch(() => {});
+    const log = await sys.getLogChannel(message.guild, 'message');
+    if (log?.isTextBased()) {
+      log.send({
+        embeds: [
+          ui.errorEmbed(
+            '🔗 Anti-Link',
+            `**User:** ${message.author}\n**Channel:** ${message.channel}`
+          )
+        ]
+      }).catch(() => {});
+    }
+    return;
+  }
+
+  // Anti-spam
+  if (cfg.antispam.enabled) {
+    const result = sys.handleAntispam?.(message);
+    if (result?.blocked) return;
+  }
+
+  // Leveling
+  if (cfg.leveling.enabled) {
+    sys.handleLevelingMessage?.(message).catch(() => {});
+  }
+
+  // Auto responders
+  if (cfg.autoresponder?.enabled) {
+    const triggers = cfg.autoresponder.triggers || [];
+    for (const trigger of triggers) {
+      const content = message.content.toLowerCase();
+      const matchText = String(trigger.match || '').toLowerCase();
+
+      const matched = trigger.mode === 'exact'
+        ? content === matchText
+        : content.includes(matchText);
+
+      if (matched) {
+        await message.channel.send(trigger.response).catch(() => {});
+        break;
+      }
+    }
+  }
+
+  // Auto reactors
+  if (cfg.autoreactor?.enabled) {
+    const triggers = cfg.autoreactor.triggers || [];
+
+    for (const trigger of triggers) {
+      const content = message.content.toLowerCase();
+      const matchText = String(trigger.match || '').toLowerCase();
+
+      const matched = trigger.mode === 'exact'
+        ? content === matchText
+        : content.includes(matchText);
+
+      if (!matched) continue;
+
+      for (const emoji of trigger.emojis || []) {
+        await message.react(emoji).catch(() => {});
+      }
+      break;
+    }
+  }
+
+  // Anti-badword
+  const bad = cfg.antibadword;
+  if (bad?.enabled !== false) {
+    const words = [
+      ...(bad.words || []),
+      ...(bad.customWords || [])
+    ].map(x => String(x).toLowerCase()).filter(Boolean);
+
+    if (
+      words.length &&
+      words.some(word => message.content.toLowerCase().includes(word)) &&
+      !message.member?.permissions.has(PermissionFlagsBits.ManageMessages)
+    ) {
+      await message.delete().catch(() => {});
+
+      const log = await sys.getLogChannel(message.guild, 'message');
+      if (log?.isTextBased()) {
+        log.send({
+          embeds: [
+            ui.errorEmbed(
+              '🚫 Bad Word Filter',
+              `**User:** ${message.author}\n**Channel:** ${message.channel}`
+            )
+          ]
+        }).catch(() => {});
+      }
+
+      return;
+    }
+  }
+
+  // AutoMod filters are independent switches.
+  const auto = cfg.automod;
+
+  if (auto.enabled !== false) {
+    const letters = message.content.replace(/[^A-Za-z]/g, '');
+
+    if (auto.capsFilter && letters.length >= 8) {
+      const caps = letters.replace(/[^A-Z]/g, '').length;
+
+      if ((caps / letters.length) * 100 >= (auto.capsThreshold || 70)) {
+        await message.delete().catch(() => {});
+
+        const log = await sys.getLogChannel(message.guild, 'message');
+        if (log?.isTextBased()) {
+          log.send({
+            embeds: [
+              ui.errorEmbed(
+                '🔠 Caps Filter',
+                `**User:** ${message.author}\n**Channel:** ${message.channel}`
+              )
+            ]
+          }).catch(() => {});
+        }
+
+        return;
+      }
+    }
+
+    if (
+      auto.inviteFilter &&
+      /(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i.test(message.content)
+    ) {
+      if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+        await message.delete().catch(() => {});
+
+        const log = await sys.getLogChannel(message.guild, 'message');
+        if (log?.isTextBased()) {
+          log.send({
+            embeds: [
+              ui.errorEmbed(
+                '🔗 Invite Filter',
+                `**User:** ${message.author}\n**Channel:** ${message.channel}`
+              )
+            ]
+          }).catch(() => {});
+        }
+
+        return;
+      }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// voiceStateUpdate — Voicemaster hub → temp channel creation, auto-cleanup,
+// greetvoice gate handling. All logic lives in systems.js; this just forwards.
+// ---------------------------------------------------------------------------------
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  await sys.handleVoiceStateUpdate(oldState, newState)
+    .catch(err => console.error('voiceStateUpdate:', err));
+});
+
+// ---------------------------------------------------------------------------------
+// Periodic tasks
+// ---------------------------------------------------------------------------------
+setInterval(
+  () => sendBirthdayWishes().catch(console.error),
+  60 * 60 * 1000
+);
+
+sendBirthdayWishes().catch(() => {});
+
+// ---------------------------------------------------------------------------------
+// Login
+// ---------------------------------------------------------------------------------
+client.login(process.env.DISCORD_TOKEN).catch(err => {
+  console.error('Failed to log in:', err);
+  process.exit(1);
+});
