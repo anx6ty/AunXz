@@ -3,11 +3,19 @@
 // interactionCreate to the right handler by command name.
 
 const {
-  SlashCommandBuilder, PermissionFlagsBits, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  ChannelType,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ApplicationIntegrationType,
+  InteractionContextType
 } = require('discord.js');
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
+const templates = require('./template');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const isOwner = (id) => OWNER_IDS.includes(id);
@@ -60,6 +68,151 @@ function actionPreflight(interaction, target, permission, permissionLabel, actio
 }
 
 const commands = [];
+
+
+// ---------------------------------------------------------------------------------
+// /template — portable server templates.
+// This command supports both User Install and Guild Install so the app can appear
+// in servers where AunXz has not been installed as a bot yet.
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder()
+    .setName('template')
+    .setDescription('Save or load a portable AunXz server template.')
+    .setIntegrationTypes(
+      ApplicationIntegrationType.UserInstall,
+      ApplicationIntegrationType.GuildInstall
+    )
+    .setContexts(InteractionContextType.Guild)
+    .addSubcommand(s => s
+      .setName('save')
+      .setDescription('Save this server as a portable template code.'))
+    .addSubcommand(s => s
+      .setName('load')
+      .setDescription('Rebuild this server from a template code.')
+      .addStringOption(o => o
+        .setName('code')
+        .setDescription('VX-TPL template code.')
+        .setRequired(true)
+        .setMaxLength(templates.MAX_CODE_LENGTH))
+      .addBooleanOption(o => o
+        .setName('confirm')
+        .setDescription('Confirm that the current server layout may be replaced.')
+        .setRequired(true))),
+
+  async execute(interaction) {
+    const sub = interaction.options.getSubcommand();
+
+    // A user-installed app can receive the command in a server where the bot
+    // itself is not a member. Discord does not give it the full guild structure.
+    if (sub === 'save') {
+      const guild = interaction.guild;
+      if (!guild) {
+        return interaction.reply({
+          embeds: [ui.errorEmbed(
+            'AunXz Bot Required',
+            'The app is installed to your account, but AunXz is not installed as a bot in this server. Discord does not provide the full server structure to a user-installed app, so a complete template cannot be exported here. Install AunXz in this server and run **/template save** again.'
+          )],
+          ephemeral: true
+        });
+      }
+
+      try {
+        const bot = guild.members?.me || await guild.members.fetchMe().catch(() => null);
+        if (!bot) {
+          return interaction.reply({
+            embeds: [ui.errorEmbed(
+              'AunXz Bot Required',
+              'AunXz must also be installed in this server as a bot to export the complete server layout. No Administrator permission is required for **/template save**.'
+            )],
+            ephemeral: true
+          });
+        }
+
+        const code = templates.encodeSnapshot(templates.createSnapshot(guild));
+        return interaction.reply({
+          embeds: [ui.okEmbed(
+            '📦 Template Saved',
+            'Your portable signed template is ready. Copy the code below and use **/template load** in another server where AunXz is installed as a bot.\n\n```\n' + code + '\n```'
+          )],
+          ephemeral: true
+        });
+      } catch (e) {
+        return interaction.reply({
+          embeds: [ui.errorEmbed('Template Save Failed', String(e.message || e))],
+          ephemeral: true
+        });
+      }
+    }
+
+    if (!interaction.guild) {
+      return interaction.reply({
+        embeds: [ui.errorEmbed('Server Only', 'Use **/template load** inside a server where AunXz is installed as a bot.')],
+        ephemeral: true
+      });
+    }
+
+    if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({
+        embeds: [ui.errorEmbed('Administrator Required', 'Only an Administrator can load a complete server template.')],
+        ephemeral: true
+      });
+    }
+
+    const bot = interaction.guild.members?.me || await interaction.guild.members.fetchMe().catch(() => null);
+    if (!bot) {
+      return interaction.reply({
+        embeds: [ui.errorEmbed('AunXz Is Not Installed', 'Install AunXz in this server as a bot before using **/template load**.')],
+        ephemeral: true
+      });
+    }
+
+    if (!interaction.options.getBoolean('confirm', true)) {
+      return interaction.reply({
+        embeds: [ui.errorEmbed(
+          'Confirmation Required',
+          'Loading a template replaces current user-created channels and roles. Re-run **/template load** with **confirm: True** when ready.'
+        )],
+        ephemeral: true
+      });
+    }
+
+    let snapshot;
+    try {
+      snapshot = templates.decodeSnapshot(interaction.options.getString('code', true));
+    } catch (e) {
+      return interaction.reply({
+        embeds: [ui.errorEmbed('Invalid Template', String(e.message || e))],
+        ephemeral: true
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const result = await templates.loadSnapshot(interaction.guild, snapshot, async stage => {
+        await interaction.editReply({
+          embeds: [ui.base('🔄 Loading Server Template').setDescription('**' + stage + '**')]
+        }).catch(() => {});
+      });
+
+      const warning = result.failed.length
+        ? '\n\n**' + result.failed.length + ' item(s) failed:**\n' + result.failed.slice(0, 8).map(x => '• ' + x).join('\n')
+        : '';
+
+      return interaction.editReply({
+        embeds: [ui.okEmbed(
+          '✅ Template Loaded',
+          'Created **' + result.channelsCreated + ' channels** and **' + result.rolesCreated + ' roles**.' + warning
+        )]
+      });
+    } catch (e) {
+      return interaction.editReply({
+        embeds: [ui.errorEmbed('Template Load Failed', String(e.message || e))]
+      });
+    }
+  }
+});
 
 
 // ---------------------------------------------------------------------------------
