@@ -8,9 +8,7 @@ const {
   ChannelType,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle,
-  ApplicationIntegrationType,
-  InteractionContextType
+  ButtonStyle
 } = require('discord.js');
 const db = require('./database');
 const ui = require('./ui');
@@ -79,11 +77,6 @@ commands.push({
   data: new SlashCommandBuilder()
     .setName('template')
     .setDescription('Save or load a portable AunXz server template.')
-    .setIntegrationTypes(
-      ApplicationIntegrationType.UserInstall,
-      ApplicationIntegrationType.GuildInstall
-    )
-    .setContexts(InteractionContextType.Guild)
     .addSubcommand(s => s
       .setName('save')
       .setDescription('Save this server as a portable template code.'))
