@@ -6,7 +6,7 @@ const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
   StringSelectMenuBuilder, RoleSelectMenuBuilder, ChannelSelectMenuBuilder, ButtonBuilder, ButtonStyle,
-  PermissionFlagsBits, AuditLogEvent
+  PermissionFlagsBits, AuditLogEvent, ApplicationIntegrationType, InteractionContextType
 } = require('discord.js');
 
 const db = require('./database');
@@ -42,6 +42,21 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
   const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
+
+  // Make public commands available to both normal guild installs and account/user installs.
+  // A command that needs server-side bot access can still reject the interaction at runtime.
+  // /template is explicitly configured in commands.js and therefore works in both contexts.
+  for (const command of publicBody) {
+    if (!Array.isArray(command.integration_types)) {
+      command.integration_types = [
+        ApplicationIntegrationType.GuildInstall,
+        ApplicationIntegrationType.UserInstall
+      ];
+    }
+    if (!Array.isArray(command.contexts)) {
+      command.contexts = [InteractionContextType.Guild];
+    }
+  }
 
   // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
   // propagate on first deploy; instant after that on updates within the same command set).
@@ -1663,224 +1678,4 @@ async function handleReactionRole(reaction, user, adding) {
 client.on('messageReactionAdd', (reaction, user) => handleReactionRole(reaction, user, true));
 client.on('messageReactionRemove', (reaction, user) => handleReactionRole(reaction, user, false));
 
-// ---------------------------------------------------------------------------------
-// messageCreate — antilink, antispam, leveling, automod, prefix-less utility
-// ---------------------------------------------------------------------------------
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-
-  // Staff applications happen in DMs and intentionally have no guild.
-  if (!message.guild) return handleApplicationDM(message).catch(console.error);
-
-  const cfgAll = db.getConfig(message.guild.id);
-
-  // Setup image/GIF uploads are consumed before command parsing and removed after saving.
-  if (await consumeSetupMedia(message)) return;
-
-   // Mentioning the bot without another command gives a server-specific quick start.
-  const mentionOnly = new RegExp(`^<@!?${client.user.id}>\\s*$`);
-
-  if (mentionOnly.test(message.content.trim())) {
-    const prefix = cfgAll.prefix || '!';
-    return message.reply({
-      embeds: [
-        ui.base(`🤖 ${client.user.username}`)
-          .setDescription(
-            `Welcome to **${message.guild.name}**!\n\n` +
-            `Start with **${prefix}help** or **/help** to see what I can do.\n\n` +
-            `**Server Prefix:** \`${prefix}\`\n` +
-            `**Bot Ping:** \`${client.ws.ping}ms\``
-          )
-      ]
-    }).catch(() => {});
-  }
-
-  const handled = await handlePrefixCommand(message).catch(err => {
-    console.error('Prefix command error:', err);
-    return false;
-  });
-  if (handled) return;
-
-  const cfg = db.getConfig(message.guild.id);
-
-  // Anti-link
-  if (
-    cfg.antilink.enabled &&
-    /(?:https?:\/\/|www\.|discord\.gg\/|discord(?:app)?\.com\/invite\/)/i.test(message.content) &&
-    !message.member?.permissions.has(PermissionFlagsBits.ManageMessages)
-  ) {
-    await message.delete().catch(() => {});
-    const log = await sys.getLogChannel(message.guild, 'message');
-    if (log?.isTextBased()) {
-      log.send({
-        embeds: [
-          ui.errorEmbed(
-            '🔗 Anti-Link',
-            `**User:** ${message.author}\n**Channel:** ${message.channel}`
-          )
-        ]
-      }).catch(() => {});
-    }
-    return;
-  }
-
-  // Anti-spam
-  if (cfg.antispam.enabled) {
-    const result = sys.handleAntispam?.(message);
-    if (result?.blocked) return;
-  }
-
-  // Leveling
-  if (cfg.leveling.enabled) {
-    sys.handleLevelingMessage?.(message).catch(() => {});
-  }
-
-  // Auto responders
-  if (cfg.autoresponder?.enabled) {
-    const triggers = cfg.autoresponder.triggers || [];
-    for (const trigger of triggers) {
-      const content = message.content.toLowerCase();
-      const matchText = String(trigger.match || '').toLowerCase();
-
-      const matched = trigger.mode === 'exact'
-        ? content === matchText
-        : content.includes(matchText);
-
-      if (matched) {
-        await message.channel.send(trigger.response).catch(() => {});
-        break;
-      }
-    }
-  }
-
-  // Auto reactors
-  if (cfg.autoreactor?.enabled) {
-    const triggers = cfg.autoreactor.triggers || [];
-
-    for (const trigger of triggers) {
-      const content = message.content.toLowerCase();
-      const matchText = String(trigger.match || '').toLowerCase();
-
-      const matched = trigger.mode === 'exact'
-        ? content === matchText
-        : content.includes(matchText);
-
-      if (!matched) continue;
-
-      for (const emoji of trigger.emojis || []) {
-        await message.react(emoji).catch(() => {});
-      }
-      break;
-    }
-  }
-
-  // Anti-badword
-  const bad = cfg.antibadword;
-  if (bad?.enabled !== false) {
-    const words = [
-      ...(bad.words || []),
-      ...(bad.customWords || [])
-    ].map(x => String(x).toLowerCase()).filter(Boolean);
-
-    if (
-      words.length &&
-      words.some(word => message.content.toLowerCase().includes(word)) &&
-      !message.member?.permissions.has(PermissionFlagsBits.ManageMessages)
-    ) {
-      await message.delete().catch(() => {});
-
-      const log = await sys.getLogChannel(message.guild, 'message');
-      if (log?.isTextBased()) {
-        log.send({
-          embeds: [
-            ui.errorEmbed(
-              '🚫 Bad Word Filter',
-              `**User:** ${message.author}\n**Channel:** ${message.channel}`
-            )
-          ]
-        }).catch(() => {});
-      }
-
-      return;
-    }
-  }
-
-  // AutoMod filters are independent switches.
-  const auto = cfg.automod;
-
-  if (auto.enabled !== false) {
-    const letters = message.content.replace(/[^A-Za-z]/g, '');
-
-    if (auto.capsFilter && letters.length >= 8) {
-      const caps = letters.replace(/[^A-Z]/g, '').length;
-
-      if ((caps / letters.length) * 100 >= (auto.capsThreshold || 70)) {
-        await message.delete().catch(() => {});
-
-        const log = await sys.getLogChannel(message.guild, 'message');
-        if (log?.isTextBased()) {
-          log.send({
-            embeds: [
-              ui.errorEmbed(
-                '🔠 Caps Filter',
-                `**User:** ${message.author}\n**Channel:** ${message.channel}`
-              )
-            ]
-          }).catch(() => {});
-        }
-
-        return;
-      }
-    }
-
-    if (
-      auto.inviteFilter &&
-      /(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i.test(message.content)
-    ) {
-      if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
-        await message.delete().catch(() => {});
-
-        const log = await sys.getLogChannel(message.guild, 'message');
-        if (log?.isTextBased()) {
-          log.send({
-            embeds: [
-              ui.errorEmbed(
-                '🔗 Invite Filter',
-                `**User:** ${message.author}\n**Channel:** ${message.channel}`
-              )
-            ]
-          }).catch(() => {});
-        }
-
-        return;
-      }
-    }
-  }
-});
-
-// ---------------------------------------------------------------------------------
-// voiceStateUpdate — Voicemaster hub → temp channel creation, auto-cleanup,
-// greetvoice gate handling. All logic lives in systems.js; this just forwards.
-// ---------------------------------------------------------------------------------
-client.on('voiceStateUpdate', async (oldState, newState) => {
-  await sys.handleVoiceStateUpdate(oldState, newState)
-    .catch(err => console.error('voiceStateUpdate:', err));
-});
-
-// ---------------------------------------------------------------------------------
-// Periodic tasks
-// ---------------------------------------------------------------------------------
-setInterval(
-  () => sendBirthdayWishes().catch(console.error),
-  60 * 60 * 1000
-);
-
-sendBirthdayWishes().catch(() => {});
-
-// ---------------------------------------------------------------------------------
-// Login
-// ---------------------------------------------------------------------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('Failed to log in:', err);
-  process.exit(1);
-});
+// ------------------------------------------------------------------------
