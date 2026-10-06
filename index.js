@@ -1,12 +1,20 @@
 // index.js — boots the client, registers slash commands, and wires every Discord event
 // to the systems/commands/ui modules. This is the only file that touches gateway events.
 
+process.on('uncaughtException', err => {
+  console.error('[AunXz] UNCAUGHT EXCEPTION:', err?.stack || err);
+});
+process.on('unhandledRejection', err => {
+  console.error('[AunXz] UNHANDLED REJECTION:', err?.stack || err);
+});
+console.log('[AunXz] Starting index.js...');
+
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
   StringSelectMenuBuilder, RoleSelectMenuBuilder, ChannelSelectMenuBuilder, ButtonBuilder, ButtonStyle,
-  PermissionFlagsBits, AuditLogEvent, ApplicationIntegrationType, InteractionContextType
+  PermissionFlagsBits, AuditLogEvent
 } = require('discord.js');
 
 const db = require('./database');
@@ -14,6 +22,10 @@ const ui = require('./ui');
 const sys = require('./systems');
 const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
 require('./v2patch').apply(); // Components V2 for every embed that has buttons/selects
+
+console.log('[AunXz] Dependencies loaded. Checking environment...');
+console.log(`[AunXz] DISCORD_TOKEN: ${process.env.DISCORD_TOKEN ? 'present' : 'MISSING'}`);
+console.log(`[AunXz] CLIENT_ID: ${process.env.CLIENT_ID ? 'present' : 'MISSING'}`);
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
 const birthdayWishesSent = new Set();
@@ -49,12 +61,12 @@ async function registerCommands() {
   for (const command of publicBody) {
     if (!Array.isArray(command.integration_types)) {
       command.integration_types = [
-        ApplicationIntegrationType.GuildInstall,
-        ApplicationIntegrationType.UserInstall
+        0, // GuildInstall
+        1  // UserInstall
       ];
     }
     if (!Array.isArray(command.contexts)) {
-      command.contexts = [InteractionContextType.Guild];
+      command.contexts = [0]; // Guild context
     }
   }
 
@@ -1671,11 +1683,4 @@ async function handleReactionRole(reaction, user, adding) {
       await reaction.users.remove(user.id).catch(() => {});
       return;
     }
-    if (adding) await member.roles.add(role);
-    else await member.roles.remove(role);
-  } catch (e) { console.error('reaction role action failed:', e); }
-}
-client.on('messageReactionAdd', (reaction, user) => handleReactionRole(reaction, user, true));
-client.on('messageReactionRemove', (reaction, user) => handleReactionRole(reaction, user, false));
-
-// ------------------------------------------------------------------------
+    if (adding)
