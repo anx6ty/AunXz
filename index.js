@@ -1,15 +1,16 @@
 // index.js — boots the client, registers slash commands, and wires every Discord event
 // to the systems/commands/ui modules. This is the only file that touches gateway events.
 
+require('dotenv').config();
+
 process.on('uncaughtException', err => {
-  console.error('[AunXz] UNCAUGHT EXCEPTION:', err?.stack || err);
+  console.error('[AunXz] UNCAUGHT EXCEPTION:', err);
 });
 process.on('unhandledRejection', err => {
-  console.error('[AunXz] UNHANDLED REJECTION:', err?.stack || err);
+  console.error('[AunXz] UNHANDLED REJECTION:', err);
 });
-console.log('[AunXz] Starting index.js...');
 
-require('dotenv').config();
+console.log('[AunXz] Starting index.js...');
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
@@ -22,10 +23,6 @@ const ui = require('./ui');
 const sys = require('./systems');
 const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
 require('./v2patch').apply(); // Components V2 for every embed that has buttons/selects
-
-console.log('[AunXz] Dependencies loaded. Checking environment...');
-console.log(`[AunXz] DISCORD_TOKEN: ${process.env.DISCORD_TOKEN ? 'present' : 'MISSING'}`);
-console.log(`[AunXz] CLIENT_ID: ${process.env.CLIENT_ID ? 'present' : 'MISSING'}`);
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
 const birthdayWishesSent = new Set();
@@ -54,21 +51,6 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
   const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
-
-  // Make public commands available to both normal guild installs and account/user installs.
-  // A command that needs server-side bot access can still reject the interaction at runtime.
-  // /template is explicitly configured in commands.js and therefore works in both contexts.
-  for (const command of publicBody) {
-    if (!Array.isArray(command.integration_types)) {
-      command.integration_types = [
-        0, // GuildInstall
-        1  // UserInstall
-      ];
-    }
-    if (!Array.isArray(command.contexts)) {
-      command.contexts = [0]; // Guild context
-    }
-  }
 
   // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
   // propagate on first deploy; instant after that on updates within the same command set).
@@ -1683,4 +1665,20 @@ async function handleReactionRole(reaction, user, adding) {
       await reaction.users.remove(user.id).catch(() => {});
       return;
     }
-    if (adding)
+    if (adding) await member.roles.add(role);
+    else await member.roles.remove(role);
+  } catch (e) { console.error('reaction role action failed:', e); }
+}
+client.on('messageReactionAdd', (reaction, user) => handleReactionRole(reaction, user, true));
+client.on('messageReactionRemove', (reaction, user) => handleReactionRole(reaction, user, false));
+
+// ---------------------------------------------------------------------------------
+// messageCreate — antilink, antispam, leveling, automod, prefix-less utility
+// ---------------------------------------------------------------------------------
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  // Staff applications happen in DMs and intentionally have no guild.
+  if (!message.guild) return handleApplicationDM(message).catch(console.error);
+
+  const cfgAll = db.getConfig
