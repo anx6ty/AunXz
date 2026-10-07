@@ -1,12 +1,16 @@
 // index.js — boots the client, registers slash commands, and wires every Discord event
 // to the systems/commands/ui modules. This is the only file that touches gateway events.
 
-// AunXz startup diagnostics — report fatal startup errors instead of failing silently.
-process.on('unhandledRejection', reason => console.error('[UNHANDLED_REJECTION]', reason));
-process.on('uncaughtException', err => console.error('[UNCAUGHT_EXCEPTION]', err));
-console.log('[AunXz] Starting index.js...');
-
 require('dotenv').config();
+
+process.on('uncaughtException', err => {
+  console.error('[AunXz] UNCAUGHT EXCEPTION:', err);
+});
+process.on('unhandledRejection', err => {
+  console.error('[AunXz] UNHANDLED REJECTION:', err);
+});
+
+console.log('[AunXz] Starting index.js...');
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ChannelType, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
@@ -44,17 +48,12 @@ const client = new Client({
 // Slash command registration
 // ---------------------------------------------------------------------------------
 async function registerCommands() {
-  if (!process.env.DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is missing. Add it to Railway Variables.');
-  if (!process.env.CLIENT_ID) throw new Error('CLIENT_ID is missing. Add it to Railway Variables.');
-
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
   const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
 
-  if (publicBody.length > 100) throw new Error(`Too many global public slash commands: ${publicBody.length}. Discord allows at most 100 global application commands.`);
-  if (ownerBody.length > 100) throw new Error(`Too many owner slash commands: ${ownerBody.length}.`);
-
-  // Public commands go out globally so every server the bot is in gets them.
+  // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
+  // propagate on first deploy; instant after that on updates within the same command set).
   await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: publicBody });
   console.log(`Registered ${publicBody.length} global commands.`);
 
@@ -286,33 +285,8 @@ async function guardCommand(interaction, cmd) {
 }
 async function executeCommand(cmd, interaction) {
   if (!await guardCommand(interaction, cmd)) return;
-
-  // Some command bugs can otherwise leave Discord waiting until the interaction expires.
-  // Track every normal acknowledgement method used by a slash command.
-  interaction.__aunxzResponded = false;
-  const wrap = (name) => {
-    const original = typeof interaction[name] === 'function' ? interaction[name].bind(interaction) : null;
-    if (!original) return;
-    interaction[name] = async (...args) => {
-      interaction.__aunxzResponded = true;
-      return original(...args);
-    };
-  };
-  for (const method of ['reply', 'deferReply', 'showModal', 'update']) wrap(method);
-
   try {
     await cmd.execute(interaction);
-
-    // If the handler returned without acknowledging the interaction, answer it ourselves.
-    if (!interaction.replied && !interaction.deferred && !interaction.__aunxzResponded && interaction.isRepliable?.()) {
-      await interaction.reply({
-        embeds: [ui.errorEmbed(
-          'Command Did Not Respond',
-          `**/${interaction.commandName}** finished without sending a response. Please try again.`
-        )],
-        ephemeral: true
-      }).catch(() => {});
-    }
   } catch (e) {
     console.error(`Command ${interaction.commandName} failed:`, e);
     const code = e?.code ? `\n**Discord code:** \`${e.code}\`` : '';
@@ -560,12 +534,12 @@ client.on('interactionCreate', async (interaction) => {
       logSetupSessions.set(`${interaction.guildId}:${interaction.user.id}`, interaction.values[0]);
       return interaction.update({embeds:[ui.logSetupEmbed(db.getConfig(interaction.guildId).logs)],components:ui.logSetupRows(db.getConfig(interaction.guildId).logs)});
     }
-    if (interaction.isChannelSelectMenu() && interaction.customId === 'logsetup:channel') {
+    if (interaction.isChannelSelectMenu() && (interaction.customId === 'logsetup:channel' || interaction.customId.startsWith('logs_cfg:'))) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
-      const key=`${interaction.guildId}:${interaction.user.id}`, type=logSetupSessions.get(key);
-      if(!type) return interaction.reply({embeds:[ui.errorEmbed('Select Log Type First','Choose a log type in the first menu, then choose its channel.')],ephemeral:true});
+      let type = interaction.customId.startsWith('logs_cfg:') ? interaction.customId.split(':')[1] : logSetupSessions.get(`${interaction.guildId}:${interaction.user.id}`);
+      if (!type) return interaction.reply({embeds:[ui.errorEmbed('Select Log Type First','Choose a log type first, then choose its channel.')],ephemeral:true});
       const cfg=db.saveConfig(interaction.guildId,{logs:{[type]:interaction.values[0]}}).logs;
-      logSetupSessions.delete(key);
+      logSetupSessions.delete(`${interaction.guildId}:${interaction.user.id}`);
       return interaction.update({embeds:[ui.logSetupEmbed(cfg)],components:ui.logSetupRows(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId === 'buttonroles_cfg:channel') {
@@ -677,15 +651,19 @@ client.on('interactionCreate', async (interaction) => {
       const channel=interaction.guild.channels.cache.get(interaction.values[0]);
       if(!channel?.isTextBased()) return interaction.update({content:'That channel is not usable — pick a text channel.',components:[]});
       const embed=ui.embedBuilderPreviewEmbed(draft);
-      const buttonComponents=(draft.buttons||[]).map(b=>{
-        const btn=new ButtonBuilder().setLabel(b.label.slice(0,80)).setStyle(ButtonStyle.Link).setURL(b.url);
+      const buttonComponents=(draft.buttons||[]).map((b,i)=>{
+        const btn=new ButtonBuilder().setCustomId(`savedembed:temp:${interaction.user.id}:${i}`).setLabel(String(b.label||'Button').slice(0,80)).setStyle(ButtonStyle.Primary);
         if(b.emoji) btn.setEmoji(b.emoji);
         return btn;
       });
-      const rows=buttonComponents.length?[new ActionRowBuilder().addComponents(buttonComponents)]:[];
-      await channel.send({embeds:[embed],components:rows}).catch(()=>{});
+      const rows=[];
+      for(let i=0;i<buttonComponents.length;i+=5) rows.push(new ActionRowBuilder().addComponents(buttonComponents.slice(i,i+5)));
+      const sent=await channel.send({embeds:[embed],components:rows}).catch(()=>null);
+      if(!sent) return interaction.update({content:`I could not post in ${channel}. Check my **Send Messages** and **Embed Links** permissions.`,components:[]});
+      // Persist the posted message's button configuration so its buttons keep working.
+      db.saveEmbed(interaction.guildId, `__message_${sent.id}`, {embed:embed.toJSON(), buttons:draft.buttons||[], messageId:sent.id, channelId:channel.id});
       sys.embedBuilderSessions.delete(interaction.user.id);
-      return interaction.update({content:`Posted in ${channel}.`,components:[]});
+      return interaction.update({content:`Posted in ${channel}. Use **/embed save** from a fresh builder to store a reusable named copy.`,components:[]});
     }
     if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:toggle') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
@@ -798,6 +776,19 @@ async function postReactionRolePanel(guild,cfg){
 }
 
 async function handleButton(interaction) {
+  if (interaction.customId.startsWith('savedembed:')) {
+    const parts=interaction.customId.split(':');
+    const recordName=parts[1] === 'temp' ? `__message_${interaction.message.id}` : decodeURIComponent(parts[1]);
+    const saved=db.getEmbed(interaction.guildId, recordName);
+    const buttonId=parts[1] === 'temp' ? Number(parts[3]) : null;
+    if(!saved) return interaction.reply({embeds:[ui.errorEmbed('Embed Not Found','This saved embed is no longer available.')],ephemeral:true});
+    const b = buttonId === null ? (saved.data.buttons||[]).find(x=>x.id===parts[2]) : (saved.data.buttons||[])[buttonId];
+    if(!b) return interaction.reply({embeds:[ui.errorEmbed('Button Not Found','That button configuration no longer exists.')],ephemeral:true});
+    const r=b.response||{};
+    const e=new EmbedBuilder().setTitle(String(r.title||b.label||'Response').slice(0,256)).setDescription(String(r.description||'').slice(0,4096));
+    if(r.color){const n=parseInt(String(r.color).replace('#',''),16);if(!Number.isNaN(n))e.setColor(n);}
+    return interaction.reply({embeds:[e],ephemeral:true});
+  }
   const id = interaction.customId;
 
   // Button-role / reaction-role panel manager
@@ -999,14 +990,24 @@ async function handleButton(interaction) {
     );
     return interaction.showModal(modal);
   }
+  if (id === 'embedbuilder:save') {
+    const draft=sys.embedBuilderSessions.get(interaction.user.id);
+    if(!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
+    const modal=new ModalBuilder().setCustomId('embedbuilder_save_modal').setTitle('Save Embed');
+    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Embed name').setStyle(TextInputStyle.Short).setPlaceholder('e.g. rules, welcome, ticket-info').setRequired(true).setMaxLength(40)));
+    return interaction.showModal(modal);
+  }
+
   if (id === 'embedbuilder:addbutton') {
     const draft = sys.embedBuilderSessions.get(interaction.user.id);
     if (!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
     if ((draft.buttons||[]).length >= 5) return interaction.reply({embeds:[ui.errorEmbed('Button Limit','A single row supports at most 5 buttons.')],ephemeral:true});
-    const modal=new ModalBuilder().setCustomId('embedbuilder_button_modal').setTitle('Add Link Button');
+    const modal=new ModalBuilder().setCustomId('embedbuilder_button_modal').setTitle('Add Response Button');
     modal.addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('label').setLabel('Button label').setStyle(TextInputStyle.Short).setRequired(true)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('url').setLabel('URL (https://…)').setStyle(TextInputStyle.Short).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('responseTitle').setLabel('Private response title').setStyle(TextInputStyle.Short).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('responseText').setLabel('Private response text').setStyle(TextInputStyle.Paragraph).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('responseColor').setLabel('Response color (optional, e.g. #5865F2)').setStyle(TextInputStyle.Short).setRequired(false)),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('emoji').setLabel('Emoji (optional)').setStyle(TextInputStyle.Short).setRequired(false))
     );
     return interaction.showModal(modal);
@@ -1465,12 +1466,23 @@ async function handleModal(interaction) {
     const draft=sys.embedBuilderSessions.get(interaction.user.id);
     if(!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
     const label=interaction.fields.getTextInputValue('label').trim();
-    const url=interaction.fields.getTextInputValue('url').trim();
+    const responseTitle=interaction.fields.getTextInputValue('responseTitle').trim();
+    const responseText=interaction.fields.getTextInputValue('responseText').trim();
+    const responseColor=interaction.fields.getTextInputValue('responseColor').trim();
     const btnEmoji=interaction.fields.getTextInputValue('emoji').trim();
-    if(!label || !/^https?:\/\//i.test(url)) return interaction.reply({embeds:[ui.errorEmbed('Invalid Button','Provide a label and a valid https:// URL.')],ephemeral:true});
-    draft.buttons=[...(draft.buttons||[]), { label, url, emoji: btnEmoji || null }];
+    if(!label || !responseTitle || !responseText) return interaction.reply({embeds:[ui.errorEmbed('Missing Button Info','Label, response title and response text are required.')],ephemeral:true});
+    draft.buttons=[...(draft.buttons||[]), { id:`b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`, label, emoji: btnEmoji || null, response:{title:responseTitle,description:responseText,color:responseColor||null} }];
     return interaction.reply({embeds:[ui.embedBuilderPreviewEmbed(draft)],components:ui.embedBuilderRow(draft),ephemeral:true});
   }
+  if (interaction.customId === 'embedbuilder_save_modal') {
+    const draft=sys.embedBuilderSessions.get(interaction.user.id);
+    if(!draft) return interaction.reply({embeds:[ui.errorEmbed('Session Expired','Run `/embedbuilder` again to start a fresh draft.')],ephemeral:true});
+    const name=interaction.fields.getTextInputValue('name').trim();
+    if(!/^[a-zA-Z0-9 _-]{1,40}$/.test(name)) return interaction.reply({embeds:[ui.errorEmbed('Invalid Name','Use 1-40 letters, numbers, spaces, `_` or `-`.')],ephemeral:true});
+    db.saveEmbed(interaction.guildId,name,{embed:ui.embedBuilderPreviewEmbed(draft).toJSON(),buttons:draft.buttons||[]});
+    return interaction.reply({embeds:[ui.okEmbed('💾 Embed Saved',`Saved **${name}**. Use **/embed load ${name}** to send it later.`)],ephemeral:true});
+  }
+
   if (interaction.customId === 'birthday_modal') {
     const raw=interaction.fields.getTextInputValue('date').trim().replace(/\s+/g,'');
     const m=raw.match(/^(\d{1,2})[-\/.](\d{1,2})$/); if(!m) return interaction.reply({embeds:[ui.errorEmbed('Invalid Date','Use a format like `8-8` or `1-9`.')],ephemeral:true});
@@ -1631,125 +1643,4 @@ async function handleHoneypot(message) {
   const member=await message.guild.members.fetch(message.author.id).catch(()=>null);
   if (cfg.action==='kick' || cfg.action==='ban') {
     let invite='';
-    if(cfg.action==='kick' && cfg.createInvite) {
-      const target=message.guild.channels.cache.get(cfg.channelId) || message.guild.systemChannel;
-      if(target?.isTextBased() && target.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.CreateInstantInvite)) {
-        invite=await target.createInvite({maxAge:86400,maxUses:1,unique:true,reason:'Honeypot recovery invite'}).then(i=>i.url).catch(()=> '');
-      }
-    }
-    if(cfg.action==='kick') {
-      await member?.kick('Honeypot trigger').catch(()=>{});
-      const dm=(cfg.dmMessage||'You were removed for posting in the honeypot channel. {invite}').replace('{invite}',invite||'');
-      await message.author.send(dm).catch(()=>{});
-    } else await member?.ban({reason:'Honeypot trigger'}).catch(()=>{});
-  } else if(cfg.action==='timeout') await member?.timeout(10*60e3,'Honeypot trigger').catch(()=>{});
-}
-
-function birthdayKey(date) { return `${date.getUTCMonth()+1}-${date.getUTCDate()}`; }
-async function sendBirthdayWishes() {
-  const now=new Date(); const key=birthdayKey(now); const dayToken=`${now.getUTCFullYear()}-${key}`;
-  for (const guild of client.guilds.cache.values()) {
-    const cfg=db.getConfig(guild.id).birthdays; if(!cfg.enabled || !cfg.wishChannelId) continue;
-    const channel=guild.channels.cache.get(cfg.wishChannelId); if(!channel?.isTextBased()) continue;
-    const entries=cfg.entries||{};
-    for(const [userId,date] of Object.entries(entries)) {
-      if(date!==key || birthdayWishesSent.has(`${guild.id}:${userId}:${dayToken}`)) continue;
-      birthdayWishesSent.add(`${guild.id}:${userId}:${dayToken}`);
-      const text=(cfg.wishMessage||'Happy Birthday {user}! 🎂').replace('{user}',`<@${userId}>`).replace('{date}',key);
-      channel.send({embeds:[ui.okEmbed('🎂 Happy Birthday!',text)]}).catch(()=>{});
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------------
-// reaction roles
-// ---------------------------------------------------------------------------------
-async function handleReactionRole(reaction, user, adding) {
-  if (user?.bot) return;
-
-  try {
-    if (reaction.partial) await reaction.fetch();
-
-    const guild = reaction.message.guild;
-    if (!guild) return;
-
-    const all = db.getConfig(guild.id);
-    const panels = Array.isArray(all.reactionRolePanels) ? all.reactionRolePanels : [];
-
-    let panel = panels.find(p => p.messageId === reaction.message.id);
-    let mappings = panel?.mappings || [];
-
-    // Backward compatibility with the old single-panel reaction-role format.
-    if (!panel) {
-      const legacy = all.reactionRoles || {};
-      if (legacy.enabled === false || legacy.messageId !== reaction.message.id) return;
-      mappings = Array.isArray(legacy.mappings) ? legacy.mappings : [];
-    }
-
-    if (panel?.enabled === false || !mappings.length) return;
-
-    const reactionKeys = [
-      reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : null,
-      reaction.emoji.id ? `<a:${reaction.emoji.name}:${reaction.emoji.id}>` : null,
-      reaction.emoji.name,
-      reaction.emoji.id
-    ].filter(Boolean);
-
-    const mapping = mappings.find(
-      m => reactionKeys.includes(String(m.emoji).trim())
-    );
-
-    if (!mapping) return;
-
-    const role = guild.roles.cache.get(mapping.roleId);
-    if (!role || role.id === guild.id || role.managed) return;
-
-    const member = await guild.members.fetch(user.id).catch(() => null);
-    if (!member) return;
-
-    const botMember = guild.members.me;
-    if (!botMember) return;
-
-    const canManageRoles =
-      botMember.permissions.has(PermissionFlagsBits.ManageRoles) ||
-      botMember.permissions.has(PermissionFlagsBits.Administrator);
-
-    if (!canManageRoles) return;
-    if (role.position >= botMember.roles.highest.position) return;
-
-    if (adding) {
-      if (!member.roles.cache.has(role.id)) {
-        await member.roles.add(role, 'Reaction role panel');
-      }
-    } else {
-      if (member.roles.cache.has(role.id)) {
-        await member.roles.remove(role, 'Reaction role panel');
-      }
-    }
-  } catch (error) {
-    console.error('[REACTION_ROLE]', error);
-  }
-}
-
-client.on('messageReactionAdd', (reaction, user) => {
-  handleReactionRole(reaction, user, true).catch(err => {
-    console.error('[REACTION_ROLE_ADD]', err);
-  });
-});
-
-client.on('messageReactionRemove', (reaction, user) => {
-  handleReactionRole(reaction, user, false).catch(err => {
-    console.error('[REACTION_ROLE_REMOVE]', err);
-  });
-});
-
-// Birthday wishes check — once per minute.
-setInterval(() => {
-  sendBirthdayWishes().catch(err => console.error('[BIRTHDAY]', err));
-}, 60_000);
-
-// Login must exist after all gateway handlers are registered.
-client.login(process.env.DISCORD_TOKEN || process.env.TOKEN).catch(err => {
-  console.error('[LOGIN] Discord login failed:', err);
-  process.exit(1);
-});
+    if(cfg.action==='ki
