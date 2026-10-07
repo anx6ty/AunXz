@@ -63,27 +63,6 @@ function actionPreflight(interaction, target, permission, permissionLabel, actio
 const commands = [];
 
 // ---------------------------------------------------------------------------------
-// /ping
-// ---------------------------------------------------------------------------------
-commands.push({
-  data: new SlashCommandBuilder()
-    .setName('ping')
-    .setDescription('Check AunXz latency and response time.'),
-  async execute(interaction) {
-    const botLatency = Math.max(0, Math.round(interaction.client.ws.ping));
-    const apiLatency = Math.max(0, Date.now() - interaction.createdTimestamp);
-    await interaction.reply({
-      embeds: [ui.base('🏓 Pong!')
-        .setDescription('AunXz is online and responding normally.')
-        .addFields(
-          { name: 'Bot Latency', value: `\`${botLatency}ms\``, inline: true },
-          { name: 'API Latency', value: `\`${apiLatency}ms\``, inline: true }
-        )]
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------------
 // /template — portable server templates.
 // The command is explicitly enabled for Guild Install + User Install when the
 // installed discord.js builder supports Discord's integration metadata. Runtime
@@ -377,6 +356,46 @@ commands.push({
     await interaction.reply({embeds:[ui.base('🎉 Giveaway Configuration')
       .setDescription(`Configure and publish this giveaway.\n\n**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** <t:${Math.floor(g.endsAt/1000)}:R>\n**Channel:** ${channel}`)
       .setFooter({text:`Giveaway #${g.id} • Hosted by ${interaction.user.tag}`})],components:[row],ephemeral:true});
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /embed — saved embed library
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder()
+    .setName('embed')
+    .setDescription('Load, delete, or list your saved embeds.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(s => s.setName('load').setDescription('Send a saved embed in this channel.')
+      .addStringOption(o => o.setName('name').setDescription('Saved embed name').setRequired(true).setMaxLength(40)))
+    .addSubcommand(s => s.setName('delete').setDescription('Delete a saved embed.')
+      .addStringOption(o => o.setName('name').setDescription('Saved embed name').setRequired(true).setMaxLength(40)))
+    .addSubcommand(s => s.setName('list').setDescription('List your saved embeds.')),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const sub=interaction.options.getSubcommand();
+    if (sub==='list') {
+      const list=db.listEmbeds(interaction.guildId).filter(x=>!x.name.startsWith('__message_'));
+      return interaction.reply({embeds:[ui.base('📚 Saved Embeds').setDescription(list.length ? list.map((x,i)=>`**${i+1}.** ${x.name}`).join('\n') : 'No saved embeds yet. Run **/embedbuilder** and press **Save**.')],ephemeral:true});
+    }
+    const name=interaction.options.getString('name').trim().toLowerCase();
+    const saved=db.getEmbed(interaction.guildId,name);
+    if (sub==='delete') {
+      if(!saved) return interaction.reply({embeds:[ui.errorEmbed('Embed Not Found',`No saved embed named **${name}** exists.`)],ephemeral:true});
+      db.deleteEmbed(interaction.guildId,name);
+      return interaction.reply({embeds:[ui.okEmbed('🗑️ Embed Deleted',`Deleted saved embed **${name}**.`)],ephemeral:true});
+    }
+    if(!saved) return interaction.reply({embeds:[ui.errorEmbed('Embed Not Found',`No saved embed named **${name}** exists. Use **/embed list** to see saved names.`)],ephemeral:true});
+    const data=saved.data||{};
+    const embed=new (require('discord.js').EmbedBuilder)(data.embed||data);
+    const rows=[];
+    const bs=(data.buttons||[]).map((b,i)=>{
+      const id=b.id || `b${i}`;
+      return new ButtonBuilder().setCustomId(`savedembed:${encodeURIComponent(name)}:${id}`).setLabel(String(b.label||'Button').slice(0,80)).setStyle(ButtonStyle.Primary).setEmoji(b.emoji || undefined);
+    });
+    for(let i=0;i<bs.length;i+=5) rows.push(new ActionRowBuilder().addComponents(bs.slice(i,i+5)));
+    return interaction.reply({embeds:[embed],components:rows});
   }
 });
 
