@@ -1666,14 +1666,90 @@ async function sendBirthdayWishes() {
 // ---------------------------------------------------------------------------------
 async function handleReactionRole(reaction, user, adding) {
   if (user?.bot) return;
+
   try {
     if (reaction.partial) await reaction.fetch();
+
     const guild = reaction.message.guild;
     if (!guild) return;
+
     const all = db.getConfig(guild.id);
     const panels = Array.isArray(all.reactionRolePanels) ? all.reactionRolePanels : [];
+
     let panel = panels.find(p => p.messageId === reaction.message.id);
     let mappings = panel?.mappings || [];
+
+    // Backward compatibility with the old single-panel reaction-role format.
     if (!panel) {
-      const legacy = all.reactionRoles;
-      if (legacy.enabled === false || legacy.messageId !== reaction.message.id) return
+      const legacy = all.reactionRoles || {};
+      if (legacy.enabled === false || legacy.messageId !== reaction.message.id) return;
+      mappings = Array.isArray(legacy.mappings) ? legacy.mappings : [];
+    }
+
+    if (panel?.enabled === false || !mappings.length) return;
+
+    const reactionKeys = [
+      reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : null,
+      reaction.emoji.id ? `<a:${reaction.emoji.name}:${reaction.emoji.id}>` : null,
+      reaction.emoji.name,
+      reaction.emoji.id
+    ].filter(Boolean);
+
+    const mapping = mappings.find(
+      m => reactionKeys.includes(String(m.emoji).trim())
+    );
+
+    if (!mapping) return;
+
+    const role = guild.roles.cache.get(mapping.roleId);
+    if (!role || role.id === guild.id || role.managed) return;
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) return;
+
+    const botMember = guild.members.me;
+    if (!botMember) return;
+
+    const canManageRoles =
+      botMember.permissions.has(PermissionFlagsBits.ManageRoles) ||
+      botMember.permissions.has(PermissionFlagsBits.Administrator);
+
+    if (!canManageRoles) return;
+    if (role.position >= botMember.roles.highest.position) return;
+
+    if (adding) {
+      if (!member.roles.cache.has(role.id)) {
+        await member.roles.add(role, 'Reaction role panel');
+      }
+    } else {
+      if (member.roles.cache.has(role.id)) {
+        await member.roles.remove(role, 'Reaction role panel');
+      }
+    }
+  } catch (error) {
+    console.error('[REACTION_ROLE]', error);
+  }
+}
+
+client.on('messageReactionAdd', (reaction, user) => {
+  handleReactionRole(reaction, user, true).catch(err => {
+    console.error('[REACTION_ROLE_ADD]', err);
+  });
+});
+
+client.on('messageReactionRemove', (reaction, user) => {
+  handleReactionRole(reaction, user, false).catch(err => {
+    console.error('[REACTION_ROLE_REMOVE]', err);
+  });
+});
+
+// Birthday wishes check — once per minute.
+setInterval(() => {
+  sendBirthdayWishes().catch(err => console.error('[BIRTHDAY]', err));
+}, 60_000);
+
+// Login must exist after all gateway handlers are registered.
+client.login(process.env.DISCORD_TOKEN || process.env.TOKEN).catch(err => {
+  console.error('[LOGIN] Discord login failed:', err);
+  process.exit(1);
+});
