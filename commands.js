@@ -63,6 +63,27 @@ function actionPreflight(interaction, target, permission, permissionLabel, actio
 const commands = [];
 
 // ---------------------------------------------------------------------------------
+// /ping
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder()
+    .setName('ping')
+    .setDescription('Check AunXz latency and response time.'),
+  async execute(interaction) {
+    const botLatency = Math.max(0, Math.round(interaction.client.ws.ping));
+    const apiLatency = Math.max(0, Date.now() - interaction.createdTimestamp);
+    await interaction.reply({
+      embeds: [ui.base('🏓 Pong!')
+        .setDescription('AunXz is online and responding normally.')
+        .addFields(
+          { name: 'Bot Latency', value: `\`${botLatency}ms\``, inline: true },
+          { name: 'API Latency', value: `\`${apiLatency}ms\``, inline: true }
+        )]
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------------
 // /template — portable server templates.
 // The command is explicitly enabled for Guild Install + User Install when the
 // installed discord.js builder supports Discord's integration metadata. Runtime
