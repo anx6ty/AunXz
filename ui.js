@@ -416,11 +416,14 @@ function setupPanelRow(sub, cfg) {
       new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings'))
     )];
     if(sub==='antiwebhook'){
-      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antiwebhook:action').setPlaceholder('Choose webhook action…').addOptions({label:'Delete webhook',value:'delete',emoji:'🗑️'},{label:'Kick creator',value:'kick',emoji:'👢'},{label:'Ban creator',value:'ban',emoji:'🔨'},{label:'Strip roles',value:'strip_roles',emoji:'🔒'}),new RoleSelectMenuBuilder().setCustomId('security_cfg:antiwebhook:bypass').setPlaceholder('Select trusted inviter role…')));
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antiwebhook:action').setPlaceholder('Choose webhook action…').addOptions({label:'Delete webhook',value:'delete',emoji:'🗑️'},{label:'Kick creator',value:'kick',emoji:'👢'},{label:'Ban creator',value:'ban',emoji:'🔨'},{label:'Strip roles',value:'strip_roles',emoji:'🔒'})));
+      rows.push(new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('security_cfg:antiwebhook:bypass').setPlaceholder('Select trusted inviter role…')));
     } else if(sub==='antibot'){
-      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antibot:action').setPlaceholder('Choose unapproved bot action…').addOptions({label:'Kick',value:'kick',emoji:'👢'},{label:'Ban',value:'ban',emoji:'🔨'},{label:'Strip roles',value:'strip_roles',emoji:'🔒'}),new RoleSelectMenuBuilder().setCustomId('security_cfg:antibot:bypass').setPlaceholder('Select bypass role…')));
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antibot:action').setPlaceholder('Choose unapproved bot action…').addOptions({label:'Kick',value:'kick',emoji:'👢'},{label:'Ban',value:'ban',emoji:'🔨'},{label:'Strip roles',value:'strip_roles',emoji:'🔒'})));
+      rows.push(new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('security_cfg:antibot:bypass').setPlaceholder('Select bypass role…')));
     } else {
-      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antialt:action').setPlaceholder('Choose new-account action…').addOptions({label:'Kick',value:'kick',emoji:'👢'},{label:'Ban',value:'ban',emoji:'🔨'}),new StringSelectMenuBuilder().setCustomId('security_cfg:antialt:age').setPlaceholder('Minimum account age…').addOptions([1,3,7,14,30,60,90].map(v=>({label:`${v} day${v===1?'':'s'}`,value:String(v)})))));
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antialt:action').setPlaceholder('Choose new-account action…').addOptions({label:'Kick',value:'kick',emoji:'👢'},{label:'Ban',value:'ban',emoji:'🔨'})));
+      rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('security_cfg:antialt:age').setPlaceholder('Minimum account age…').addOptions([1,3,7,14,30,60,90].map(v=>({label:`${v} day${v===1?'':'s'}`,value:String(v)})))));
     }
     rows.push(new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`security_cfg:${sub}:log`).setPlaceholder('Select security log channel…').addChannelTypes(ChannelType.GuildText)));
     return rows;
@@ -666,6 +669,25 @@ function autoreactorSetupRow(cfg) {
   return rows;
 }
 
+// ---------------- LOG SETUP ----------------
+function logSetupEmbed(cfg) {
+  const labels = [
+    ['mod','Moderation'],['message','Messages'],['member','Members'],['voice','Voice'],
+    ['antinuke','Anti-Nuke'],['server','Server'],['ticket','Tickets'],['join','Join/Leave']
+  ];
+  const text = labels.map(([key,label]) => `**${label}:** ${cfg[key] ? `<#${cfg[key]}>` : 'Not set'}`).join('\n');
+  return featureSetupEmbed('Logging', 'Choose where each type of log should be sent. Each selector controls one independent log stream.', [
+    {name:'Status',value:'Configured per log type',inline:false},
+    {name:'Destinations',value:text,inline:false}
+  ]);
+}
+function logSetupRows(cfg) {
+  const row = key => new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder().setCustomId(`logs_cfg:${key}`).setPlaceholder(`Select ${key} log channel`).setChannelTypes(ChannelType.GuildText)
+  );
+  return [row('mod'), row('message'), row('member'), row('voice'), row('antinuke')].slice(0,5);
+}
+
 // ---------------- EMBED BUILDER ----------------
 function embedBuilderPreviewEmbed(draft) {
   const e = base(draft.title || 'Untitled Embed');
@@ -674,6 +696,7 @@ function embedBuilderPreviewEmbed(draft) {
   if (draft.imageUrl) e.setImage(draft.imageUrl);
   if (draft.thumbnailUrl) e.setThumbnail(draft.thumbnailUrl);
   if (draft.footer) e.setFooter({ text: draft.footer.slice(0, 200) });
+  if (draft.buttons?.length) e.addFields({ name: 'Buttons', value: draft.buttons.map((b,i)=>`${i+1}. **${b.label}** → ${b.response?.title || 'Private response'}`).join('\n').slice(0,1024), inline:false });
   return e;
 }
 function embedBuilderRow(draft) {
@@ -681,15 +704,13 @@ function embedBuilderRow(draft) {
   const rows = [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('embedbuilder:text').setLabel('Edit Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
     new ButtonBuilder().setCustomId('embedbuilder:image').setLabel('Edit Images').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
-    new ButtonBuilder().setCustomId('embedbuilder:addbutton').setLabel('Add Button').setStyle(ButtonStyle.Secondary).setEmoji(emoji('add')),
-    new ButtonBuilder().setCustomId('embedbuilder:post').setLabel('Post').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
+    new ButtonBuilder().setCustomId('embedbuilder:addbutton').setLabel('Add Response Button').setStyle(ButtonStyle.Secondary).setEmoji(emoji('add')),
+    new ButtonBuilder().setCustomId('embedbuilder:save').setLabel('Save').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
   )];
-  if (buttons.length) {
-    rows.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder().setCustomId('embedbuilder:removebutton').setPlaceholder(`Remove a button… (${buttons.length} added)`)
-        .addOptions(buttons.slice(0, 25).map((b, i) => ({ label: (b.label || 'Button').slice(0, 90), value: String(i), emoji: emoji('remove') })))
-    ));
-  }
+  if (buttons.length) rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('embedbuilder:removebutton').setPlaceholder(`Remove a button… (${buttons.length} added)`)
+      .addOptions(buttons.slice(0,25).map((b,i)=>({label:(b.label||'Button').slice(0,100),value:String(i),emoji:emoji('remove')})))
+  ));
   return rows;
 }
 
@@ -783,6 +804,7 @@ module.exports = {
   configSummaryEmbed, moduleListEmbed, emojisListEmbed,
   featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
+  logSetupEmbed, logSetupRows,
   embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
