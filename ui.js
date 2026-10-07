@@ -499,7 +499,9 @@ function buttonRoleSetupRows(cfg, selectedId) {
   ));
   if (panel) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
+      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText)
+    ));
+    rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`buttonroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
       new ButtonBuilder().setCustomId(`buttonroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
     ));
@@ -543,7 +545,9 @@ function reactionRoleSetupRows(cfg, selectedId) {
   ));
   if (panel) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
+      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText)
+    ));
+    rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`reactionroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
       new ButtonBuilder().setCustomId(`reactionroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
     ));
@@ -682,10 +686,26 @@ function logSetupEmbed(cfg) {
   ]);
 }
 function logSetupRows(cfg) {
-  const row = key => new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder().setCustomId(`logs_cfg:${key}`).setPlaceholder(`Select ${key} log channel`).setChannelTypes(ChannelType.GuildText)
-  );
-  return [row('mod'), row('message'), row('member'), row('voice'), row('antinuke')].slice(0,5);
+  const labels = [
+    ['mod', 'Moderation'], ['message', 'Messages'], ['member', 'Members'], ['voice', 'Voice'],
+    ['antinuke', 'Anti-Nuke'], ['server', 'Server'], ['ticket', 'Tickets'], ['join', 'Join/Leave']
+  ];
+  const typeMenu = new StringSelectMenuBuilder()
+    .setCustomId('logsetup:type')
+    .setPlaceholder('1. Select a log type…')
+    .addOptions(labels.map(([value, label]) => ({
+      label,
+      value,
+      description: cfg[value] ? `Currently: ${cfg[value]}` : 'Not configured yet'
+    })));
+  const channelMenu = new ChannelSelectMenuBuilder()
+    .setCustomId('logsetup:channel')
+    .setPlaceholder('2. Select the destination channel…')
+    .setChannelTypes(ChannelType.GuildText);
+  return [
+    new ActionRowBuilder().addComponents(typeMenu),
+    new ActionRowBuilder().addComponents(channelMenu)
+  ];
 }
 
 // ---------------- EMBED BUILDER ----------------
