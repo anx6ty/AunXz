@@ -499,9 +499,7 @@ function buttonRoleSetupRows(cfg, selectedId) {
   ));
   if (panel) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText)
-    ));
-    rows.push(new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
       new ButtonBuilder().setCustomId(`buttonroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
       new ButtonBuilder().setCustomId(`buttonroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
     ));
@@ -545,9 +543,7 @@ function reactionRoleSetupRows(cfg, selectedId) {
   ));
   if (panel) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText)
-    ));
-    rows.push(new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
       new ButtonBuilder().setCustomId(`reactionroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
       new ButtonBuilder().setCustomId(`reactionroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
     ));
@@ -686,26 +682,104 @@ function logSetupEmbed(cfg) {
   ]);
 }
 function logSetupRows(cfg) {
-  const labels = [
-    ['mod', 'Moderation'], ['message', 'Messages'], ['member', 'Members'], ['voice', 'Voice'],
-    ['antinuke', 'Anti-Nuke'], ['server', 'Server'], ['ticket', 'Tickets'], ['join', 'Join/Leave']
+  const row = key => new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder().setCustomId(`logs_cfg:${key}`).setPlaceholder(`Select ${key} log channel`).setChannelTypes(ChannelType.GuildText)
+  );
+  return [row('mod'), row('message'), row('member'), row('voice'), row('antinuke')].slice(0,5);
+}
+
+
+// ---------------- STAT SETUP ----------------
+function statSetupEmbed(stats, category = 'server', selected = 'members', statInfo = null) {
+  const cfg = stats || {};
+  const current = statInfo || (
+    category === 'server'
+      ? cfg.server?.[selected]
+      : category === 'social'
+        ? cfg.social?.[selected]
+        : (cfg.custom || []).find(x => x.id === selected)
+  );
+  const configuredCount = [
+    ...Object.values(cfg.server || {}),
+    ...Object.values(cfg.social || {}),
+    ...(cfg.custom || [])
+  ].filter(x => x?.enabled).length;
+  const categoryTitle = category === 'server' ? 'Server Stats' : category === 'social' ? 'Social Media Stats' : 'Custom Stats';
+  const label = current?.name || selected || 'None';
+  const status = current?.enabled ? `${emoji('enabled')} Enabled` : `${emoji('disabled')} Disabled`;
+  const source = current?.source ? `\n**Source:** \`${String(current.source).slice(0, 160)}\`` : '';
+  const format = current?.template ? `\n**Channel format:** \`${String(current.template).slice(0, 90)}\`` : '';
+  const error = current?.lastError ? `\n**Last error:** ${String(current.lastError).slice(0, 300)}` : '';
+  const description = [
+    'Create private live voice-channel counters for your server and social accounts.',
+    '',
+    `**Module:** ${cfg.enabled ? `${emoji('enabled')} Active` : `${emoji('disabled')} Inactive`}`,
+    `**Configured counters:** **${configuredCount}**`,
+    `**Stats category:** ${cfg.categoryId ? `<#${cfg.categoryId}>` : '*Auto-created on first stat*'}`,
+    `**Selected:** **${label}** — ${status}${source}${format}${error}`,
+    '',
+    'Configure opens an Administrator-only form. Templates support placeholders such as `{value}`, `{members}`, `{humans}`, `{bots}`, `{staff}`, `{online}`, `{subscribers}`, `{followers}`, `{likes}`, `{views}`, `{videos}` and more.'
+  ].join('\n');
+  return base(`${emoji('settings')} Statsetup — ${categoryTitle}`)
+    .setDescription(description)
+    .setFooter({ text: "Voice-channel counters refresh on their own interval (minimum 60 seconds)." });
+}
+
+function statSetupCategoryRow(category = 'server') {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('statsetup:category')
+      .setPlaceholder('Choose a stats category…')
+      .addOptions([
+        { label: 'Server Stats', value: 'server', description: 'Members, bots, staff, channels, boosts and more', emoji: '📊', default: category === 'server' },
+        { label: 'Social Media Stats', value: 'social', description: 'YouTube, TikTok, X/Twitter and Instagram', emoji: '🌐', default: category === 'social' },
+        { label: 'Custom Stats', value: 'custom', description: 'Add your own manually maintained counters', emoji: '🧩', default: category === 'custom' }
+      ])
+  );
+}
+
+function statSetupMetricRow(stats, category = 'server', selected = 'members') {
+  const cfg = stats || {};
+  let options = [];
+  if (category === 'server') {
+    options = Object.entries(cfg.server || {}).map(([key, value]) => ({ label: value?.name || key, value: key, description: value?.enabled ? 'Enabled' : 'Disabled', default: key === selected }));
+  } else if (category === 'social') {
+    const labels = { youtube: 'YouTube', tiktok: 'TikTok', x: 'Twitter / X', instagram: 'Instagram' };
+    options = Object.keys(labels).map(key => ({ label: labels[key], value: key, description: cfg.social?.[key]?.enabled ? 'Enabled' : 'Disabled', default: key === selected }));
+  } else {
+    options = (cfg.custom || []).map(item => ({ label: item.name || 'Custom Stat', value: item.id, description: item.enabled ? 'Enabled' : 'Disabled', default: item.id === selected }));
+  }
+  if (!options.length) options = [{ label: 'No custom stat yet', value: 'none', description: 'Press Add Custom to create one', default: true }];
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`statsetup:metric:${category}`).setPlaceholder('Choose a stat…').addOptions(options.slice(0, 25))
+  );
+}
+
+function statSetupCategoryChannelRow(stats) {
+  return new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder()
+      .setCustomId('statsetup:category_channel')
+      .setPlaceholder(stats?.categoryId ? 'Change stats category' : 'Choose / change stats category')
+      .setChannelTypes(ChannelType.GuildCategory)
+  );
+}
+
+function statSetupActionRows(category = 'server', selected = 'members', stats = {}) {
+  const canConfigure = selected && selected !== 'none';
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`statsetup:configure:${category}:${selected}`).setLabel('Configure').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')).setDisabled(!canConfigure),
+      new ButtonBuilder().setCustomId(`statsetup:toggle:${category}:${selected}`).setLabel((stats?.[category]?.[selected]?.enabled || (category === 'custom' && stats?.custom?.find(x => x.id === selected)?.enabled)) ? 'Disable' : 'Enable').setStyle(ButtonStyle.Secondary).setEmoji(emoji('settings')).setDisabled(!canConfigure),
+      new ButtonBuilder().setCustomId(`statsetup:refresh:${category}:${selected}`).setLabel('Refresh Now').setStyle(ButtonStyle.Success).setEmoji(emoji('success')).setDisabled(!canConfigure),
+      new ButtonBuilder().setCustomId(`statsetup:delete:${category}:${selected}`).setLabel(category === 'custom' ? 'Delete' : 'Disable').setStyle(ButtonStyle.Danger).setEmoji(emoji('remove')).setDisabled(!canConfigure)
+    )
   ];
-  const typeMenu = new StringSelectMenuBuilder()
-    .setCustomId('logsetup:type')
-    .setPlaceholder('1. Select a log type…')
-    .addOptions(labels.map(([value, label]) => ({
-      label,
-      value,
-      description: cfg[value] ? `Currently: ${cfg[value]}` : 'Not configured yet'
-    })));
-  const channelMenu = new ChannelSelectMenuBuilder()
-    .setCustomId('logsetup:channel')
-    .setPlaceholder('2. Select the destination channel…')
-    .setChannelTypes(ChannelType.GuildText);
-  return [
-    new ActionRowBuilder().addComponents(typeMenu),
-    new ActionRowBuilder().addComponents(channelMenu)
-  ];
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('statsetup:defaults').setLabel('Create Core Server Set').setStyle(ButtonStyle.Success).setEmoji('📊').setDisabled(category !== 'server'),
+    new ButtonBuilder().setCustomId('statsetup:addcustom').setLabel('Add Custom').setStyle(ButtonStyle.Secondary).setEmoji('🧩'),
+    new ButtonBuilder().setCustomId('statsetup:reset').setLabel('Reset All').setStyle(ButtonStyle.Danger).setEmoji(emoji('remove'))
+  ));
+  return rows;
 }
 
 // ---------------- EMBED BUILDER ----------------
@@ -825,6 +899,7 @@ module.exports = {
   featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
   logSetupEmbed, logSetupRows,
+  statSetupEmbed, statSetupCategoryRow, statSetupMetricRow, statSetupCategoryChannelRow, statSetupActionRows,
   embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
