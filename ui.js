@@ -31,7 +31,7 @@ const DEFAULT_EMOJIS = {
   voice_mic: '🎙️', link: '🔗', spam: '🚫', tools: '🛠️', error: '❌', logs: '📜', owner: '👑',
   raid: '🚨', mute: '🔇', boost: '🚀', clear: '🧹', slow: '🐌', unknown: '❔', help: '📖',
   cancel: '✖️', emoji: '😀', nobody: '🙅', already_gone: '😅', balloon: '🎈',
-  member_join: '📥', member_leave: '📤'
+  member_join: '📥', member_leave: '📤', info: 'ℹ️'
 };
 
 // Backward-compatible semantic names used by existing UI builders.
@@ -48,6 +48,29 @@ const EMOJI_KEYS = Object.keys(DEFAULT_EMOJIS);
 const DEFAULT_TO_KEY = new Map(Object.entries(DEFAULT_EMOJIS).map(([k, v]) => [v, k]));
 
 function resolveEmojiKey(name) { return EMOJI_ALIASES[name] || name; }
+function isCustomEmoji(value) { return /^<a?:[A-Za-z0-9_~.-]+:\d+>$/.test(String(value || '').trim()); }
+function extractEmojiTokens(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const custom = text.match(/<a?:[A-Za-z0-9_~.-]+:\d+>/g) || [];
+  // Keep this intentionally conservative: registered/default emojis remain named entries,
+  // while any additional Unicode emoji becomes an automatically discovered entry.
+  const unicode = text.match(/\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*/gu) || [];
+  return [...new Set([...custom, ...unicode])];
+}
+function dynamicEmojiEntries() {
+  const found = new Set();
+  for (const row of db.listEmbedTexts(500)) {
+    for (const value of extractEmojiTokens(`${row.title || ''} ${row.description || ''} ${row.footer || ''}`)) found.add(value);
+  }
+  for (const value of Object.values(DEFAULT_EMOJIS)) found.delete(value);
+  const rows = [...found].map((value, i) => {
+    const customName = String(value).match(/^<a?:([^:>]+):/);
+    const key = customName ? `custom_${customName[1]}` : `auto_${i + 1}`;
+    return { key, value, usedIn: db.listEmbedTexts(500).filter(r => `${r.title || ''} ${r.description || ''} ${r.footer || ''}`.includes(value)).slice(0, 8).map(r => r.name) };
+  });
+  return rows;
+}
+
 function emoji(name) {
   const key = resolveEmojiKey(name);
   return db.getEmojiOverride(key) || DEFAULT_EMOJIS[key] || DEFAULT_EMOJIS.unknown;
@@ -70,10 +93,30 @@ function decorateEmbed(embed) {
   const setFooter = embed.setFooter.bind(embed);
   const setAuthor = embed.setAuthor.bind(embed);
   const addFields = embed.addFields.bind(embed);
-  embed.setTitle = value => setTitle(emojify(value));
-  embed.setDescription = value => setDescription(emojify(value));
+
+  embed.setTitle = value => {
+    const source = String(value ?? '');
+    embed.__aunxzSourceTitle = source;
+    const override = db.getEmbedText(source);
+    const actual = override?.title || emojify(source);
+    db.registerEmbedText(source, override?.description || '', override?.footer || '');
+    return setTitle(actual);
+  };
+  embed.setDescription = value => {
+    const source = String(value ?? '');
+    const sourceTitle = embed.__aunxzSourceTitle || '';
+    const override = sourceTitle ? db.getEmbedText(sourceTitle) : null;
+    const actual = override && override.description ? override.description : emojify(source);
+    if (sourceTitle) db.registerEmbedText(sourceTitle, source, override?.footer || '');
+    return setDescription(actual);
+  };
   embed.setFooter = value => {
-    if (value && typeof value === 'object') return setFooter({ ...value, text: emojify(value.text) });
+    if (value && typeof value === 'object') {
+      const text = emojify(value.text);
+      if (embed.__aunxzSourceTitle) db.registerEmbedText(embed.__aunxzSourceTitle, '', text);
+      return setFooter({ ...value, text });
+    }
+    if (embed.__aunxzSourceTitle) db.registerEmbedText(embed.__aunxzSourceTitle, '', String(value || ''));
     return setFooter(emojify(value));
   };
   embed.setAuthor = value => {
@@ -335,14 +378,48 @@ function ticketMemberSelectRow(action) {
 }
 
 // ---------------- OWNER: /emoji ----------------
-function emojisListEmbed(overrides = {}) {
-  const lines = EMOJI_KEYS.map((key, i) => {
-    const value = overrides[key] || DEFAULT_EMOJIS[key];
-    const custom = overrides[key] ? ' *(custom)*' : '';
-    return `**${i + 1}. ${key}:** ${value}${custom}`;
+function emojisListEmbed(overrides = {}, page = 1, pageSize = 8) {
+  const dynamic = dynamicEmojiEntries();
+  const all = [
+    ...EMOJI_KEYS.map(key => ({ key, value: overrides[key] || DEFAULT_EMOJIS[key], custom: !!overrides[key] })),
+    ...dynamic.map(x => ({ ...x, custom: true, dynamic: true }))
+  ];
+  const totalPages = Math.max(1, Math.ceil(all.length / pageSize));
+  const safePage = Math.min(totalPages, Math.max(1, Number(page) || 1));
+  const slice = all.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const lines = slice.map((entry, i) => {
+    const mark = entry.custom ? ' *(custom)*' : '';
+    const used = entry.usedIn?.length ? `\n   Used in: ${entry.usedIn.map(x => `\`${x}\``).join(', ')}` : '';
+    return `**${(safePage - 1) * pageSize + i + 1}. ${entry.key}:** ${entry.value}${mark}${used}`;
   });
-  return base(`${emoji('emoji')} Bot Emoji Registry`)
-    .setDescription(lines.join('\n') + '\n\nChange any entry with **/emoji set**. Reset with **/emoji reset**. Changes apply to buttons and embed text immediately.');
+  return base(`${emoji('emoji')} AunXz Emojis`)
+    .setDescription(`**STATUS**\n${emoji('enabled')} **Registry:** \`${all.length} entries\`\n\n${lines.join('\n\n') || 'No emojis registered yet.'}\n\nUse **/emoji set** for named defaults. Use **/em edit** to edit embed text. New emojis found inside registered embeds appear here automatically.\n\n**Page ${safePage}/${totalPages}**`);
+}
+function emojisListRows(page = 1, pageSize = 8) {
+  const total = EMOJI_KEYS.length + dynamicEmojiEntries().length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`emoji:list:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`emoji:page:${page}`).setLabel(`${page}/${totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`emoji:list:${Math.min(totalPages, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages).setEmoji('▶️')
+  )];
+}
+function embedTextsListEmbed(page = 1, pageSize = 6) {
+  const rows = db.listEmbedTexts(500);
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(totalPages, Math.max(1, Number(page) || 1));
+  const slice = rows.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const lines = slice.map((r, i) => `**${(safePage - 1) * pageSize + i + 1}. \`${r.name}\`**\n**Title:** ${r.title || r.sourceTitle}\n**Description:** ${(r.description || '*none*').slice(0, 650)}`);
+  return base(`${emoji('emoji')} Embed Text Registry`)
+    .setDescription(`${lines.join('\n\n') || 'No embed texts have been registered yet. Use the bot normally, then run this again.'}\n\n**Page ${safePage}/${totalPages} • ${rows.length} registered embeds**`);
+}
+function embedTextsListRows(page = 1, pageSize = 6) {
+  const total = Math.max(1, Math.ceil(db.listEmbedTexts(500).length / pageSize));
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`em:list:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`em:page:${page}`).setLabel(`${page}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`em:list:${Math.min(total, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= total).setEmoji('▶️')
+  )];
 }
 
 // ---------------- LEVELING ----------------
@@ -499,7 +576,9 @@ function buttonRoleSetupRows(cfg, selectedId) {
   ));
   if (panel) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
+      new ChannelSelectMenuBuilder().setCustomId(`buttonroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText)
+    ));
+    rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`buttonroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
       new ButtonBuilder().setCustomId(`buttonroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
     ));
@@ -543,7 +622,9 @@ function reactionRoleSetupRows(cfg, selectedId) {
   ));
   if (panel) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText),
+      new ChannelSelectMenuBuilder().setCustomId(`reactionroles_cfg:channel:${panel.id}`).setPlaceholder('Select where this panel should be posted…').setChannelTypes(ChannelType.GuildText)
+    ));
+    rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`reactionroles_cfg:settings:${panel.id}`).setLabel('Panel Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
       new ButtonBuilder().setCustomId(`reactionroles_cfg:addrole:${panel.id}`).setLabel('Add Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('add'))
     ));
@@ -682,104 +763,108 @@ function logSetupEmbed(cfg) {
   ]);
 }
 function logSetupRows(cfg) {
-  const row = key => new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder().setCustomId(`logs_cfg:${key}`).setPlaceholder(`Select ${key} log channel`).setChannelTypes(ChannelType.GuildText)
-  );
-  return [row('mod'), row('message'), row('member'), row('voice'), row('antinuke')].slice(0,5);
-}
-
-
-// ---------------- STAT SETUP ----------------
-function statSetupEmbed(stats, category = 'server', selected = 'members', statInfo = null) {
-  const cfg = stats || {};
-  const current = statInfo || (
-    category === 'server'
-      ? cfg.server?.[selected]
-      : category === 'social'
-        ? cfg.social?.[selected]
-        : (cfg.custom || []).find(x => x.id === selected)
-  );
-  const configuredCount = [
-    ...Object.values(cfg.server || {}),
-    ...Object.values(cfg.social || {}),
-    ...(cfg.custom || [])
-  ].filter(x => x?.enabled).length;
-  const categoryTitle = category === 'server' ? 'Server Stats' : category === 'social' ? 'Social Media Stats' : 'Custom Stats';
-  const label = current?.name || selected || 'None';
-  const status = current?.enabled ? `${emoji('enabled')} Enabled` : `${emoji('disabled')} Disabled`;
-  const source = current?.source ? `\n**Source:** \`${String(current.source).slice(0, 160)}\`` : '';
-  const format = current?.template ? `\n**Channel format:** \`${String(current.template).slice(0, 90)}\`` : '';
-  const error = current?.lastError ? `\n**Last error:** ${String(current.lastError).slice(0, 300)}` : '';
-  const description = [
-    'Create private live voice-channel counters for your server and social accounts.',
-    '',
-    `**Module:** ${cfg.enabled ? `${emoji('enabled')} Active` : `${emoji('disabled')} Inactive`}`,
-    `**Configured counters:** **${configuredCount}**`,
-    `**Stats category:** ${cfg.categoryId ? `<#${cfg.categoryId}>` : '*Auto-created on first stat*'}`,
-    `**Selected:** **${label}** — ${status}${source}${format}${error}`,
-    '',
-    'Configure opens an Administrator-only form. Templates support placeholders such as `{value}`, `{members}`, `{humans}`, `{bots}`, `{staff}`, `{online}`, `{subscribers}`, `{followers}`, `{likes}`, `{views}`, `{videos}` and more.'
-  ].join('\n');
-  return base(`${emoji('settings')} Statsetup — ${categoryTitle}`)
-    .setDescription(description)
-    .setFooter({ text: "Voice-channel counters refresh on their own interval (minimum 60 seconds)." });
-}
-
-function statSetupCategoryRow(category = 'server') {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('statsetup:category')
-      .setPlaceholder('Choose a stats category…')
-      .addOptions([
-        { label: 'Server Stats', value: 'server', description: 'Members, bots, staff, channels, boosts and more', emoji: '📊', default: category === 'server' },
-        { label: 'Social Media Stats', value: 'social', description: 'YouTube, TikTok, X/Twitter and Instagram', emoji: '🌐', default: category === 'social' },
-        { label: 'Custom Stats', value: 'custom', description: 'Add your own manually maintained counters', emoji: '🧩', default: category === 'custom' }
-      ])
-  );
-}
-
-function statSetupMetricRow(stats, category = 'server', selected = 'members') {
-  const cfg = stats || {};
-  let options = [];
-  if (category === 'server') {
-    options = Object.entries(cfg.server || {}).map(([key, value]) => ({ label: value?.name || key, value: key, description: value?.enabled ? 'Enabled' : 'Disabled', default: key === selected }));
-  } else if (category === 'social') {
-    const labels = { youtube: 'YouTube', tiktok: 'TikTok', x: 'Twitter / X', instagram: 'Instagram' };
-    options = Object.keys(labels).map(key => ({ label: labels[key], value: key, description: cfg.social?.[key]?.enabled ? 'Enabled' : 'Disabled', default: key === selected }));
-  } else {
-    options = (cfg.custom || []).map(item => ({ label: item.name || 'Custom Stat', value: item.id, description: item.enabled ? 'Enabled' : 'Disabled', default: item.id === selected }));
-  }
-  if (!options.length) options = [{ label: 'No custom stat yet', value: 'none', description: 'Press Add Custom to create one', default: true }];
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder().setCustomId(`statsetup:metric:${category}`).setPlaceholder('Choose a stat…').addOptions(options.slice(0, 25))
-  );
-}
-
-function statSetupCategoryChannelRow(stats) {
-  return new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder()
-      .setCustomId('statsetup:category_channel')
-      .setPlaceholder(stats?.categoryId ? 'Change stats category' : 'Choose / change stats category')
-      .setChannelTypes(ChannelType.GuildCategory)
-  );
-}
-
-function statSetupActionRows(category = 'server', selected = 'members', stats = {}) {
-  const canConfigure = selected && selected !== 'none';
-  const rows = [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`statsetup:configure:${category}:${selected}`).setLabel('Configure').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')).setDisabled(!canConfigure),
-      new ButtonBuilder().setCustomId(`statsetup:toggle:${category}:${selected}`).setLabel((stats?.[category]?.[selected]?.enabled || (category === 'custom' && stats?.custom?.find(x => x.id === selected)?.enabled)) ? 'Disable' : 'Enable').setStyle(ButtonStyle.Secondary).setEmoji(emoji('settings')).setDisabled(!canConfigure),
-      new ButtonBuilder().setCustomId(`statsetup:refresh:${category}:${selected}`).setLabel('Refresh Now').setStyle(ButtonStyle.Success).setEmoji(emoji('success')).setDisabled(!canConfigure),
-      new ButtonBuilder().setCustomId(`statsetup:delete:${category}:${selected}`).setLabel(category === 'custom' ? 'Delete' : 'Disable').setStyle(ButtonStyle.Danger).setEmoji(emoji('remove')).setDisabled(!canConfigure)
-    )
+  const labels = [
+    ['mod', 'Moderation'], ['message', 'Messages'], ['member', 'Members'], ['voice', 'Voice'],
+    ['antinuke', 'Anti-Nuke'], ['server', 'Server'], ['ticket', 'Tickets'], ['join', 'Join/Leave']
   ];
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('statsetup:defaults').setLabel('Create Core Server Set').setStyle(ButtonStyle.Success).setEmoji('📊').setDisabled(category !== 'server'),
-    new ButtonBuilder().setCustomId('statsetup:addcustom').setLabel('Add Custom').setStyle(ButtonStyle.Secondary).setEmoji('🧩'),
-    new ButtonBuilder().setCustomId('statsetup:reset').setLabel('Reset All').setStyle(ButtonStyle.Danger).setEmoji(emoji('remove'))
-  ));
-  return rows;
+  const typeMenu = new StringSelectMenuBuilder()
+    .setCustomId('logsetup:type')
+    .setPlaceholder('1. Select a log type…')
+    .addOptions(labels.map(([value, label]) => ({
+      label,
+      value,
+      description: cfg[value] ? `Currently: ${cfg[value]}` : 'Not configured yet'
+    })));
+  const channelMenu = new ChannelSelectMenuBuilder()
+    .setCustomId('logsetup:channel')
+    .setPlaceholder('2. Select the destination channel…')
+    .setChannelTypes(ChannelType.GuildText);
+  return [
+    new ActionRowBuilder().addComponents(typeMenu),
+    new ActionRowBuilder().addComponents(channelMenu)
+  ];
+}
+
+// ---------------- OWNER LOGS / MEMBERSHIP ----------------
+function ownerLogSetupEmbed(cfg = {}) {
+  const e = base(`${emoji('owner')} Owner Log Control Center`);
+  e.setDescription(
+    `Configure where AunXz sends its global owner logs.\n\n` +
+    `**Error logs:** ${cfg.errorChannelId ? `<#${cfg.errorChannelId}>` : '*not set*'}\n` +
+    `**Online/offline logs:** ${cfg.onlineChannelId ? `<#${cfg.onlineChannelId}>` : '*not set*'}\n` +
+    `**Join logs:** ${cfg.joinChannelId ? `<#${cfg.joinChannelId}>` : '*not set*'}\n\n` +
+    `The selected channels are global to the bot and are only configurable by bot owners.`
+  );
+  return e;
+}
+function ownerLogSetupRows(cfg = {}) {
+  return [
+    new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('ownerlogsetup:error').setPlaceholder(cfg.errorChannelId ? 'Change error log channel…' : 'Select error log channel…').setChannelTypes(ChannelType.GuildText)),
+    new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('ownerlogsetup:online').setPlaceholder(cfg.onlineChannelId ? 'Change online/offline channel…' : 'Select online/offline channel…').setChannelTypes(ChannelType.GuildText)),
+    new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('ownerlogsetup:join').setPlaceholder(cfg.joinChannelId ? 'Change join log channel…' : 'Select join log channel…').setChannelTypes(ChannelType.GuildText))
+  ];
+}
+function ownerJoinLogEmbed(guild) {
+  return base(`${emoji('owner')} AunXz Joined a Server`)
+    .setDescription(
+      `**Server:** ${guild.name}\n` +
+      `**ID:** \`${guild.id}\`\n` +
+      `**Owner:** <@${guild.ownerId}>\n` +
+      `**Members:** ${guild.memberCount || 0}\n` +
+      `**Created:** <t:${Math.floor(guild.createdTimestamp / 1000)}:F>\n\n` +
+      `Use **AunXz** for owner-only controls.`
+    );
+}
+function ownerJoinLogRows(guildId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`owner:guild:${guildId}`).setLabel('AunXz').setStyle(ButtonStyle.Primary).setEmoji(emoji('owner'))
+  )];
+}
+function ownerGuildControlEmbed(guild) {
+  return base(`${emoji('owner')} Server Controls`)
+    .setDescription(`**${guild.name}**\n\`${guild.id}\`\n\nChoose an owner action below.`);
+}
+function ownerGuildControlRows(guildId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`owner:infoask:${guildId}`).setLabel('Server Info').setStyle(ButtonStyle.Primary).setEmoji(emoji('info') || 'ℹ️'),
+    new ButtonBuilder().setCustomId(`owner:leave:${guildId}`).setLabel('Leave').setStyle(ButtonStyle.Danger).setEmoji(emoji('delete')),
+    new ButtonBuilder().setCustomId(`owner:invite:${guildId}`).setLabel('Generate Invite').setStyle(ButtonStyle.Success).setEmoji(emoji('add'))
+  )];
+}
+function ownerInfoChoiceEmbed(guild) {
+  return base(`${emoji('owner')} Server Info Access`)
+    .setDescription(`Choose which member group should be included with the server report for **${guild.name}**.`);
+}
+function ownerInfoChoiceRows(guildId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`owner:info:admins:${guildId}`).setLabel('Admins').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`owner:info:higher:${guildId}`).setLabel('Higher Roles').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`owner:info:none:${guildId}`).setLabel('Server Only').setStyle(ButtonStyle.Secondary)
+  )];
+}
+function membershipListEmbed(rows, page = 1, pageSize = 5) {
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safe = Math.min(totalPages, Math.max(1, Number(page) || 1));
+  const slice = rows.slice((safe - 1) * pageSize, safe * pageSize);
+  const now = Date.now();
+  const lines = slice.map((r, i) => {
+    const active = now < r.expiresAt;
+    return `${(safe - 1) * pageSize + i + 1}. **${r.plan || 'Membership'}**\n` +
+      `\`${r.guildId}\`\n` +
+      `• Plan: **${r.plan}** | Status: ${active ? `${emoji('enabled')} Active` : `${emoji('disabled')} Expired`}\n` +
+      `• Expires: <t:${Math.floor(r.expiresAt / 1000)}:F> (<t:${Math.floor(r.expiresAt / 1000)}:R>)`;
+  });
+  return base(`${emoji('owner')} AunXz Memberships`)
+    .setDescription(`${lines.join('\n\n') || 'No memberships configured yet.'}\n\n**Page ${safe} of ${totalPages} • Total Subscriptions: ${rows.length}**`);
+}
+function membershipListRows(rows, page = 1, pageSize = 5) {
+  const total = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safe = Math.min(total, Math.max(1, Number(page) || 1));
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ms:list:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`ms:page:${safe}`).setLabel(`${safe}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`ms:list:${Math.min(total, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= total).setEmoji('▶️')
+  )];
 }
 
 // ---------------- EMBED BUILDER ----------------
@@ -850,27 +935,61 @@ function embedToContainer(embedLike) {
 // Rewrites { embeds, components, content, ephemeral } into a Components V2 payload.
 // Every payload that contains at least one embed is converted (with or without buttons/selects).
 // Payloads without embeds pass through untouched. `force` is kept for API compatibility.
-function toComponentsV2(payload, force = false) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
-  const embeds = payload.embeds;
-  const rows = payload.components;
-  if (!Array.isArray(embeds) || !embeds.length) return payload;
-  const { embeds: _e, components: _c, content, ephemeral, flags, ...rest } = payload;
-  const out = [];
-  if (content) out.push(new TextDisplayBuilder().setContent(String(content).slice(0, 4000)));
-  const containers = embeds.map(e => embedToContainer(e));
-  const leftovers = [];
-  if (Array.isArray(rows) && rows.length) {
-    // Buttons/selects live INSIDE the last container so they render as part of the embed card.
-    const target = containers[containers.length - 1];
-    const inRows = rows.filter(r => r instanceof ActionRowBuilder || (r && (r.type === 1 || (r.data && r.data.type === 1))));
-    leftovers.push(...rows.filter(r => !inRows.includes(r)));
-    if (inRows.length) {
-      target.addSeparatorComponents(new SeparatorBuilder().setDivider(false));
-      target.addActionRowComponents(...inRows);
+function flattenComponentRows(value, out = []) {
+  if (!value) return out;
+  if (Array.isArray(value)) { for (const item of value) flattenComponentRows(item, out); return out; }
+  if (value instanceof ActionRowBuilder || value?.type === 1 || value?.data?.type === 1) out.push(value);
+  else if (value?.toJSON && value.toJSON()?.type === 1) out.push(value);
+  return out;
+}
+
+function embedToContainer(embedLike, rows = []) {
+  const d = typeof embedLike?.toJSON === 'function' ? embedLike.toJSON() : (embedLike || {});
+  const container = new ContainerBuilder();
+  if (typeof d.color === 'number') container.setAccentColor(d.color);
+  const intro = [];
+  if (d.author?.name) intro.push(`**${emojify(d.author.name)}**`);
+  if (d.title) intro.push(d.url ? `## [${emojify(d.title)}](${d.url})` : `## ${emojify(d.title)}`);
+  if (d.description) intro.push(emojify(d.description));
+  const introText = intro.join('\n').slice(0, 4000) || '\u200b';
+  if (d.thumbnail?.url) {
+    container.addSectionComponents(new SectionBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(introText)).setThumbnailAccessory(new ThumbnailBuilder().setURL(d.thumbnail.url)));
+  } else {
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(introText));
+  }
+  if (d.fields?.length) {
+    for (const field of d.fields.slice(0, 25)) {
+      const text = `**${emojify(field.name || 'Field')}**\n${emojify(field.value || '')}`.slice(0, 4000);
+      container.addTextDisplayComponents(new TextDisplayBuilder().setContent(text));
     }
   }
-  out.push(...containers, ...leftovers);
+  if (d.image?.url) container.addMediaGalleryComponents(new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(d.image.url)));
+  const foot = [];
+  if (d.footer?.text) foot.push(emojify(d.footer.text));
+  if (d.timestamp) foot.push(new Date(d.timestamp).toUTCString());
+  if (foot.length) {
+    container.addSeparatorComponents(new SeparatorBuilder().setDivider(true));
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${foot.join(' • ')}`.slice(0, 4000)));
+  }
+  const validRows = flattenComponentRows(rows);
+  if (validRows.length) {
+    container.addSeparatorComponents(new SeparatorBuilder().setDivider(false));
+    container.addActionRowComponents(...validRows);
+  }
+  return container;
+}
+
+function toComponentsV2(payload, force = false) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  if ((payload.flags || 0) & MessageFlags.IsComponentsV2) return payload;
+  const embeds = Array.isArray(payload.embeds) ? payload.embeds : [];
+  if (!embeds.length) return payload;
+
+  const { embeds: _e, components: rawRows, content, ephemeral, flags, stickers, poll, ...rest } = payload;
+  const rows = flattenComponentRows(rawRows);
+  const out = [];
+  if (content) out.push(new TextDisplayBuilder().setContent(String(content).slice(0, 4000)));
+  embeds.forEach((embed, index) => out.push(embedToContainer(embed, index === embeds.length - 1 ? rows : [])));
   let bits = (typeof flags === 'number' ? flags : 0) | MessageFlags.IsComponentsV2;
   if (ephemeral) bits |= MessageFlags.Ephemeral;
   return { ...rest, components: out, flags: bits };
@@ -895,11 +1014,10 @@ module.exports = {
   vmSetupEmbed, vmSetupRow, vmCategoryPromptEmbed, vmCategorySelectRow, vmChannelPromptEmbed, vmChannelSelectRow,
   vmKickPromptEmbed, vmKickSelectRow, vmKickNobodyEmbed, vmKickGoneEmbed, vmKickedEmbed,
   levelUpEmbed, leaderboardEmbed,
-  configSummaryEmbed, moduleListEmbed, emojisListEmbed,
+  configSummaryEmbed, moduleListEmbed, emojisListEmbed, emojisListRows, embedTextsListEmbed, embedTextsListRows,
   featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
-  logSetupEmbed, logSetupRows,
-  statSetupEmbed, statSetupCategoryRow, statSetupMetricRow, statSetupCategoryChannelRow, statSetupActionRows,
+  logSetupEmbed, logSetupRows, ownerLogSetupEmbed, ownerLogSetupRows, ownerJoinLogEmbed, ownerJoinLogRows, ownerGuildControlEmbed, ownerGuildControlRows, ownerInfoChoiceEmbed, ownerInfoChoiceRows, membershipListEmbed, membershipListRows,
   embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
