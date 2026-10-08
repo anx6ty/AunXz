@@ -254,8 +254,9 @@ function getEmojiOverride(name){return db.prepare('SELECT value FROM emoji_overr
 function setEmojiOverride(name,value){db.prepare('INSERT INTO emoji_overrides(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(name,value);}
 function resetEmojiOverride(name){db.prepare('DELETE FROM emoji_overrides WHERE name=?').run(name);}
 function getAllEmojiOverrides(){const out={};for(const r of db.prepare('SELECT name,value FROM emoji_overrides').all())out[r.name]=r.value;return out;}
-function saveEmojiSnapshot(values){const code='EM-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,7).toUpperCase();db.prepare('INSERT INTO emoji_snapshots(code,data,createdAt) VALUES (?,?,?)').run(code,JSON.stringify(values),Date.now());return code;}
-function getEmojiSnapshot(code){const r=db.prepare('SELECT data FROM emoji_snapshots WHERE code=?').get(code);if(!r)return null;try{return JSON.parse(r.data);}catch{return null;}}
+function saveEmojiSnapshot(values){const code='EM-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,7).toUpperCase();db.prepare('INSERT INTO emoji_snapshots(code,data,createdAt) VALUES (?,?,?)').run(code,JSON.stringify(values||{}),Date.now());return code;}
+function getEmojiSnapshot(code){const r=db.prepare('SELECT data FROM emoji_snapshots WHERE code=?').get(String(code||'').trim());if(!r)return null;try{return JSON.parse(r.data);}catch{return null;}}
+function applyEmojiSnapshot(values={}){const tx=db.transaction(obj=>{for(const [key,value] of Object.entries(obj||{})){if(value===undefined||value===null||value==='')continue;db.prepare('INSERT INTO emoji_overrides(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(String(key),String(value));}});tx(values);return getAllEmojiOverrides();}
 
 // Dynamic embed text registry
 function slugifyEmbedName(sourceTitle){
@@ -314,7 +315,7 @@ module.exports={
   createTicket,getTicket,setTicketStatus,closeTicket,openTicketsForUser,
   addVMChannel,getVMChannel,removeVMChannel,
   addToWhitelist,removeFromWhitelist,isWhitelisted,logAction,recentActions,getStickyRoles,setStickyRoles,bumpSpam,trackJoin,recentJoinCount,
-  getEmojiOverride,setEmojiOverride,resetEmojiOverride,getAllEmojiOverrides,saveEmojiSnapshot,getEmojiSnapshot,
+  getEmojiOverride,setEmojiOverride,resetEmojiOverride,getAllEmojiOverrides,saveEmojiSnapshot,getEmojiSnapshot,applyEmojiSnapshot,
   registerEmbedText,getEmbedText,listEmbedTexts,updateEmbedText,
   getOwnerConfig,saveOwnerConfig,membership,addMembership,removeMembership,listMemberships,
   createGiveaway,getGiveaway,listGiveaways,updateGiveaway,
