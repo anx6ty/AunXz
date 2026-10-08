@@ -8,7 +8,6 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
-const stats = require('./stats');
 const templates = require('./template');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -361,70 +360,6 @@ commands.push({
 });
 
 // ---------------------------------------------------------------------------------
-// /statsetup — live voice-channel statistics
-// ---------------------------------------------------------------------------------
-commands.push({
-  data: new SlashCommandBuilder()
-    .setName('statsetup')
-    .setDescription('Configure live server and social-media stat voice channels.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-  async execute(interaction) {
-    if (!requireAdmin(interaction)) return;
-    const cfg = stats.readStats(interaction.guildId);
-    await interaction.reply({
-      embeds: [ui.statSetupEmbed(cfg, 'server', 'members')],
-      components: [
-        ui.statSetupCategoryRow('server'),
-        ui.statSetupMetricRow(cfg, 'server', 'members'),
-        ui.statSetupCategoryChannelRow(cfg),
-        ...ui.statSetupActionRows('server', 'members', cfg)
-      ],
-      ephemeral: true
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------------
-// /embed — saved embed library
-// ---------------------------------------------------------------------------------
-commands.push({
-  data: new SlashCommandBuilder()
-    .setName('embed')
-    .setDescription('Load, delete, or list your saved embeds.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand(s => s.setName('load').setDescription('Send a saved embed in this channel.')
-      .addStringOption(o => o.setName('name').setDescription('Saved embed name').setRequired(true).setMaxLength(40)))
-    .addSubcommand(s => s.setName('delete').setDescription('Delete a saved embed.')
-      .addStringOption(o => o.setName('name').setDescription('Saved embed name').setRequired(true).setMaxLength(40)))
-    .addSubcommand(s => s.setName('list').setDescription('List your saved embeds.')),
-  async execute(interaction) {
-    if (!requireAdmin(interaction)) return;
-    const sub=interaction.options.getSubcommand();
-    if (sub==='list') {
-      const list=db.listEmbeds(interaction.guildId).filter(x=>!x.name.startsWith('__message_'));
-      return interaction.reply({embeds:[ui.base('📚 Saved Embeds').setDescription(list.length ? list.map((x,i)=>`**${i+1}.** ${x.name}`).join('\n') : 'No saved embeds yet. Run **/embedbuilder** and press **Save**.')],ephemeral:true});
-    }
-    const name=interaction.options.getString('name').trim().toLowerCase();
-    const saved=db.getEmbed(interaction.guildId,name);
-    if (sub==='delete') {
-      if(!saved) return interaction.reply({embeds:[ui.errorEmbed('Embed Not Found',`No saved embed named **${name}** exists.`)],ephemeral:true});
-      db.deleteEmbed(interaction.guildId,name);
-      return interaction.reply({embeds:[ui.okEmbed('🗑️ Embed Deleted',`Deleted saved embed **${name}**.`)],ephemeral:true});
-    }
-    if(!saved) return interaction.reply({embeds:[ui.errorEmbed('Embed Not Found',`No saved embed named **${name}** exists. Use **/embed list** to see saved names.`)],ephemeral:true});
-    const data=saved.data||{};
-    const embed=new (require('discord.js').EmbedBuilder)(data.embed||data);
-    const rows=[];
-    const bs=(data.buttons||[]).map((b,i)=>{
-      const id=b.id || `b${i}`;
-      return new ButtonBuilder().setCustomId(`savedembed:${encodeURIComponent(name)}:${id}`).setLabel(String(b.label||'Button').slice(0,80)).setStyle(ButtonStyle.Primary).setEmoji(b.emoji || undefined);
-    });
-    for(let i=0;i<bs.length;i+=5) rows.push(new ActionRowBuilder().addComponents(bs.slice(i,i+5)));
-    return interaction.reply({embeds:[embed],components:rows});
-  }
-});
-
-// ---------------------------------------------------------------------------------
 // /help
 // ---------------------------------------------------------------------------------
 commands.push({
@@ -443,7 +378,7 @@ const GENERIC_MODULES = [
 ];
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'antiwebhook', 'antibot', 'antialt', 'voicemaster', 'greetvoice', 'greetmessage',
-  'leveling', 'tickets', 'logs', 'statsetup', ...GENERIC_MODULES
+  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
 ];
 const GENERIC_COMMANDS = {
   welcome: 'welcome', leave: 'leave', boost: 'boost', starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
@@ -1428,7 +1363,7 @@ commands.push({
     if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
     const sub = interaction.options.getSubcommand();
     if (sub === 'list') {
-      return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides())], ephemeral: true });
+      return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides(), 1)], components: ui.emojisListRows(1), ephemeral: true });
     }
     if (sub === 'save') {
       const values = {};
@@ -1461,6 +1396,75 @@ Use **/emoji load** with this code to restore these emojis later.`)], ephemeral:
     }
     db.resetEmojiOverride(name);
     return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Reset`, `**${name}** is back to its default: ${ui.DEFAULT_EMOJIS[name]}`)] });
+  }
+});
+
+// ---------------- Owner: /em — dynamic embed/emoji registry ----------------
+commands.push({
+  ownerOnly: true,
+  data: new SlashCommandBuilder().setName('em').setDescription('[Owner] Browse and edit AunXz embed text and emojis.')
+    .addSubcommand(s => s.setName('list').setDescription('List registered embed texts and discovered emojis.'))
+    .addSubcommand(s => s.setName('edit').setDescription('Edit one registered embed text.')
+      .addStringOption(o => o.setName('name').setDescription('Name shown by /em list').setRequired(true).setAutocomplete(true))),
+  async execute(interaction) {
+    if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'list') return interaction.reply({ embeds: [ui.embedTextsListEmbed(1)], components: ui.embedTextsListRows(1), ephemeral: true });
+    const name = interaction.options.getString('name', true).trim();
+    const row = db.getEmbedText(name);
+    if (!row) return interaction.reply({ embeds: [ui.errorEmbed('Embed Not Found', `No registered embed named **${name}** exists. Run **/em list** first.`)], ephemeral: true });
+    const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+    const modal = new ModalBuilder().setCustomId(`em_edit_modal:${row.name}`).setTitle(`Edit ${row.name}`.slice(0,45));
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title').setLabel('Title').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(row.title || row.sourceTitle).slice(0,256))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(String(row.description || '').slice(0,4000))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('footer').setLabel('Footer').setStyle(TextInputStyle.Short).setRequired(false).setValue(String(row.footer || '').slice(0,200)))
+    );
+    return interaction.showModal(modal);
+  }
+});
+
+// ---------------- Owner: /ms — server membership/subscription manager ------------
+commands.push({
+  ownerOnly: true,
+  data: new SlashCommandBuilder().setName('ms').setDescription('[Owner] Manage AunXz server memberships.')
+    .addSubcommand(s => s.setName('add').setDescription('Add or extend a server membership.')
+      .addStringOption(o => o.setName('server_id').setDescription('Discord server ID').setRequired(true))
+      .addIntegerOption(o => o.setName('days').setDescription('Membership length in days').setMinValue(1).setMaxValue(3650))
+      .addStringOption(o => o.setName('plan').setDescription('Plan label, for example 30 Days'))
+      .addStringOption(o => o.setName('note').setDescription('Optional internal note')))
+    .addSubcommand(s => s.setName('remove').setDescription('Remove a server membership.')
+      .addStringOption(o => o.setName('server_id').setDescription('Discord server ID').setRequired(true)))
+    .addSubcommand(s => s.setName('list').setDescription('List all server memberships.')),
+  async execute(interaction) {
+    if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'add') {
+      const serverId = interaction.options.getString('server_id', true).trim();
+      if (!/^\d{15,25}$/.test(serverId)) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Server ID', 'Enter a valid Discord server ID.')], ephemeral: true });
+      const days = interaction.options.getInteger('days') || 30;
+      const plan = interaction.options.getString('plan') || `${days} Days`;
+      const note = interaction.options.getString('note') || '';
+      const row = db.addMembership(serverId, { days, plan, note });
+      return interaction.reply({ embeds: [ui.okEmbed('Membership Added', `**Server:** \`${serverId}\`\n**Plan:** ${row.plan}\n**Expires:** <t:${Math.floor(row.expiresAt / 1000)}:F> (<t:${Math.floor(row.expiresAt / 1000)}:R>)`)] });
+    }
+    if (sub === 'remove') {
+      const serverId = interaction.options.getString('server_id', true).trim();
+      db.removeMembership(serverId);
+      return interaction.reply({ embeds: [ui.okEmbed('Membership Removed', `Membership for \`${serverId}\` has been removed.`)] });
+    }
+    return interaction.reply({ embeds: [ui.membershipListEmbed(db.listMemberships(), 1)], components: ui.membershipListRows(db.listMemberships(), 1), ephemeral: true });
+  }
+});
+
+// ---------------- Owner: /ownerlogsetup ------------------------------------------
+commands.push({
+  ownerOnly: true,
+  data: new SlashCommandBuilder().setName('ownerlogsetup').setDescription('[Owner] Configure global bot logs in the owner server.'),
+  async execute(interaction) {
+    if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+    const cfg = db.getOwnerConfig();
+    return interaction.reply({ embeds: [ui.ownerLogSetupEmbed(cfg)], components: ui.ownerLogSetupRows(cfg), ephemeral: true });
   }
 });
 
