@@ -13,8 +13,21 @@ const templates = require('./template');
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const isOwner = (id) => OWNER_IDS.includes(id);
 
+const BYPASS_IDS = [
+  ...(process.env.BYPASS_ID || '').split(','),
+  ...(process.env.BYPASS_IDS || '').split(',')
+].map(s => s.trim()).filter(Boolean);
+
+function isBypass(id) {
+  return Boolean(id && BYPASS_IDS.includes(String(id)));
+}
+
+function hasUserPermission(interaction, permission) {
+  return isBypass(interaction.user?.id) || Boolean(interaction.member?.permissions?.has(permission));
+}
+
 function requireAdmin(interaction) {
-  if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+  if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     return false;
   }
@@ -390,7 +403,7 @@ commands.push({
       .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
       .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
   async execute(interaction) {
-    if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+    if(!hasUserPermission(interaction, PermissionFlagsBits.ManageGuild))
       return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
     const prize=interaction.options.getString('prize');
     const winners=interaction.options.getInteger('winners')||1;
@@ -1196,7 +1209,7 @@ commands.push({
 // as an alternative to the Staff Controls buttons.
 // ---------------------------------------------------------------------------------
 function requireTicketStaff(interaction, ticketCfg) {
-  const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+  const isAdmin = hasUserPermission(interaction, PermissionFlagsBits.Administrator);
   const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
   if (!isAdmin && !hasRole) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator to manage tickets.')], ephemeral: true });
@@ -1350,7 +1363,7 @@ commands.push({
     .addSubcommand(s => s.setName('reset').setDescription('reset a member\'s XP and level to 0')
       .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))),
   async execute(interaction) {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (!hasUserPermission(interaction, PermissionFlagsBits.ModerateMembers) && !hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Moderate Members** or **Administrator**.')], ephemeral: true });
     }
     const sub = interaction.options.getSubcommand();
@@ -1614,4 +1627,4 @@ commands.push({
   }
 });
 
-module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
+module.exports = { commands, isOwner, isBypass, buildModulePatch, PANEL_MODULES };
