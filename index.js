@@ -423,4 +423,4 @@ function startInteractionWatchdog(interaction) {
 // functions and session Maps declared above.
 const fs = require('fs');
 const path = require('path');
-eval(fs.readFileSync(path.join(__dirname, 'index2.js'), 'utf8'));
+eval(fs.readFileSync(path.join(__dirname, 'indexaa.js'), 'utf8'));
