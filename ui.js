@@ -49,26 +49,46 @@ const DEFAULT_TO_KEY = new Map(Object.entries(DEFAULT_EMOJIS).map(([k, v]) => [v
 
 function resolveEmojiKey(name) { return EMOJI_ALIASES[name] || name; }
 function isCustomEmoji(value) { return /^<a?:[A-Za-z0-9_~.-]+:\d+>$/.test(String(value || '').trim()); }
+function customEmojiKey(value) {
+  const m = String(value || '').trim().match(/^<a?:([^:>]+):(\d+)>$/);
+  return m ? `custom_${m[1]}` : null;
+}
+function unicodeEmojiKey(value) {
+  const cps = [...String(value || '')].map(ch => ch.codePointAt(0).toString(16)).join('-');
+  return cps ? `unicode_${cps}` : null;
+}
+function emojiTokenKey(value) {
+  return customEmojiKey(value) || unicodeEmojiKey(value);
+}
+function emojiDisplayValue(value) {
+  const key = emojiTokenKey(value);
+  return key ? (db.getEmojiOverride(key) || value) : value;
+}
 function extractEmojiTokens(text) {
   if (typeof text !== 'string' || !text) return [];
   const custom = text.match(/<a?:[A-Za-z0-9_~.-]+:\d+>/g) || [];
-  // Keep this intentionally conservative: registered/default emojis remain named entries,
-  // while any additional Unicode emoji becomes an automatically discovered entry.
   const unicode = text.match(/\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*/gu) || [];
   return [...new Set([...custom, ...unicode])];
 }
 function dynamicEmojiEntries() {
+  const usedRows = db.listEmbedTexts(500);
   const found = new Set();
-  for (const row of db.listEmbedTexts(500)) {
+  for (const row of usedRows) {
     for (const value of extractEmojiTokens(`${row.title || ''} ${row.description || ''} ${row.footer || ''}`)) found.add(value);
   }
   for (const value of Object.values(DEFAULT_EMOJIS)) found.delete(value);
-  const rows = [...found].map((value, i) => {
-    const customName = String(value).match(/^<a?:([^:>]+):/);
-    const key = customName ? `custom_${customName[1]}` : `auto_${i + 1}`;
-    return { key, value, usedIn: db.listEmbedTexts(500).filter(r => `${r.title || ''} ${r.description || ''} ${r.footer || ''}`.includes(value)).slice(0, 8).map(r => r.name) };
+  return [...found].map(value => {
+    const key = emojiTokenKey(value) || `auto_${Buffer.from(value).toString('hex').slice(0, 20)}`;
+    const current = db.getEmojiOverride(key) || value;
+    const custom = /^<a?:([^:>]+):(\d+)>$/.exec(value);
+    return {
+      key,
+      value: current,
+      originalValue: value,
+      custom: true,
+      usedIn: usedRows.filter(r => `${r.title || ''} ${r.description || ''} ${r.footer || ''}`.includes(value)).slice(0, 8).map(r => r.name)
+    };
   });
-  return rows;
 }
 
 function emoji(name) {
@@ -76,15 +96,19 @@ function emoji(name) {
   return db.getEmojiOverride(key) || DEFAULT_EMOJIS[key] || DEFAULT_EMOJIS.unknown;
 }
 
-// Replace every default emoji found inside user-facing text with its current configured value.
-// This also covers embeds built outside of a helper such as ui.okEmbed(...).
+// Replace both built-in emojis and dynamically discovered embed emojis with their current values.
 function emojify(value) {
   if (typeof value !== 'string' || !value) return value;
-  const entries = Object.entries(DEFAULT_EMOJIS).sort((a, b) => b[1].length - a[1].length);
-  const overrides = db.getAllEmojiOverrides();
-  const byDefault = new Map(entries.map(([key, def]) => [def, overrides[key] || def]));
-  const pattern = new RegExp(entries.map(([, def]) => def.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')).join('|'), 'gu');
-  return value.replace(pattern, m => byDefault.get(m) || m);
+  let out = value;
+  const defaults = Object.entries(DEFAULT_EMOJIS).sort((a, b) => b[1].length - a[1].length);
+  for (const [key, def] of defaults) {
+    const replacement = db.getEmojiOverride(key) || def;
+    if (replacement !== def) out = out.split(def).join(replacement);
+  }
+  for (const entry of dynamicEmojiEntries()) {
+    if (entry.originalValue && entry.value !== entry.originalValue) out = out.split(entry.originalValue).join(entry.value);
+  }
+  return out;
 }
 
 function decorateEmbed(embed) {
@@ -191,8 +215,7 @@ const HELP_CATEGORIES = {
       '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
       '**/antibadwordsetup** — multilingual profanity filter\n' +
       '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
-      '**/birthdaysetup** — birthday panel + automatic wishes\n' +
-      '**/serverprofile avatar|banner** — membership-gated per-server AunXz profile'
+      '**/birthdaysetup** — birthday panel + automatic wishes'
   },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
@@ -207,29 +230,23 @@ const HELP_CATEGORIES = {
   }
 };
 
-function visibleHelpCategories(includeOwner = false) {
-  return Object.entries(HELP_CATEGORIES).filter(([key]) => includeOwner || key !== 'owner');
-}
 function helpHomeEmbed(client, includeOwner = false) {
+  const categories = Object.entries(HELP_CATEGORIES).filter(([key]) => includeOwner || key !== 'owner');
   return base(`${emoji('help')} Help Menu`)
-    .setDescription(
-      `Pick a category from the menu below.\n\n` +
-      visibleHelpCategories(includeOwner).map(([, c]) => `${emoji(c.emojiKey)} **${c.name}**`).join('\n')
-    )
+    .setDescription(`Pick a category from the menu below.\n\n` + categories.map(([, c]) => `${emoji(c.emojiKey)} **${c.name}**`).join('\n'))
     .setThumbnail(client.user.displayAvatarURL());
 }
-function helpCategoryEmbed(key, includeOwner = false) {
+function helpCategoryEmbed(key) {
   const cat = HELP_CATEGORIES[key];
-  if (!cat || (key === 'owner' && !includeOwner)) return errorEmbed('Unknown Category', 'That help category is not available.');
+  if (!cat) return errorEmbed('Unknown Category', 'That help category no longer exists.');
   return base(`${emoji(cat.emojiKey)} ${cat.name}`).setDescription(cat.desc);
 }
 function helpSelectRow(includeOwner = false) {
+  const entries = Object.entries(HELP_CATEGORIES).filter(([key]) => includeOwner || key !== 'owner');
   const menu = new StringSelectMenuBuilder()
     .setCustomId('help_select')
     .setPlaceholder('Choose a category…')
-    .addOptions(visibleHelpCategories(includeOwner).map(([value, c]) => ({
-      label: c.name, value, emoji: emoji(c.emojiKey)
-    })));
+    .addOptions(entries.map(([value, c]) => ({ label: c.name, value, emoji: emoji(c.emojiKey) })));
   return new ActionRowBuilder().addComponents(menu);
 }
 
@@ -381,33 +398,65 @@ function ticketMemberSelectRow(action) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
+function automodSetupEmbed(cfg = {}) {
+  const a = cfg.automod || cfg;
+  return base(`${emoji('shield')} AutoMod`)
+    .setDescription(`**Status:** ${a.enabled !== false ? `${emoji('enabled')} Enabled` : `${emoji('disabled')} Disabled`}\n**Bad Words:** ${a.badWordFilter ? 'On' : 'Off'}\n**Caps:** ${a.capsFilter ? `${a.capsThreshold || 70}%` : 'Off'}\n**Invites:** ${a.inviteFilter ? 'On' : 'Off'}\n\nUse the controls below to configure AutoMod.`);
+}
+function automodSetupRows(cfg = {}) {
+  const a = cfg.automod || cfg;
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('automod_cfg:toggle').setLabel(a.enabled === false ? 'Enable' : 'Disable').setStyle(a.enabled === false ? ButtonStyle.Success : ButtonStyle.Danger).setEmoji(a.enabled === false ? emoji('enabled') : emoji('disabled')),
+    new ButtonBuilder().setCustomId('automod_cfg:words').setLabel('Bad Words').setStyle(ButtonStyle.Secondary).setEmoji(emoji('warning')),
+    new ButtonBuilder().setCustomId('automod_cfg:caps').setLabel('Caps').setStyle(ButtonStyle.Secondary).setEmoji('🔠'),
+    new ButtonBuilder().setCustomId('automod_cfg:invite').setLabel('Invites').setStyle(ButtonStyle.Secondary).setEmoji(emoji('link'))
+  )];
+}
+
 // ---------------- OWNER: /emoji ----------------
-function emojisListEmbed(overrides = {}, page = 1, pageSize = 8) {
-  const dynamic = dynamicEmojiEntries();
-  const all = [
-    ...EMOJI_KEYS.map(key => ({ key, value: overrides[key] || DEFAULT_EMOJIS[key], custom: !!overrides[key] })),
-    ...dynamic.map(x => ({ ...x, custom: true, dynamic: true }))
+function emojiRegistryEntries() {
+  return [
+    ...EMOJI_KEYS.map(key => ({ key, value: emoji(key), originalValue: DEFAULT_EMOJIS[key], custom: !!db.getEmojiOverride(key), dynamic: false, usedIn: [] })),
+    ...dynamicEmojiEntries()
   ];
+}
+function emojiSnapshotObject() {
+  const values = {};
+  for (const entry of emojiRegistryEntries()) values[entry.key] = entry.value;
+  return values;
+}
+function formatEmojiSnapshot(values = {}) {
+  return Object.entries(values).map(([key, value]) => {
+    const custom = String(value).match(/^<a?:([^:>]+):(\d+)>$/);
+    return `${key}: ${custom ? `${custom[1]}/${custom[2]} ${value}` : value}`;
+  }).join('\n');
+}
+function emojisListEmbed(overrides = {}, page = 1, pageSize = 8) {
+  const all = emojiRegistryEntries();
   const totalPages = Math.max(1, Math.ceil(all.length / pageSize));
   const safePage = Math.min(totalPages, Math.max(1, Number(page) || 1));
   const slice = all.slice((safePage - 1) * pageSize, safePage * pageSize);
   const lines = slice.map((entry, i) => {
     const mark = entry.custom ? ' *(custom)*' : '';
     const used = entry.usedIn?.length ? `\n   Used in: ${entry.usedIn.map(x => `\`${x}\``).join(', ')}` : '';
-    return `**${(safePage - 1) * pageSize + i + 1}. ${entry.key}:** ${entry.value}${mark}${used}`;
+    const custom = String(entry.value).match(/^<a?:([^:>]+):(\d+)>$/);
+    const copy = custom ? `\`${custom[1]}/${custom[2]}\` • ${entry.value}` : entry.value;
+    return `**${(safePage - 1) * pageSize + i + 1}. ${entry.key}:** ${copy}${mark}${used}`;
   });
   return base(`${emoji('emoji')} AunXz Emojis`)
-    .setDescription(`**STATUS**\n${emoji('enabled')} **Registry:** \`${all.length} entries\`\n\n${lines.join('\n\n') || 'No emojis registered yet.'}\n\nUse **/emoji set** for named defaults. Use **/em edit** to edit embed text. New emojis found inside registered embeds appear here automatically.\n\n**Page ${safePage}/${totalPages}**`);
+    .setDescription(`**STATUS**\n${emoji('enabled')} **Registry:** \`${all.length} entries\`\n\n${lines.join('\n\n') || 'No emojis registered yet.'}\n\nUse **/emoji set** for named defaults. Use **/em add** for a custom emoji. Use **/em edit** to edit embed text. Emojis used in registered embeds appear here automatically and disappear when no longer used.\n\n**Page ${safePage}/${totalPages}**`);
 }
 function emojisListRows(page = 1, pageSize = 8) {
-  const total = EMOJI_KEYS.length + dynamicEmojiEntries().length;
+  const total = emojiRegistryEntries().length;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safe = Math.min(totalPages, Math.max(1, Number(page) || 1));
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`emoji:list:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'),
-    new ButtonBuilder().setCustomId(`emoji:page:${page}`).setLabel(`${page}/${totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`emoji:list:${Math.min(totalPages, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages).setEmoji('▶️')
+    new ButtonBuilder().setCustomId(`emoji:list:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`emoji:page:${safe}`).setLabel(`${safe}/${totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`emoji:list:${Math.min(totalPages, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= totalPages).setEmoji('▶️')
   )];
 }
+
 function embedTextsListEmbed(page = 1, pageSize = 6) {
   const rows = db.listEmbedTexts(500);
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
@@ -900,42 +949,6 @@ function embedBuilderRow(draft) {
 // ---------------- COMPONENTS V2 CONVERSION ----------------
 // Converts an embed into a Components V2 Container (title/description/fields/images/footer as
 // text displays, sections and media galleries). Buttons/selects are added inside the container by toComponentsV2.
-function embedToContainer(embedLike) {
-  const d = typeof embedLike.toJSON === 'function' ? embedLike.toJSON() : embedLike;
-  const container = new ContainerBuilder();
-  if (typeof d.color === 'number') container.setAccentColor(d.color);
-  const intro = [];
-  if (d.author && d.author.name) intro.push(`**${d.author.name}**`);
-  if (d.title) intro.push(d.url ? `## [${d.title}](${d.url})` : `## ${d.title}`);
-  if (d.description) intro.push(d.description);
-  const introText = intro.join('\n').slice(0, 4000);
-  if (d.thumbnail && d.thumbnail.url) {
-    container.addSectionComponents(
-      new SectionBuilder()
-        .addTextDisplayComponents(new TextDisplayBuilder().setContent(introText || '\u200b'))
-        .setThumbnailAccessory(new ThumbnailBuilder().setURL(d.thumbnail.url))
-    );
-  } else if (introText) {
-    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(introText));
-  }
-  if (d.fields && d.fields.length) {
-    container.addSeparatorComponents(new SeparatorBuilder().setDivider(false));
-    const text = d.fields.map(f => `**${f.name}**\n${f.value}`).join('\n\n').slice(0, 4000);
-    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(text));
-  }
-  if (d.image && d.image.url) {
-    container.addMediaGalleryComponents(new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(d.image.url)));
-  }
-  const foot = [];
-  if (d.footer && d.footer.text) foot.push(d.footer.text);
-  if (d.timestamp) foot.push(new Date(d.timestamp).toUTCString());
-  if (foot.length) {
-    container.addSeparatorComponents(new SeparatorBuilder().setDivider(true));
-    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${foot.join(' • ')}`.slice(0, 4000)));
-  }
-  return container;
-}
-
 // Rewrites { embeds, components, content, ephemeral } into a Components V2 payload.
 // Every payload that contains at least one embed is converted (with or without buttons/selects).
 // Payloads without embeds pass through untouched. `force` is kept for API compatibility.
@@ -1007,8 +1020,8 @@ module.exports.birthdaySetupEmbed = birthdaySetupEmbed;
 module.exports.honeypotSetupEmbed = honeypotSetupEmbed;
 
 module.exports = {
-  THEME, OK, WARN, DANGER, emoji, emojify, EMOJI_KEYS, DEFAULT_EMOJIS,
-  base, okEmbed, warnEmbed, errorEmbed,
+  THEME, OK, WARN, DANGER, emoji, emojify, EMOJI_KEYS, DEFAULT_EMOJIS, emojiRegistryEntries, emojiSnapshotObject, formatEmojiSnapshot,
+  base, okEmbed, warnEmbed, errorEmbed, automodSetupEmbed, automodSetupRows,
   HELP_CATEGORIES, helpHomeEmbed, helpCategoryEmbed, helpSelectRow,
   confirmRow,
   ticketPanelEmbed, ticketPanelRow, ticketControlRow, ticketWelcomeEmbed,
