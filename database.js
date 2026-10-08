@@ -1,25 +1,26 @@
-// database.js — single SQLite file, all persistence for the bot.
-// Guild-level toggles/config are stored as one JSON blob per guild so we can support
-// dozens of setup options without needing a column for every single one.
+// database.js — persistent SQLite storage for AunXz.
+// Safe migrations only: existing data is never wiped.
 
 const Database = require('better-sqlite3');
 const path = require('path');
-const fs = require('fs');
 
-// Railway persistent volume support: DATA_DIR=/data (or /data when it exists).
-// Never store the live database beside the application when a persistent volume is available.
-const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : path.join(__dirname, 'data'));
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_PATH = path.join(DATA_DIR, 'bot.sqlite');
+const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, 'bot.sqlite');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+function hasColumn(table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column);
+}
+function addColumn(table, column, definition) {
+  if (!hasColumn(table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS guild_config (
   guildId TEXT PRIMARY KEY,
   data TEXT NOT NULL DEFAULT '{}'
 );
-
 CREATE TABLE IF NOT EXISTS levels (
   guildId TEXT NOT NULL,
   userId TEXT NOT NULL,
@@ -28,7 +29,6 @@ CREATE TABLE IF NOT EXISTS levels (
   lastMessage INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guildId, userId)
 );
-
 CREATE TABLE IF NOT EXISTS warns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guildId TEXT NOT NULL,
@@ -37,7 +37,6 @@ CREATE TABLE IF NOT EXISTS warns (
   reason TEXT,
   timestamp INTEGER NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS tickets (
   channelId TEXT PRIMARY KEY,
   guildId TEXT NOT NULL,
@@ -46,19 +45,16 @@ CREATE TABLE IF NOT EXISTS tickets (
   claimedBy TEXT,
   createdAt INTEGER NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS voicemaster_channels (
   channelId TEXT PRIMARY KEY,
   guildId TEXT NOT NULL,
   ownerId TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS antinuke_whitelist (
   guildId TEXT NOT NULL,
   userId TEXT NOT NULL,
   PRIMARY KEY (guildId, userId)
 );
-
 CREATE TABLE IF NOT EXISTS action_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guildId TEXT NOT NULL,
@@ -67,14 +63,12 @@ CREATE TABLE IF NOT EXISTS action_log (
   detail TEXT,
   timestamp INTEGER NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS sticky_roles (
   guildId TEXT NOT NULL,
   userId TEXT NOT NULL,
   roles TEXT NOT NULL,
   PRIMARY KEY (guildId, userId)
 );
-
 CREATE TABLE IF NOT EXISTS spam_tracker (
   guildId TEXT NOT NULL,
   userId TEXT NOT NULL,
@@ -82,24 +76,55 @@ CREATE TABLE IF NOT EXISTS spam_tracker (
   windowStart INTEGER NOT NULL,
   PRIMARY KEY (guildId, userId)
 );
-
 CREATE TABLE IF NOT EXISTS join_tracker (
   guildId TEXT NOT NULL,
   userId TEXT NOT NULL,
   timestamp INTEGER NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS emoji_overrides (
   name TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS emoji_snapshots (
   code TEXT PRIMARY KEY,
   data TEXT NOT NULL,
   createdAt INTEGER NOT NULL
 );
-
+CREATE TABLE IF NOT EXISTS embed_texts (
+  name TEXT PRIMARY KEY,
+  sourceTitle TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  footer TEXT NOT NULL DEFAULT '',
+  uses INTEGER NOT NULL DEFAULT 0,
+  updatedAt INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS owner_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  data TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS memberships (
+  guildId TEXT PRIMARY KEY,
+  plan TEXT NOT NULL DEFAULT '30 Days',
+  durationDays INTEGER NOT NULL DEFAULT 30,
+  createdAt INTEGER NOT NULL,
+  expiresAt INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS giveaways (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guildId TEXT NOT NULL,
+  hostId TEXT NOT NULL,
+  prize TEXT NOT NULL,
+  winners INTEGER NOT NULL DEFAULT 1,
+  durationMs INTEGER NOT NULL DEFAULT 0,
+  endsAt INTEGER NOT NULL DEFAULT 0,
+  channelId TEXT,
+  messageId TEXT,
+  participants TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'configuring',
+  createdAt INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS saved_embeds (
   guildId TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -108,116 +133,54 @@ CREATE TABLE IF NOT EXISTS saved_embeds (
   updatedAt INTEGER NOT NULL,
   PRIMARY KEY (guildId, name)
 );
-
-CREATE TABLE IF NOT EXISTS giveaways (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL,
-  channelId TEXT,
-  messageId TEXT,
-  hostId TEXT NOT NULL,
-  prize TEXT NOT NULL,
-  winners INTEGER NOT NULL DEFAULT 1,
-  durationMs INTEGER NOT NULL DEFAULT 86400000,
-  endsAt INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'configuring',
-  participants TEXT NOT NULL DEFAULT '[]',
-  createdAt INTEGER NOT NULL
-);
 `);
 
-// ---------- lightweight schema migrations ----------
-// Existing Railway volumes keep the old SQLite file. CREATE TABLE IF NOT EXISTS does
-// not add columns to an already-existing table, so every new column must be migrated.
-function ensureColumn(table, column, definition) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (!columns.some(c => c.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
+// Safe migration for old giveaway tables created before durationMs existed.
+addColumn('giveaways', 'durationMs', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('giveaways', 'endsAt', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('giveaways', 'messageId', 'TEXT');
+addColumn('giveaways', 'participants', "TEXT NOT NULL DEFAULT '[]'");
+addColumn('giveaways', 'status', "TEXT NOT NULL DEFAULT 'configuring'");
+addColumn('giveaways', 'createdAt', 'INTEGER NOT NULL DEFAULT 0');
 
-// Giveaways were introduced after some installations already had an older giveaways table.
-// These migrations are safe to run on every startup.
-ensureColumn('giveaways', 'channelId', 'TEXT');
-ensureColumn('giveaways', 'messageId', 'TEXT');
-ensureColumn('giveaways', 'hostId', "TEXT NOT NULL DEFAULT ''");
-ensureColumn('giveaways', 'prize', "TEXT NOT NULL DEFAULT 'Giveaway'");
-ensureColumn('giveaways', 'winners', 'INTEGER NOT NULL DEFAULT 1');
-ensureColumn('giveaways', 'durationMs', 'INTEGER NOT NULL DEFAULT 86400000');
-ensureColumn('giveaways', 'endsAt', 'INTEGER NOT NULL DEFAULT 0');
-ensureColumn('giveaways', 'status', "TEXT NOT NULL DEFAULT 'configuring'");
-ensureColumn('giveaways', 'participants', "TEXT NOT NULL DEFAULT '[]'");
-ensureColumn('giveaways', 'createdAt', 'INTEGER NOT NULL DEFAULT 0');
-
-// Repair old rows that were created before the new fields existed.
-db.prepare("UPDATE giveaways SET durationMs = 86400000 WHERE durationMs IS NULL OR durationMs <= 0").run();
-db.prepare("UPDATE giveaways SET createdAt = COALESCE(createdAt, 0) WHERE createdAt IS NULL").run();
-db.prepare("UPDATE giveaways SET endsAt = createdAt + durationMs WHERE (endsAt IS NULL OR endsAt = 0) AND createdAt > 0").run();
-db.prepare("UPDATE giveaways SET participants = '[]' WHERE participants IS NULL OR participants = ''").run();
-
-// ---------- default config shape ----------
-// Every guild setting the bot supports lives in here. Missing keys fall back to these defaults.
 const DEFAULT_CONFIG = {
   prefix: '!',
-  logs: {
-    mod: null, message: null, member: null, voice: null,
-    antinuke: null, server: null, ticket: null, join: null
-  },
+  logs: { mod: null, message: null, member: null, voice: null, antinuke: null, server: null, ticket: null, join: null },
   welcome: { enabled: false, channel: null, message: 'Welcome {user} to {server}! You are member #{count}.', autoroleId: null },
   leave: { enabled: false, channel: null, message: '{user} has left the server.' },
-  boost: { enabled: false, channel: null, message: '{user} just boosted the server! Thank you! 🚀' },
-  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null, audioPath: null, mode: 'tts' },
+  boost: { enabled: false, channel: null, message: '{user} just boosted the server! 🚀' },
+  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null },
   greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!', image: null },
   antinuke: {
-    enabled: false, punishment: 'ban', // ban | kick | strip_roles
-    maxChannelDeletes: 3, maxChannelCreates: 5, maxRoleDeletes: 3, maxRoleCreates: 5,
-    maxBans: 3, maxKicks: 3, maxWebhookCreates: 3, maxRoleUpdates: 5,
-    windowSeconds: 10, protectOwner: true
+    enabled: false, punishment: 'ban', maxChannelDeletes: 3, maxChannelCreates: 5, maxRoleDeletes: 3, maxRoleCreates: 5,
+    maxBans: 3, maxKicks: 3, maxWebhookCreates: 3, maxRoleUpdates: 5, windowSeconds: 10, protectOwner: true
   },
   antilink: { enabled: false, mode: 'delete', whitelistedDomains: ['discord.gg', 'discord.com/invite'], bypassRoleId: null, whitelistedChannels: [] },
   antispam: { enabled: false, maxMessages: 6, windowSeconds: 7, punishment: 'mute', muteMinutes: 5, maxMentions: 5, maxEmojis: 10 },
   antiraid: { enabled: false, joinThreshold: 8, windowSeconds: 10, action: 'lockdown', minAccountAgeDays: 3 },
+  antiwebhook: { enabled: false, action: 'delete', bypassRoleId: null, logChannelId: null },
+  antibot: { enabled: false, action: 'kick', bypassRoleId: null, logChannelId: null },
+  antialt: { enabled: false, action: 'kick', minAccountAgeDays: 3, logChannelId: null },
   voicemaster: { enabled: false, hubChannelId: null, categoryId: null, nameTemplate: "{user}'s room" },
   leveling: { enabled: false, channel: null, xpPerMessage: 15, cooldownSeconds: 60, levelUpMessage: '{user} reached level {level}!', roleRewards: {} },
-  ticket: {
-    enabled: false, categoryId: null, panelChannelId: null, supportRoleId: null, logChannelId: null, counter: 0,
-    // The "Open Ticket" panel message (posted by /ticketpanel).
-    panelTitle: null, panelDescription: null, panelThumbnail: null, panelImage: null,
-    // The embed sent inside a freshly-created ticket channel (matches the "Welcome @user /
-    // Category: X / message" + thumbnail + banner layout).
-    categoryLabel: 'General Support', welcomeMessage: 'Our support team will assist you shortly.',
-    welcomeThumbnail: null, welcomeImage: null
-  },
-  automod: { badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
+  ticket: { enabled: false, categoryId: null, panelChannelId: null, supportRoleId: null, logChannelId: null, counter: 0, panelTitle: null, panelDescription: null, panelThumbnail: null, panelImage: null, categoryLabel: 'General Support', welcomeMessage: 'Our support team will assist you shortly.', welcomeThumbnail: null, welcomeImage: null },
+  automod: { enabled: true, badWordFilter: false, badWords: [], capsFilter: false, capsThreshold: 70, inviteFilter: false },
+  antibadword: { enabled: false, words: [], customWords: [] },
+  autoresponder: { enabled: false, ignoreCase: true, triggers: [] },
+  autoreactor: { enabled: false, ignoreCase: true, triggers: [] },
   afk: {},
-  autorole: { enabled: false, target: 'everyone', roleId: null },
-  reactionRoles: { enabled: false, channelId: null, messageId: null, mappings: [] },
+  autorole: { enabled: false, roleId: null, target: 'everyone' },
+  reactionRoles: { enabled: true },
   reactionRolePanels: [],
+  buttonRolePanels: [],
   suggestions: { enabled: false, channelId: null },
   polls: { enabled: true },
   snipeEnabled: true,
   nsfwFilter: { enabled: false },
   birthdays: { enabled: false, panelChannelId: null, wishChannelId: null, wishMessage: 'Happy Birthday {user}! 🎂', entries: {} },
-  buttonRoles: { enabled: false, channelId: null, title: 'Choose your roles', description: 'Press a button to get or remove a role.', image: null, embedType: 'embed', buttons: [] },
-  buttonRolePanels: [],
-  staffApplications: { enabled: false, panelChannelId: null, logChannelId: null, title: 'Staff Applications', description: 'Click Apply to start your application.', questions: [], dmIntro: 'Are you ready to start your staff application?', acceptingRoleId: null },
-  antibadword: { enabled: false, logChannelId: null, customWords: [], action: 'delete' },
-  autoresponder: { enabled: false, ignoreCase: true, triggers: [] },
-  autoreactor: { enabled: false, ignoreCase: true, triggers: [] },
-  honeypot: { enabled: false, channelId: null, action: 'kick', logChannelId: null, createInvite: true, dmMessage: 'You were removed for posting in the honeypot channel. Here is an invite back: {invite}', cleanupWindow: 'none' },
-  antiwebhook: { enabled: false, action: 'delete', bypassRoleId: null, logChannelId: null },
-  antibot: { enabled: false, action: 'kick', bypassRoleId: null, logChannelId: null },
-  antialt: { enabled: false, action: 'kick', minAccountAgeDays: 7, logChannelId: null },
   starboard: { enabled: false, channelId: null, threshold: 3 },
   inviteTracker: { enabled: false },
-  stats: {
-    enabled: false,
-    categoryId: null,
-    categoryName: '📊・server-stats',
-    refreshSeconds: 300,
-    server: {},
-    social: {},
-    custom: []
-  },
+  staffApplications: { enabled: false, panelChannelId: null, logChannelId: null, questions: [], title: 'Staff Applications', description: 'Click Apply to start your application.', dmIntro: 'Are you ready to start your staff application?' },
   maintenance: false,
   blacklist: []
 };
@@ -225,337 +188,136 @@ const DEFAULT_CONFIG = {
 function deepMerge(base, override) {
   const out = Array.isArray(base) ? [...base] : { ...base };
   for (const k of Object.keys(override || {})) {
-    if (override[k] && typeof override[k] === 'object' && !Array.isArray(override[k]) && base[k] && typeof base[k] === 'object') {
-      out[k] = deepMerge(base[k], override[k]);
-    } else {
-      out[k] = override[k];
-    }
+    if (override[k] && typeof override[k] === 'object' && !Array.isArray(override[k]) && base[k] && typeof base[k] === 'object') out[k] = deepMerge(base[k], override[k]);
+    else out[k] = override[k];
   }
   return out;
 }
 
 const getConfigStmt = db.prepare('SELECT data FROM guild_config WHERE guildId = ?');
-const upsertConfigStmt = db.prepare(`
-  INSERT INTO guild_config (guildId, data) VALUES (@guildId, @data)
-  ON CONFLICT(guildId) DO UPDATE SET data = @data
-`);
-
-function normalizeRolePanels(config) {
-  const out = config;
-  if (!Array.isArray(out.buttonRolePanels)) out.buttonRolePanels = [];
-  if (!Array.isArray(out.reactionRolePanels)) out.reactionRolePanels = [];
-
-  // Migrate the old single-panel format in memory. The next save persists the new format.
-  if (!out.buttonRolePanels.length && out.buttonRoles && (
-    out.buttonRoles.channelId || (out.buttonRoles.buttons || []).length || out.buttonRoles.title || out.buttonRoles.image
-  )) {
-    out.buttonRolePanels.push({
-      id: 'legacy-button-panel',
-      enabled: out.buttonRoles.enabled !== false,
-      channelId: out.buttonRoles.channelId || null,
-      title: out.buttonRoles.title || 'Choose your roles',
-      description: out.buttonRoles.description || 'Press a button to get or remove a role.',
-      image: out.buttonRoles.image || null,
-      embedType: out.buttonRoles.embedType || 'embed',
-      buttons: Array.isArray(out.buttonRoles.buttons) ? [...out.buttonRoles.buttons] : []
-    });
-  }
-
-  if (!out.reactionRolePanels.length && out.reactionRoles && (
-    out.reactionRoles.channelId || out.reactionRoles.messageId || (out.reactionRoles.mappings || []).length
-  )) {
-    out.reactionRolePanels.push({
-      id: 'legacy-reaction-panel',
-      enabled: out.reactionRoles.enabled !== false,
-      channelId: out.reactionRoles.channelId || null,
-      messageId: out.reactionRoles.messageId || null,
-      title: 'Choose your roles',
-      description: 'React below to receive or remove a role.',
-      mappings: Array.isArray(out.reactionRoles.mappings) ? [...out.reactionRoles.mappings] : []
-    });
-  }
-
-  return out;
-}
-
+const upsertConfigStmt = db.prepare('INSERT INTO guild_config (guildId, data) VALUES (@guildId, @data) ON CONFLICT(guildId) DO UPDATE SET data = @data');
 function getConfig(guildId) {
   const row = getConfigStmt.get(guildId);
-  const stored = row ? JSON.parse(row.data) : {};
-  return normalizeRolePanels(deepMerge(DEFAULT_CONFIG, stored));
+  let stored = {};
+  try { stored = row ? JSON.parse(row.data) : {}; } catch { stored = {}; }
+  return deepMerge(DEFAULT_CONFIG, stored);
 }
-
 function saveConfig(guildId, partial) {
-  const current = getConfig(guildId);
-  const merged = deepMerge(current, partial);
+  const merged = deepMerge(getConfig(guildId), partial || {});
   upsertConfigStmt.run({ guildId, data: JSON.stringify(merged) });
   return merged;
 }
 
-// ---------- leveling ----------
+// Levels
 const getLevelStmt = db.prepare('SELECT * FROM levels WHERE guildId = ? AND userId = ?');
-const upsertLevelStmt = db.prepare(`
-  INSERT INTO levels (guildId, userId, xp, level, lastMessage) VALUES (?, ?, ?, ?, ?)
-  ON CONFLICT(guildId, userId) DO UPDATE SET xp = excluded.xp, level = excluded.level, lastMessage = excluded.lastMessage
-`);
+const upsertLevelStmt = db.prepare('INSERT INTO levels (guildId, userId, xp, level, lastMessage) VALUES (?, ?, ?, ?, ?) ON CONFLICT(guildId, userId) DO UPDATE SET xp=excluded.xp, level=excluded.level, lastMessage=excluded.lastMessage');
 const topLevelsStmt = db.prepare('SELECT * FROM levels WHERE guildId = ? ORDER BY xp DESC LIMIT ?');
+function getLevel(guildId, userId) { return getLevelStmt.get(guildId, userId) || { guildId, userId, xp: 0, level: 0, lastMessage: 0 }; }
+function setLevel(guildId, userId, xp, level, lastMessage) { upsertLevelStmt.run(guildId, userId, xp, level, lastMessage); }
+function topLevels(guildId, limit = 10) { return topLevelsStmt.all(guildId, limit); }
 
-function getLevel(guildId, userId) {
-  return getLevelStmt.get(guildId, userId) || { guildId, userId, xp: 0, level: 0, lastMessage: 0 };
-}
-function setLevel(guildId, userId, xp, level, lastMessage) {
-  upsertLevelStmt.run(guildId, userId, xp, level, lastMessage);
-}
-function topLevels(guildId, limit = 10) {
-  return topLevelsStmt.all(guildId, limit);
-}
+// Warnings
+const addWarnStmt = db.prepare('INSERT INTO warns (guildId,userId,moderatorId,reason,timestamp) VALUES (?,?,?,?,?)');
+const getWarnsStmt = db.prepare('SELECT * FROM warns WHERE guildId=? AND userId=? ORDER BY timestamp DESC');
+const clearWarnsStmt = db.prepare('DELETE FROM warns WHERE guildId=? AND userId=?');
+function addWarn(guildId,userId,moderatorId,reason){addWarnStmt.run(guildId,userId,moderatorId,reason,Date.now());}
+function getWarns(guildId,userId){return getWarnsStmt.all(guildId,userId);}
+function clearWarns(guildId,userId){clearWarnsStmt.run(guildId,userId);}
 
+// Tickets
+const createTicketStmt = db.prepare('INSERT INTO tickets(channelId,guildId,userId,status,createdAt) VALUES (?,?,?,?,?)');
+function createTicket(channelId,guildId,userId){createTicketStmt.run(channelId,guildId,userId,'open',Date.now());}
+function getTicket(channelId){return db.prepare('SELECT * FROM tickets WHERE channelId=?').get(channelId);}
+function setTicketStatus(channelId,status,claimedBy=null){db.prepare('UPDATE tickets SET status=?, claimedBy=? WHERE channelId=?').run(status,claimedBy,channelId);}
+function closeTicket(channelId){db.prepare("UPDATE tickets SET status='closed' WHERE channelId=?").run(channelId);}
+function openTicketsForUser(guildId,userId){return db.prepare("SELECT * FROM tickets WHERE guildId=? AND userId=? AND status='open'").all(guildId,userId);}
 
-// ---------- giveaways ----------
-const insertGiveawayStmt = db.prepare(`
-  INSERT INTO giveaways
-  (guildId, channelId, messageId, hostId, prize, winners, durationMs, endsAt, status, participants, createdAt)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-const getGiveawayStmt = db.prepare('SELECT * FROM giveaways WHERE id = ? AND guildId = ?');
-const updateGiveawayStmt = db.prepare('UPDATE giveaways SET channelId=?, messageId=?, prize=?, winners=?, durationMs=?, endsAt=?, status=?, participants=? WHERE id=? AND guildId=?');
-const listGiveawaysStmt = db.prepare('SELECT * FROM giveaways WHERE guildId = ? ORDER BY createdAt DESC LIMIT ?');
+// Voice master
+function addVMChannel(channelId,guildId,ownerId){db.prepare('INSERT OR REPLACE INTO voicemaster_channels(channelId,guildId,ownerId) VALUES (?,?,?)').run(channelId,guildId,ownerId);}
+function getVMChannel(channelId){return db.prepare('SELECT * FROM voicemaster_channels WHERE channelId=?').get(channelId);}
+function removeVMChannel(channelId){db.prepare('DELETE FROM voicemaster_channels WHERE channelId=?').run(channelId);}
 
-function createGiveaway(guildId, hostId, data = {}) {
-  const now = Date.now();
-  const durationMs = Number(data.durationMs || 86400000);
-  const result = insertGiveawayStmt.run(
-    guildId, data.channelId || null, data.messageId || null, hostId,
-    String(data.prize || 'Giveaway'), Math.max(1, Number(data.winners || 1)),
-    durationMs, Number(data.endsAt || now + durationMs),
-    data.status || 'configuring', JSON.stringify(data.participants || []), now
-  );
-  return getGiveawayStmt.get(result.lastInsertRowid, guildId);
-}
-function getGiveaway(guildId, id) { return getGiveawayStmt.get(id, guildId); }
-function updateGiveaway(guildId, id, patch = {}) {
-  const cur = getGiveaway(guildId, id);
-  if (!cur) return null;
-  const next = { ...cur, ...patch };
-  updateGiveawayStmt.run(
-    next.channelId, next.messageId, next.prize, next.winners, next.durationMs,
-    next.endsAt, next.status, typeof next.participants === 'string' ? next.participants : JSON.stringify(next.participants || []),
-    id, guildId
-  );
-  return getGiveaway(guildId, id);
-}
-function listGiveaways(guildId, limit = 25) { return listGiveawaysStmt.all(guildId, limit); }
+// Whitelist / action logs / sticky roles / spam / joins
+function addToWhitelist(guildId,userId){db.prepare('INSERT OR IGNORE INTO antinuke_whitelist(guildId,userId) VALUES (?,?)').run(guildId,userId);}
+function removeFromWhitelist(guildId,userId){db.prepare('DELETE FROM antinuke_whitelist WHERE guildId=? AND userId=?').run(guildId,userId);}
+function isWhitelisted(guildId,userId){return !!db.prepare('SELECT 1 FROM antinuke_whitelist WHERE guildId=? AND userId=?').get(guildId,userId);}
+function logAction(guildId,userId,type,detail){db.prepare('INSERT INTO action_log(guildId,userId,type,detail,timestamp) VALUES (?,?,?,?,?)').run(guildId,userId,type,detail,Date.now());}
+function recentActions(guildId,limit=15){return db.prepare('SELECT * FROM action_log WHERE guildId=? ORDER BY timestamp DESC LIMIT ?').all(guildId,limit);}
+function getStickyRoles(guildId,userId){const r=db.prepare('SELECT roles FROM sticky_roles WHERE guildId=? AND userId=?').get(guildId,userId); try{return r?JSON.parse(r.roles):[];}catch{return[];}}
+function setStickyRoles(guildId,userId,roles){db.prepare('INSERT INTO sticky_roles(guildId,userId,roles) VALUES (?,?,?) ON CONFLICT(guildId,userId) DO UPDATE SET roles=excluded.roles').run(guildId,userId,JSON.stringify(roles));}
+function bumpSpam(guildId,userId,windowSeconds){const now=Date.now();const r=db.prepare('SELECT * FROM spam_tracker WHERE guildId=? AND userId=?').get(guildId,userId);if(!r||now-r.windowStart>windowSeconds*1000){db.prepare('INSERT OR REPLACE INTO spam_tracker(guildId,userId,count,windowStart) VALUES (?,?,?,?)').run(guildId,userId,1,now);return 1;}const n=r.count+1;db.prepare('UPDATE spam_tracker SET count=? WHERE guildId=? AND userId=?').run(n,guildId,userId);return n;}
+function trackJoin(guildId,userId){db.prepare('INSERT INTO join_tracker(guildId,userId,timestamp) VALUES (?,?,?)').run(guildId,userId,Date.now());}
+function recentJoinCount(guildId,windowSeconds){return db.prepare('SELECT COUNT(*) c FROM join_tracker WHERE guildId=? AND timestamp>?').get(guildId,Date.now()-windowSeconds*1000).c;}
 
-// ---------- role panel helpers ----------
-function findPanel(guildId, kind, panelId) {
-  const cfg = getConfig(guildId);
-  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
-  return (cfg[key] || []).find(p => p.id === panelId) || null;
-}
+// Emoji overrides
+function getEmojiOverride(name){return db.prepare('SELECT value FROM emoji_overrides WHERE name=?').get(name)?.value||null;}
+function setEmojiOverride(name,value){db.prepare('INSERT INTO emoji_overrides(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(name,value);}
+function resetEmojiOverride(name){db.prepare('DELETE FROM emoji_overrides WHERE name=?').run(name);}
+function getAllEmojiOverrides(){const out={};for(const r of db.prepare('SELECT name,value FROM emoji_overrides').all())out[r.name]=r.value;return out;}
+function saveEmojiSnapshot(values){const code='EM-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,7).toUpperCase();db.prepare('INSERT INTO emoji_snapshots(code,data,createdAt) VALUES (?,?,?)').run(code,JSON.stringify(values),Date.now());return code;}
+function getEmojiSnapshot(code){const r=db.prepare('SELECT data FROM emoji_snapshots WHERE code=?').get(code);if(!r)return null;try{return JSON.parse(r.data);}catch{return null;}}
 
-function upsertPanel(guildId, kind, panel) {
-  const cfg = getConfig(guildId);
-  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
-  const list = [...(cfg[key] || [])];
-  const index = list.findIndex(p => p.id === panel.id);
-  if (index >= 0) list[index] = { ...list[index], ...panel };
-  else list.push(panel);
-  return saveConfig(guildId, { [key]: list });
+// Dynamic embed text registry
+function slugifyEmbedName(sourceTitle){
+  return String(sourceTitle||'embed').replace(/<@!?\d+>/g,'@user').replace(/\d{15,25}/g,'id').replace(/[^a-zA-Z0-9 _-]/g,'').trim().replace(/\s+/g,'-').toLowerCase().slice(0,70) || 'embed';
 }
-
-function removePanel(guildId, kind, panelId) {
-  const cfg = getConfig(guildId);
-  const key = kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels';
-  const list = (cfg[key] || []).filter(p => p.id !== panelId);
-  return saveConfig(guildId, { [key]: list });
-}
-
-// ---------- warns ----------
-const addWarnStmt = db.prepare('INSERT INTO warns (guildId, userId, moderatorId, reason, timestamp) VALUES (?, ?, ?, ?, ?)');
-const getWarnsStmt = db.prepare('SELECT * FROM warns WHERE guildId = ? AND userId = ? ORDER BY timestamp DESC');
-const clearWarnsStmt = db.prepare('DELETE FROM warns WHERE guildId = ? AND userId = ?');
-
-function addWarn(guildId, userId, moderatorId, reason) {
-  addWarnStmt.run(guildId, userId, moderatorId, reason, Date.now());
-}
-function getWarns(guildId, userId) {
-  return getWarnsStmt.all(guildId, userId);
-}
-function clearWarns(guildId, userId) {
-  clearWarnsStmt.run(guildId, userId);
-}
-
-// ---------- tickets ----------
-const createTicketStmt = db.prepare('INSERT INTO tickets (channelId, guildId, userId, status, createdAt) VALUES (?, ?, ?, ?, ?)');
-const getTicketStmt = db.prepare('SELECT * FROM tickets WHERE channelId = ?');
-const setTicketStatusStmt = db.prepare('UPDATE tickets SET status = ?, claimedBy = COALESCE(?, claimedBy) WHERE channelId = ?');
-const openTicketForUserStmt = db.prepare("SELECT * FROM tickets WHERE guildId = ? AND userId = ? AND status = 'open' ORDER BY createdAt DESC");
-const openTicketsForUserStmt = db.prepare("SELECT * FROM tickets WHERE guildId = ? AND userId = ? AND status = 'open' ORDER BY createdAt DESC");
-
-function createTicket(channelId, guildId, userId) {
-  createTicketStmt.run(channelId, guildId, userId, 'open', Date.now());
-}
-function getTicket(channelId) {
-  return getTicketStmt.get(channelId);
-}
-function closeTicket(channelId) {
-  db.prepare("UPDATE tickets SET status = 'closed' WHERE channelId = ?").run(channelId);
-}
-function setTicketStatus(channelId, status, claimedBy = null) {
-  setTicketStatusStmt.run(status, claimedBy, channelId);
-}
-function openTicketForUser(guildId, userId) {
-  return openTicketForUserStmt.get(guildId, userId);
-}
-function openTicketsForUser(guildId, userId) {
-  return openTicketsForUserStmt.all(guildId, userId);
-}
-
-// ---------- voicemaster ----------
-const addVMChannelStmt = db.prepare('INSERT INTO voicemaster_channels (channelId, guildId, ownerId) VALUES (?, ?, ?)');
-const getVMChannelStmt = db.prepare('SELECT * FROM voicemaster_channels WHERE channelId = ?');
-const removeVMChannelStmt = db.prepare('DELETE FROM voicemaster_channels WHERE channelId = ?');
-
-function addVMChannel(channelId, guildId, ownerId) {
-  addVMChannelStmt.run(channelId, guildId, ownerId);
-}
-function getVMChannel(channelId) {
-  return getVMChannelStmt.get(channelId);
-}
-function removeVMChannel(channelId) {
-  removeVMChannelStmt.run(channelId);
-}
-
-// ---------- antinuke whitelist ----------
-const addWhitelistStmt = db.prepare('INSERT OR IGNORE INTO antinuke_whitelist (guildId, userId) VALUES (?, ?)');
-const removeWhitelistStmt = db.prepare('DELETE FROM antinuke_whitelist WHERE guildId = ? AND userId = ?');
-const isWhitelistedStmt = db.prepare('SELECT 1 FROM antinuke_whitelist WHERE guildId = ? AND userId = ?');
-
-function addToWhitelist(guildId, userId) { addWhitelistStmt.run(guildId, userId); }
-function removeFromWhitelist(guildId, userId) { removeWhitelistStmt.run(guildId, userId); }
-function isWhitelisted(guildId, userId) { return !!isWhitelistedStmt.get(guildId, userId); }
-
-// ---------- action log (antinuke / audit trail shown in /logs) ----------
-const addActionLogStmt = db.prepare('INSERT INTO action_log (guildId, userId, type, detail, timestamp) VALUES (?, ?, ?, ?, ?)');
-const recentActionLogStmt = db.prepare('SELECT * FROM action_log WHERE guildId = ? ORDER BY timestamp DESC LIMIT ?');
-
-function logAction(guildId, userId, type, detail) {
-  addActionLogStmt.run(guildId, userId, type, detail, Date.now());
-}
-function recentActions(guildId, limit = 15) {
-  return recentActionLogStmt.all(guildId, limit);
-}
-
-// ---------- sticky roles ----------
-const getStickyStmt = db.prepare('SELECT roles FROM sticky_roles WHERE guildId = ? AND userId = ?');
-const setStickyStmt = db.prepare(`
-  INSERT INTO sticky_roles (guildId, userId, roles) VALUES (?, ?, ?)
-  ON CONFLICT(guildId, userId) DO UPDATE SET roles = excluded.roles
-`);
-
-function getStickyRoles(guildId, userId) {
-  const row = getStickyStmt.get(guildId, userId);
-  return row ? JSON.parse(row.roles) : [];
-}
-function setStickyRoles(guildId, userId, roles) {
-  setStickyStmt.run(guildId, userId, JSON.stringify(roles));
-}
-
-// ---------- spam tracker (rolling window counters, cleaned lazily) ----------
-const getSpamStmt = db.prepare('SELECT * FROM spam_tracker WHERE guildId = ? AND userId = ?');
-const setSpamStmt = db.prepare(`
-  INSERT INTO spam_tracker (guildId, userId, count, windowStart) VALUES (?, ?, ?, ?)
-  ON CONFLICT(guildId, userId) DO UPDATE SET count = excluded.count, windowStart = excluded.windowStart
-`);
-
-function bumpSpam(guildId, userId, windowSeconds) {
-  const now = Date.now();
-  const row = getSpamStmt.get(guildId, userId);
-  if (!row || now - row.windowStart > windowSeconds * 1000) {
-    setSpamStmt.run(guildId, userId, 1, now);
-    return 1;
+function registerEmbedText(sourceTitle, description='', footer=''){
+  const name=slugifyEmbedName(sourceTitle);
+  const existing=db.prepare('SELECT * FROM embed_texts WHERE name=?').get(name);
+  if(existing){
+    db.prepare('UPDATE embed_texts SET sourceTitle=?, uses=uses+1, updatedAt=? WHERE name=?').run(String(sourceTitle),Date.now(),name);
+    return existing;
   }
-  const count = row.count + 1;
-  setSpamStmt.run(guildId, userId, count, row.windowStart);
-  return count;
+  db.prepare('INSERT INTO embed_texts(name,sourceTitle,title,description,footer,uses,updatedAt) VALUES (?,?,?,?,?,?,?)').run(name,String(sourceTitle),String(sourceTitle),String(description||''),String(footer||''),1,Date.now());
+  return db.prepare('SELECT * FROM embed_texts WHERE name=?').get(name);
+}
+function getEmbedText(name){return db.prepare('SELECT * FROM embed_texts WHERE lower(name)=lower(?) OR lower(sourceTitle)=lower(?) LIMIT 1').get(name,name)||null;}
+function listEmbedTexts(limit=500){return db.prepare('SELECT * FROM embed_texts ORDER BY updatedAt DESC LIMIT ?').all(limit);}
+function updateEmbedText(name, patch){
+  const row=getEmbedText(name); if(!row) return null;
+  const next={title:patch.title??row.title,description:patch.description??row.description,footer:patch.footer??row.footer};
+  db.prepare('UPDATE embed_texts SET title=?,description=?,footer=?,updatedAt=? WHERE name=?').run(next.title,next.description,next.footer,Date.now(),row.name);
+  return db.prepare('SELECT * FROM embed_texts WHERE name=?').get(row.name);
 }
 
-// ---------- join tracker (antiraid) ----------
-const addJoinStmt = db.prepare('INSERT INTO join_tracker (guildId, userId, timestamp) VALUES (?, ?, ?)');
-const recentJoinsStmt = db.prepare('SELECT COUNT(*) as c FROM join_tracker WHERE guildId = ? AND timestamp > ?');
+// Owner-global config
+function getOwnerConfig(){const r=db.prepare('SELECT data FROM owner_config WHERE id=1').get();if(!r)return {};try{return JSON.parse(r.data)||{};}catch{return {};}}
+function saveOwnerConfig(partial){const current=getOwnerConfig();const merged=deepMerge(current,partial||{});db.prepare('INSERT INTO owner_config(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(JSON.stringify(merged));return merged;}
 
-function trackJoin(guildId, userId) {
-  addJoinStmt.run(guildId, userId, Date.now());
-}
-function recentJoinCount(guildId, windowSeconds) {
-  return recentJoinsStmt.get(guildId, Date.now() - windowSeconds * 1000).c;
-}
+// Owner-managed memberships
+function membership(guildId){return db.prepare('SELECT * FROM memberships WHERE guildId=?').get(guildId)||null;}
+function addMembership(guildId,{days=30,plan=null,note='' }={}){const n=Math.max(1,Number(days)||30);const now=Date.now();const old=membership(guildId);const start=old&&old.expiresAt>now?old.expiresAt:now;const expires=start+n*86400000;const label=plan||`${n} Days`;db.prepare('INSERT INTO memberships(guildId,plan,durationDays,createdAt,expiresAt,note) VALUES(?,?,?,?,?,?) ON CONFLICT(guildId) DO UPDATE SET plan=excluded.plan,durationDays=excluded.durationDays,createdAt=excluded.createdAt,expiresAt=excluded.expiresAt,note=excluded.note').run(guildId,label,n,now,expires,String(note||''));return membership(guildId);}
+function removeMembership(guildId){db.prepare('DELETE FROM memberships WHERE guildId=?').run(guildId);}
+function listMemberships(){return db.prepare('SELECT * FROM memberships ORDER BY expiresAt DESC').all().map(r=>({...r,status:Date.now()<r.expiresAt?'active':'expired'}));}
 
+// Giveaways
+function createGiveaway(guildId,hostId,opts={}){const info={prize:String(opts.prize||'Giveaway'),winners:Math.max(1,Number(opts.winners)||1),durationMs:Number(opts.durationMs)||0,endsAt:Number(opts.endsAt)||0,channelId:opts.channelId||null,createdAt:Date.now()};const q=db.prepare('INSERT INTO giveaways(guildId,hostId,prize,winners,durationMs,endsAt,channelId,status,createdAt) VALUES (?,?,?,?,?,?,?,?,?)');const result=q.run(guildId,hostId,info.prize,info.winners,info.durationMs,info.endsAt,info.channelId,'configuring',info.createdAt);return getGiveaway(guildId,result.lastInsertRowid);}
+function getGiveaway(guildId,id){return db.prepare('SELECT * FROM giveaways WHERE guildId=? AND id=?').get(guildId,Number(id));}
+function listGiveaways(guildId,limit=50){return db.prepare('SELECT * FROM giveaways WHERE guildId=? ORDER BY id DESC LIMIT ?').all(guildId,limit);}
+function updateGiveaway(guildId,id,patch){const row=getGiveaway(guildId,id);if(!row)return null;const next={...row,...patch,participants:patch.participants??row.participants};const fields=['prize','winners','durationMs','endsAt','channelId','messageId','participants','status'];const set=fields.filter(k=>Object.prototype.hasOwnProperty.call(patch,k)).map(k=>`${k}=?`).join(',');if(set)db.prepare(`UPDATE giveaways SET ${set} WHERE guildId=? AND id=?`).run(...fields.filter(k=>Object.prototype.hasOwnProperty.call(patch,k)).map(k=>next[k]),guildId,Number(id));return getGiveaway(guildId,id);}
 
-// ---------- saved embeds ----------
-const saveEmbedStmt = db.prepare(`INSERT INTO saved_embeds (guildId,name,data,createdAt,updatedAt) VALUES (?,?,?,?,?) ON CONFLICT(guildId,name) DO UPDATE SET data=excluded.data, updatedAt=excluded.updatedAt`);
-const getEmbedStmt = db.prepare('SELECT * FROM saved_embeds WHERE guildId = ? AND name = ?');
-const listEmbedsStmt = db.prepare('SELECT name, createdAt, updatedAt FROM saved_embeds WHERE guildId = ? ORDER BY name COLLATE NOCASE');
-const deleteEmbedStmt = db.prepare('DELETE FROM saved_embeds WHERE guildId = ? AND name = ?');
-function saveEmbed(guildId, name, data) { const now=Date.now(); saveEmbedStmt.run(guildId, String(name).trim().toLowerCase(), JSON.stringify(data), now, now); return getEmbed(guildId,name); }
-function getEmbed(guildId, name) { const row=getEmbedStmt.get(guildId,String(name).trim().toLowerCase()); return row ? {...row, data:JSON.parse(row.data)} : null; }
-function listEmbeds(guildId) { return listEmbedsStmt.all(guildId); }
-function deleteEmbed(guildId, name) { return deleteEmbedStmt.run(guildId,String(name).trim().toLowerCase()).changes > 0; }
-// ---------- emoji overrides (bot-wide, owner-configurable via /emoji) ----------
-const getEmojiStmt = db.prepare('SELECT value FROM emoji_overrides WHERE name = ?');
-const setEmojiStmt = db.prepare(`
-  INSERT INTO emoji_overrides (name, value) VALUES (?, ?)
-  ON CONFLICT(name) DO UPDATE SET value = excluded.value
-`);
-const deleteEmojiStmt = db.prepare('DELETE FROM emoji_overrides WHERE name = ?');
-const allEmojiStmt = db.prepare('SELECT name, value FROM emoji_overrides');
-const saveEmojiSnapshotStmt = db.prepare('INSERT INTO emoji_snapshots (code, data, createdAt) VALUES (?, ?, ?)');
-const getEmojiSnapshotStmt = db.prepare('SELECT data FROM emoji_snapshots WHERE code = ?');
+// Saved embeds used by /embed load/delete/list from recent builds.
+function saveEmbed(guildId,name,data){const now=Date.now();db.prepare('INSERT INTO saved_embeds(guildId,name,data,createdAt,updatedAt) VALUES(?,?,?,?,?) ON CONFLICT(guildId,name) DO UPDATE SET data=excluded.data,updatedAt=excluded.updatedAt').run(guildId,name,JSON.stringify(data),now,now);return getEmbed(guildId,name);}
+function getEmbed(guildId,name){const r=db.prepare('SELECT * FROM saved_embeds WHERE guildId=? AND lower(name)=lower(?)').get(guildId,name);if(!r)return null;try{return {...r,data:JSON.parse(r.data)};}catch{return null;}}
+function listEmbeds(guildId){return db.prepare('SELECT * FROM saved_embeds WHERE guildId=? ORDER BY updatedAt DESC').all(guildId).map(r=>{try{return {...r,data:JSON.parse(r.data)};}catch{return r;}});}
+function deleteEmbed(guildId,name){return db.prepare('DELETE FROM saved_embeds WHERE guildId=? AND lower(name)=lower(?)').run(guildId,name).changes>0;}
 
-function getEmojiOverride(name) {
-  const row = getEmojiStmt.get(name);
-  return row ? row.value : null;
-}
-function setEmojiOverride(name, value) {
-  setEmojiStmt.run(name, value);
-}
-function resetEmojiOverride(name) {
-  deleteEmojiStmt.run(name);
-}
-function getAllEmojiOverrides() {
-  const out = {};
-  for (const row of allEmojiStmt.all()) out[row.name] = row.value;
-  return out;
-}
-function randomSnapshotCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  let code = '';
-  do { code = Array.from({length: 12}, () => chars[Math.floor(Math.random()*chars.length)]).join(''); }
-  while (getEmojiSnapshotStmt.get(code));
-  return code;
-}
-function saveEmojiSnapshot(values) {
-  const code = randomSnapshotCode();
-  saveEmojiSnapshotStmt.run(code, JSON.stringify(values || {}), Date.now());
-  return code;
-}
-function getEmojiSnapshot(code) {
-  const row = getEmojiSnapshotStmt.get(String(code || '').trim());
-  return row ? JSON.parse(row.data) : null;
-}
+// Role panels stored inside the JSON config, so no extra migration is needed.
+function panelArrayKey(kind){return kind==='button'?'buttonRolePanels':'reactionRolePanels';}
+function findPanel(guildId,kind,panelId){const arr=getConfig(guildId)[panelArrayKey(kind)]||[];return arr.find(p=>p.id===panelId)||null;}
+function upsertPanel(guildId,kind,panel){const key=panelArrayKey(kind);const arr=[...(getConfig(guildId)[key]||[])];const i=arr.findIndex(p=>p.id===panel.id);if(i>=0)arr[i]=panel;else arr.push(panel);return saveConfig(guildId,{[key]:arr})[key].find(p=>p.id===panel.id);}
+function removePanel(guildId,kind,panelId){const key=panelArrayKey(kind);return saveConfig(guildId,{[key]:(getConfig(guildId)[key]||[]).filter(p=>p.id!==panelId)})[key];}
 
-module.exports = {
-  db, DEFAULT_CONFIG,
-  getConfig, saveConfig, findPanel, upsertPanel, removePanel,
-  getLevel, setLevel, topLevels,
-  addWarn, getWarns, clearWarns,
-  createTicket, getTicket, closeTicket, setTicketStatus, openTicketForUser, openTicketsForUser,
-  addVMChannel, getVMChannel, removeVMChannel,
-  addToWhitelist, removeFromWhitelist, isWhitelisted,
-  logAction, recentActions,
-  getStickyRoles, setStickyRoles,
-  bumpSpam, trackJoin, recentJoinCount,
-  getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
-  saveEmojiSnapshot, getEmojiSnapshot, DB_PATH, DATA_DIR,
-  saveEmbed, getEmbed, listEmbeds, deleteEmbed,
-  createGiveaway, getGiveaway, updateGiveaway, listGiveaways,
+module.exports={
+  db,DB_PATH,DEFAULT_CONFIG,getConfig,saveConfig,
+  getLevel,setLevel,topLevels,addWarn,getWarns,clearWarns,
+  createTicket,getTicket,setTicketStatus,closeTicket,openTicketsForUser,
+  addVMChannel,getVMChannel,removeVMChannel,
+  addToWhitelist,removeFromWhitelist,isWhitelisted,logAction,recentActions,getStickyRoles,setStickyRoles,bumpSpam,trackJoin,recentJoinCount,
+  getEmojiOverride,setEmojiOverride,resetEmojiOverride,getAllEmojiOverrides,saveEmojiSnapshot,getEmojiSnapshot,
+  registerEmbedText,getEmbedText,listEmbedTexts,updateEmbedText,
+  getOwnerConfig,saveOwnerConfig,membership,addMembership,removeMembership,listMemberships,
+  createGiveaway,getGiveaway,listGiveaways,updateGiveaway,
+  saveEmbed,getEmbed,listEmbeds,deleteEmbed,
+  findPanel,upsertPanel,removePanel
 };
