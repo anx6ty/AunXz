@@ -21,6 +21,26 @@ function requireAdmin(interaction) {
   return true;
 }
 
+function activeMembership(guildId) {
+  const row = db.membership(guildId);
+  return !!row && Number(row.expiresAt) > Date.now();
+}
+
+function requireMembership(interaction) {
+  if (!interaction.guildId || !activeMembership(interaction.guildId)) {
+    const row = interaction.guildId ? db.membership(interaction.guildId) : null;
+    const details = row?.expiresAt
+      ? `Your AunXz membership expired <t:${Math.floor(Number(row.expiresAt) / 1000)}:R>.`
+      : 'This server does not have an active AunXz membership.';
+    interaction.reply({
+      embeds: [ui.errorEmbed('Membership Required', `${details}\n\nAsk the AunXz owner for a membership plan before using this feature.`)],
+      ephemeral: true
+    });
+    return false;
+  }
+  return true;
+}
+
 function getImageAttachment(interaction, optionName) {
   const attachment = interaction.options.getAttachment(optionName);
   if (!attachment) return null;
@@ -356,6 +376,73 @@ commands.push({
     await interaction.reply({embeds:[ui.base('🎉 Giveaway Configuration')
       .setDescription(`Configure and publish this giveaway.\n\n**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** <t:${Math.floor(g.endsAt/1000)}:R>\n**Channel:** ${channel}`)
       .setFooter({text:`Giveaway #${g.id} • Hosted by ${interaction.user.tag}`})],components:[row],ephemeral:true});
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// /serverprofile — per-server AunXz avatar/banner (membership feature)
+// Discord exposes a guild-specific bot member profile; this changes only AunXz's
+// profile in the current server, not the global bot avatar/banner.
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder().setName('serverprofile').setDescription('Customize AunXz for this server (membership required).')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(s => s.setName('avatar').setDescription('Set AunXz\'s server-specific avatar.')
+      .addAttachmentOption(o => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
+    .addSubcommand(s => s.setName('banner').setDescription('Set AunXz\'s server-specific banner.')
+      .addAttachmentOption(o => o.setName('image').setDescription('PNG, JPG or GIF image').setRequired(true)))
+    .addSubcommand(s => s.setName('reset_avatar').setDescription('Reset AunXz\'s server-specific avatar.'))
+    .addSubcommand(s => s.setName('reset_banner').setDescription('Reset AunXz\'s server-specific banner.')),
+  async execute(interaction) {
+    if (!interaction.member?.permissions?.has(PermissionFlagsBits.ManageGuild) &&
+        !interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Manage Server** or **Administrator**.')], ephemeral: true });
+    }
+    if (!requireMembership(interaction)) return;
+
+    const sub = interaction.options.getSubcommand();
+    const guild = interaction.guild;
+    const botMember = guild.members?.me || await guild.members.fetchMe().catch(() => null);
+    if (!botMember) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Bot Member Missing', 'I could not access my server member profile here.')], ephemeral: true });
+    }
+
+    const key = sub.includes('avatar') ? 'avatar' : 'banner';
+    const isReset = sub.startsWith('reset_');
+    if (isReset) {
+      try {
+        await guild.members.editMe({ [key]: null, reason: `AunXz server profile ${key} reset` });
+        return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Server ${key === 'avatar' ? 'PFP' : 'Banner'} Reset`, `AunXz's **server-specific ${key}** was reset for **${guild.name}**.`)] });
+      } catch (e) {
+        return interaction.reply({ embeds: [ui.errorEmbed('Profile Reset Failed', String(e?.message || e))], ephemeral: true });
+      }
+    }
+
+    const attachment = interaction.options.getAttachment('image', true);
+    const contentType = String(attachment.contentType || '').toLowerCase();
+    const name = String(attachment.name || '').toLowerCase();
+    const valid = contentType.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(name);
+    if (!valid) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Invalid Image', 'Upload a PNG, JPG, GIF or WebP image.')], ephemeral: true });
+    }
+    if (attachment.size && attachment.size > 10 * 1024 * 1024) {
+      return interaction.reply({ embeds: [ui.errorEmbed('File Too Large', 'Keep the uploaded image under 10 MB.')], ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const response = await fetch(attachment.url);
+      if (!response.ok) throw new Error(`Could not download the upload (${response.status}).`);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      await guild.members.editMe({ [key]: buffer, reason: `AunXz server profile ${key} changed` });
+      return interaction.editReply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Server ${key === 'avatar' ? 'PFP' : 'Banner'} Updated`, `AunXz's **server-specific ${key}** is now updated for **${guild.name}**.`)] });
+    } catch (e) {
+      const message = String(e?.message || e);
+      const hint = /nitro|premium|feature|not enabled|400|50035/i.test(message)
+        ? '\\n\\nDiscord may restrict this profile feature for the bot/app on this server.'
+        : '';
+      return interaction.editReply({ embeds: [ui.errorEmbed('Profile Update Failed', message + hint)] });
+    }
   }
 });
 
