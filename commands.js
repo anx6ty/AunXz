@@ -12,11 +12,9 @@ const templates = require('./template');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const isOwner = (id) => OWNER_IDS.includes(id);
-const BYPASS_IDS = (process.env.BYPASS_ID || process.env.BYPASS_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const isBypass = (id) => BYPASS_IDS.includes(String(id));
 
 function requireAdmin(interaction) {
-  if (isBypass(interaction.user?.id)) return true;
+  if (isOwner(interaction.user?.id)) return true;
   if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     return false;
@@ -37,7 +35,7 @@ function botMember(interaction) {
 
 function actionPermissionError(interaction, permission, label) {
   const member = interaction.member;
-  if (!isBypass(interaction.user?.id) && !member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+  if (!isOwner(interaction.user?.id) && !member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
     return ui.errorEmbed('Missing Permissions', `You need **${label}** to use this action.`);
   }
   const bot = botMember(interaction);
@@ -53,7 +51,7 @@ function hierarchyError(interaction, target, actionLabel) {
   if (target.id === interaction.guild.ownerId) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} the server owner.`);
   if (target.id === interaction.client.user.id) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} myself.`);
   if (target.roles?.highest?.position >= bot.roles.highest.position) return ui.errorEmbed('Role Hierarchy', `I cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than my highest role.`);
-  if (!isBypass(interaction.user?.id) && interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
+  if (!isOwner(interaction.user?.id) && interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
     return ui.errorEmbed('Role Hierarchy', `You cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than your highest role.`);
   }
   return null;
@@ -873,10 +871,22 @@ commands.push({
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
     const preflight = actionPreflight(interaction, member, PermissionFlagsBits.BanMembers, 'Ban Members', 'ban');
     if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
+
+    const bot = botMember(interaction);
+    if (!bot?.permissions?.has(PermissionFlagsBits.BanMembers) && !bot?.permissions?.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Bot Missing Permissions', 'I need **Ban Members** permission to ban members.')], ephemeral: true });
+    }
+    if (member && !member.bannable) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Cannot Ban Member', `Discord does not allow me to ban **${user.tag}**. Make sure my highest role is above their highest role.`)], ephemeral: true });
+    }
+
     try {
-      await interaction.guild.members.ban(user.id, { reason });
+      await interaction.guild.bans.create(user.id, { reason });
     } catch (e) {
-      return interaction.reply({ embeds: [ui.errorEmbed('Ban Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true });
+      let detail = e.message || 'unknown error';
+      if (e.code === 50013) detail = 'I do not have permission to ban this member, or my role is not high enough.';
+      else if (e.code === 10007) detail = 'The member could not be found in this server.';
+      return interaction.reply({ embeds: [ui.errorEmbed('Ban Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${detail}`)], ephemeral: true });
     }
     const embed = ui.okEmbed('🔨 Member Banned', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
     await interaction.reply({ embeds: [embed] });
@@ -1488,7 +1498,7 @@ commands.push({
 });
 
 // Keep Discord from hiding permission-gated slash commands from the configured
-// bypass user. Runtime guardCommand() still enforces permissions for everyone else.
+// owner IDs. Runtime guardCommand() still enforces permissions for everyone else.
 for (const command of commands) {
   try {
     const json = command.data.toJSON();
@@ -1501,4 +1511,4 @@ for (const command of commands) {
   }
 }
 
-module.exports = { commands, isOwner, isBypass, buildModulePatch, PANEL_MODULES };
+module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
