@@ -42,8 +42,21 @@ function requireMembership(interaction) {
 }
 function getImageAttachmentRequired(interaction, name) {
   const a = interaction.options.getAttachment(name);
-  if (!a || !(a.contentType || '').toLowerCase().startsWith('image/')) return null;
-  return a;
+  if (!a) return null;
+  const type = String(a.contentType || '').toLowerCase();
+  const filename = String(a.name || '').toLowerCase();
+  const isImage = type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(filename);
+  return isImage ? a : null;
+}
+
+async function downloadImageAttachment(attachment) {
+  const size = Number(attachment?.size || 0);
+  if (size && size > 10 * 1024 * 1024) throw new Error('That image is larger than 10 MB. Please upload a smaller file.');
+  const response = await fetch(attachment.url);
+  if (!response.ok) throw new Error(`Discord CDN returned HTTP ${response.status}.`);
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > 10 * 1024 * 1024) throw new Error('That image is larger than 10 MB. Please upload a smaller file.');
+  return Buffer.from(await response.arrayBuffer());
 }
 function parseCustomEmojiInput(raw, client) {
   const value = String(raw || '').trim();
@@ -1521,13 +1534,13 @@ function membershipCommand(name, description, field, successTitle) {
       if (!requireMembership(interaction)) return;
       const file = getImageAttachmentRequired(interaction, 'file');
       if (!file) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Image', 'Please upload a PNG, JPG, WEBP, or GIF image.')], ephemeral: true });
-      const bot = botMember(interaction);
-      if (!bot?.editable) return interaction.reply({ embeds: [ui.errorEmbed('Cannot Edit Profile', 'I cannot edit my profile in this server. Check the bot installation and Discord permissions.')], ephemeral: true });
       try {
-        await interaction.guild.members.editMe({ [field]: file.url });
+        const image = await downloadImageAttachment(file);
+        await interaction.guild.members.editMe({ [field]: image, reason: `AunXz membership ${field} update` });
         return interaction.reply({ embeds: [ui.okEmbed(successTitle, `The server-specific bot ${field === 'avatar' ? 'PFP' : 'banner'} has been updated.`)], ephemeral: true });
       } catch (e) {
-        return interaction.reply({ embeds: [ui.errorEmbed('Profile Update Failed', String(e.message || e))], ephemeral: true });
+        const code = e?.code ? `\n**Discord code:** \`${e.code}\`` : '';
+        return interaction.reply({ embeds: [ui.errorEmbed('Profile Update Failed', `${String(e.message || e)}${code}`)], ephemeral: true });
       }
     }
   };
@@ -1552,8 +1565,14 @@ commands.push({
   async execute(interaction) {
     if (!requireAdmin(interaction)) return;
     if (!requireMembership(interaction)) return;
-    try { await botMember(interaction)?.setNickname(interaction.options.getString('nickname', true), 'Membership server profile'); return interaction.reply({ embeds: [ui.okEmbed('Nickname Updated', 'AunXz now has the selected server nickname.')] }); }
-    catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('Nickname Update Failed', String(e.message || e))], ephemeral: true }); }
+    const bot = botMember(interaction) || await interaction.guild.members.fetchMe().catch(() => null);
+    if (!bot) return interaction.reply({ embeds: [ui.errorEmbed('Bot Member Missing', 'I could not resolve AunXz as a member of this server.')], ephemeral: true });
+    try {
+      await bot.setNickname(interaction.options.getString('nickname', true), 'Membership server profile');
+      return interaction.reply({ embeds: [ui.okEmbed('Nickname Updated', 'AunXz now has the selected server nickname.')] });
+    } catch (e) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Nickname Update Failed', String(e.message || e))], ephemeral: true });
+    }
   }
 });
 for (const [cmd, field, label] of [['membership_resetpfp','avatar','PFP'],['membership_resetbanner','banner','banner']]) {
