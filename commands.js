@@ -8,6 +8,7 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
+const stats = require('./stats');
 const templates = require('./template');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -360,6 +361,30 @@ commands.push({
 });
 
 // ---------------------------------------------------------------------------------
+// /statsetup — live voice-channel statistics
+// ---------------------------------------------------------------------------------
+commands.push({
+  data: new SlashCommandBuilder()
+    .setName('statsetup')
+    .setDescription('Configure live server and social-media stat voice channels.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  async execute(interaction) {
+    if (!requireAdmin(interaction)) return;
+    const cfg = stats.readStats(interaction.guildId);
+    await interaction.reply({
+      embeds: [ui.statSetupEmbed(cfg, 'server', 'members')],
+      components: [
+        ui.statSetupCategoryRow('server'),
+        ui.statSetupMetricRow(cfg, 'server', 'members'),
+        ui.statSetupCategoryChannelRow(cfg),
+        ...ui.statSetupActionRows('server', 'members', cfg)
+      ],
+      ephemeral: true
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------------
 // /embed — saved embed library
 // ---------------------------------------------------------------------------------
 commands.push({
@@ -418,7 +443,7 @@ const GENERIC_MODULES = [
 ];
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'antiwebhook', 'antibot', 'antialt', 'voicemaster', 'greetvoice', 'greetmessage',
-  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
+  'leveling', 'tickets', 'logs', 'statsetup', ...GENERIC_MODULES
 ];
 const GENERIC_COMMANDS = {
   welcome: 'welcome', leave: 'leave', boost: 'boost', starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
