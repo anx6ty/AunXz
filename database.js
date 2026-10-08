@@ -2,11 +2,52 @@
 // Safe migrations only: existing data is never wiped.
 
 const Database = require('better-sqlite3');
+const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, 'bot.sqlite');
+function ensureParent(filePath) {
+  const parent = path.dirname(filePath);
+  if (!fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
+}
+
+function resolveDatabasePath() {
+  if (process.env.DATABASE_PATH) return path.resolve(process.env.DATABASE_PATH);
+  const volume = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+  if (volume) return path.join(path.resolve(volume), 'aunxz.sqlite');
+  return path.join(__dirname, 'data', 'aunxz.sqlite');
+}
+
+const DB_PATH = resolveDatabasePath();
+ensureParent(DB_PATH);
+
+// When a Railway Volume was attached after the bot had already been using a local
+// SQLite file, move the old database into the volume once, before opening the new DB.
+// SQLite WAL is checkpointed first so no uncommitted pages are lost during migration.
+function migrateLegacyDatabase(target) {
+  if (fs.existsSync(target)) return;
+  const candidates = [
+    path.join(__dirname, 'bot.sqlite'),
+    path.join(__dirname, 'aunxz.sqlite'),
+    path.join(__dirname, 'data', 'bot.sqlite')
+  ];
+  const source = candidates.find(file => file !== target && fs.existsSync(file));
+  if (!source) return;
+  try {
+    const legacy = new Database(source);
+    try { legacy.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
+    try { legacy.close(); } catch {}
+    fs.copyFileSync(source, target);
+    console.log(`[AunXz] Migrated legacy SQLite database to persistent path: ${target}`);
+  } catch (error) {
+    console.error('[AunXz] Legacy SQLite migration failed:', error);
+  }
+}
+
+migrateLegacyDatabase(DB_PATH);
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+db.pragma('synchronous = FULL');
+db.pragma('busy_timeout = 5000');
 db.pragma('foreign_keys = ON');
 
 function hasColumn(table, column) {
