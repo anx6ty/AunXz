@@ -191,7 +191,8 @@ const HELP_CATEGORIES = {
       '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
       '**/antibadwordsetup** — multilingual profanity filter\n' +
       '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
-      '**/birthdaysetup** — birthday panel + automatic wishes'
+      '**/birthdaysetup** — birthday panel + automatic wishes\n' +
+      '**/serverprofile avatar|banner** — membership-gated per-server AunXz profile'
   },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
@@ -206,24 +207,27 @@ const HELP_CATEGORIES = {
   }
 };
 
-function helpHomeEmbed(client) {
+function visibleHelpCategories(includeOwner = false) {
+  return Object.entries(HELP_CATEGORIES).filter(([key]) => includeOwner || key !== 'owner');
+}
+function helpHomeEmbed(client, includeOwner = false) {
   return base(`${emoji('help')} Help Menu`)
     .setDescription(
       `Pick a category from the menu below.\n\n` +
-      Object.values(HELP_CATEGORIES).map(c => `${emoji(c.emojiKey)} **${c.name}**`).join('\n')
+      visibleHelpCategories(includeOwner).map(([, c]) => `${emoji(c.emojiKey)} **${c.name}**`).join('\n')
     )
     .setThumbnail(client.user.displayAvatarURL());
 }
-function helpCategoryEmbed(key) {
+function helpCategoryEmbed(key, includeOwner = false) {
   const cat = HELP_CATEGORIES[key];
-  if (!cat) return errorEmbed('Unknown Category', 'That help category no longer exists.');
+  if (!cat || (key === 'owner' && !includeOwner)) return errorEmbed('Unknown Category', 'That help category is not available.');
   return base(`${emoji(cat.emojiKey)} ${cat.name}`).setDescription(cat.desc);
 }
-function helpSelectRow() {
+function helpSelectRow(includeOwner = false) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('help_select')
     .setPlaceholder('Choose a category…')
-    .addOptions(Object.entries(HELP_CATEGORIES).map(([value, c]) => ({
+    .addOptions(visibleHelpCategories(includeOwner).map(([value, c]) => ({
       label: c.name, value, emoji: emoji(c.emojiKey)
     })));
   return new ActionRowBuilder().addComponents(menu);
