@@ -328,14 +328,20 @@ async function guardCommand(interaction, cmd) {
   const cfg = db.getConfig(interaction.guildId);
   const json = cmd.data.toJSON();
   const required = cmd.requiredMemberPermissions || json.default_member_permissions;
-  if (required && !isOwner(interaction.user?.id) && !interaction.member.permissions.has(BigInt(required))) {
-    return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
-  }
-  if (!commandIsSetupOnly(interaction)) {
-    const key = commandFeatureKey(interaction);
-    if (key && !featureEnabled(cfg, key)) {
-      const setupName = key === 'ticket' ? '/tickets setup' : key === 'greetmessage' ? '/greetmessage setup' : `/${interaction.commandName} setup`;
-      return interaction.reply({ embeds:[ui.errorEmbed('Feature Disabled', `**${key}** is currently disabled. Enable it from ${setupName}.`)], ephemeral:true }).then(()=>false);
+  // Bot owners are trusted to run commands in any server without the
+  // server member permission requirements or AunXz feature-toggle gate.
+  // Discord's own bot permissions/role hierarchy are still enforced when
+  // the requested action actually touches Discord resources.
+  if (!isOwner(interaction.user?.id)) {
+    if (required && !interaction.member.permissions.has(BigInt(required))) {
+      return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
+    }
+    if (!commandIsSetupOnly(interaction)) {
+      const key = commandFeatureKey(interaction);
+      if (key && !featureEnabled(cfg, key)) {
+        const setupName = key === 'ticket' ? '/tickets setup' : key === 'greetmessage' ? '/greetmessage setup' : `/${interaction.commandName} setup`;
+        return interaction.reply({ embeds:[ui.errorEmbed('Feature Disabled', `**${key}** is currently disabled. Enable it from ${setupName}.`)], ephemeral:true }).then(()=>false);
+      }
     }
   }
   return true;
