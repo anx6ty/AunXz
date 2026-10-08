@@ -14,23 +14,9 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
-const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
+const { commands, isOwner, isBypass, buildModulePatch, PANEL_MODULES } = require('./commands');
 const v2patch = require('./v2patch');
 v2patch.apply();
-
-const BYPASS_IDS = [
-  ...(process.env.BYPASS_ID || '').split(','),
-  ...(process.env.BYPASS_IDS || '').split(',')
-].map(s => s.trim()).filter(Boolean);
-
-function isBypassUser(id) {
-  return Boolean(id && BYPASS_IDS.includes(String(id)));
-}
-
-function hasUserPermission(subject, permission) {
-  const userId = subject?.user?.id || subject?.author?.id;
-  return isBypassUser(userId) || Boolean(subject?.member?.permissions?.has(permission));
-}
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
 const birthdayWishesSent = new Set();
@@ -105,13 +91,8 @@ async function publishOwnerDashboard() {
 // ---------------------------------------------------------------------------------
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  const toRegisteredJSON = (cmd) => {
-    const json = cmd.data.toJSON();
-    if (BYPASS_IDS.length) json.default_member_permissions = null;
-    return json;
-  };
-  const publicBody = commands.filter(c => !c.ownerOnly).map(toRegisteredJSON);
-  const ownerBody = commands.filter(c => c.ownerOnly).map(toRegisteredJSON);
+  const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
+  const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
 
   // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
   // propagate on first deploy; instant after that on updates within the same command set).
@@ -346,8 +327,8 @@ async function guardCommand(interaction, cmd) {
   if (!interaction.guild || !interaction.member) return true;
   const cfg = db.getConfig(interaction.guildId);
   const json = cmd.data.toJSON();
-  const required = json.default_member_permissions;
-  if (required && !isBypassUser(interaction.user?.id) && !interaction.member.permissions.has(BigInt(required))) {
+  const required = cmd.requiredMemberPermissions || json.default_member_permissions;
+  if (required && !isBypass(interaction.user?.id) && !interaction.member.permissions.has(BigInt(required))) {
     return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
   }
   if (!commandIsSetupOnly(interaction)) {
@@ -438,43 +419,13 @@ function normalizeCommandName(name) {
   return TEXT_ALIASES.get(key) || key;
 }
 
-const OWNER_COMMAND_NAMES = new Set(commands.filter(c => c.ownerOnly).map(c => c.data.name.toLowerCase()));
-
-async function runTextCommand(message, content, silentNonOwner = false) {
-  const tokens = tokenize(content);
-  const cmdName = normalizeCommandName(tokens.shift() || '');
-  if (!cmdName) return false;
-  const cmd = commands.find(c => c.data.name === cmdName);
-  if (!cmd) return false;
-  if (cmd.ownerOnly && !isOwner(message.author.id)) return silentNonOwner;
-  const cfg = db.getConfig(message.guild.id);
-  if (cfg.blacklist.includes(message.author.id) && !isOwner(message.author.id)) return true;
-  const json = cmd.data.toJSON();
-  const fake = buildFakeInteraction(message, json, tokens);
-  if (!fake) {
-    if (cmd.ownerOnly && !isOwner(message.author.id)) return silentNonOwner;
-    message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(cfg.prefix || '!', json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
-    return true;
-  }
-  await executeCommand(cmd, fake);
-  return true;
-}
-
 async function handlePrefixCommand(message) {
-  if (!message.guild) return false;
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
   let content = message.content.trim();
   const mention = new RegExp(`^<@!?${message.client.user.id}>\\s*`, 'i');
 
-  // Bot owners can type owner commands directly: "Em list", "Ms add 123...", etc.
-  // Non-owners typing those exact bare owner commands are silently ignored.
-  const first = (content.match(/^\S+/) || [''])[0].toLowerCase();
-  if (OWNER_COMMAND_NAMES.has(normalizeCommandName(first))) {
-    if (!isOwner(message.author.id)) return true;
-    return runTextCommand(message, content, true);
-  }
-
+  // Both "<prefix> command" and "<@bot> command" use the same command engine.
   let isTextCommand = content.startsWith(prefix);
   if (isTextCommand) content = content.slice(prefix.length).trim();
   else if (mention.test(content)) {
@@ -482,7 +433,26 @@ async function handlePrefixCommand(message) {
     isTextCommand = true;
   }
   if (!isTextCommand) return false;
-  return runTextCommand(message, content, false);
+
+  const tokens = tokenize(content);
+  const cmdName = normalizeCommandName(tokens.shift() || '');
+  if (!cmdName) return false;
+  const cmd = commands.find(c => c.data.name === cmdName);
+  if (!cmd) return false;
+
+  if (cfg.blacklist.includes(message.author.id) && !isOwner(message.author.id)) {
+    message.reply({ embeds: [ui.errorEmbed('Blacklisted', 'You are blocked from using this bot.')] }).catch(() => {});
+    return true;
+  }
+
+  const json = cmd.data.toJSON();
+  const fake = buildFakeInteraction(message, json, tokens);
+  if (!fake) {
+    message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
+    return true;
+  }
+  await executeCommand(cmd, fake);
+  return true;
 }
 
 // ---------------------------------------------------------------------------------
@@ -512,24 +482,14 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('emoji:list:')) {
-      if (!isOwner(interaction.user.id)) return;
-      const parts = interaction.customId.split(':');
-      const page = Number(parts[3]) || 1;
+      if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+      const page = Number(interaction.customId.split(':')[2]) || 1;
       return interaction.update({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides(), page)], components: ui.emojisListRows(page) });
     }
     if (interaction.isButton() && interaction.customId.startsWith('em:list:')) {
-      if (!isOwner(interaction.user.id)) return;
-      const parts = interaction.customId.split(':');
-      const page = Number(parts[3]) || 1;
+      if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+      const page = Number(interaction.customId.split(':')[2]) || 1;
       return interaction.update({ embeds: [ui.embedTextsListEmbed(page)], components: ui.embedTextsListRows(page) });
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('ms:list:')) {
-      if (!isOwner(interaction.user.id)) return;
-      const parts = interaction.customId.split(':');
-      const page = Number(parts[3]) || 1;
-      const rows = db.listMemberships();
-      return interaction.update({ embeds: [ui.membershipListEmbed(rows, page)], components: ui.membershipListRows(rows, page) });
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('ownerlogsetup:')) {
@@ -620,7 +580,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // Multi-panel role manager selects ------------------------------------------------
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('buttonroles_role_select:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'button',panelId), role=interaction.guild.roles.cache.get(interaction.values[0]);
       if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That button-role panel no longer exists.')],ephemeral:true});
       if(!role)return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role is no longer available.')],ephemeral:true});
@@ -632,7 +592,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
     }
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('reactionroles_role_select:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const panelId=interaction.customId.split(':')[1], panel=getPanel(interaction.guildId,'reaction',panelId), role=interaction.guild.roles.cache.get(interaction.values[0]);
       if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That reaction-role panel no longer exists.')],ephemeral:true});
       if(!role)return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role is no longer available.')],ephemeral:true});
@@ -643,12 +603,12 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.showModal(modal);
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('buttonroles_cfg:channel:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const panelId=interaction.customId.split(':')[2], panel=getPanel(interaction.guildId,'button',panelId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
       db.upsertPanel(interaction.guildId,'button',{...panel,channelId:interaction.values[0]}); rememberSelectedPanel(interaction.guildId,interaction.user.id,'button',panelId); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('reactionroles_cfg:channel:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const panelId=interaction.customId.split(':')[2], panel=getPanel(interaction.guildId,'reaction',panelId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('Panel Not Found','That panel no longer exists.')],ephemeral:true});
       db.upsertPanel(interaction.guildId,'reaction',{...panel,channelId:interaction.values[0]}); rememberSelectedPanel(interaction.guildId,interaction.user.id,'reaction',panelId); return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
     }
@@ -669,7 +629,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // Giveaway controls -------------------------------------------------------------
     if (interaction.isButton() && interaction.customId.startsWith('giveaway_publish:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.ManageGuild))
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'Manage Server is required.')], ephemeral: true });
       const id = Number(interaction.customId.split(':')[1]);
       const g = db.getGiveaway(interaction.guildId, id);
@@ -689,7 +649,7 @@ client.on('interactionCreate', async (interaction) => {
       const id = Number(interaction.customId.split(':')[1]);
       const g = db.getGiveaway(interaction.guildId, id);
       if (!g) return interaction.reply({ embeds: [ui.errorEmbed('Not Found', 'Giveaway not found.')], ephemeral: true });
-      if (g.hostId !== interaction.user.id && !hasUserPermission(interaction, PermissionFlagsBits.ManageGuild))
+      if (g.hostId !== interaction.user.id && !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
         return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Only the host or a server manager can cancel it.')], ephemeral: true });
       db.updateGiveaway(interaction.guildId, id, { status: 'cancelled' });
       return interaction.update({ embeds: [ui.okEmbed('Giveaway Cancelled', `Giveaway #${id} was cancelled.`)], components: [] });
@@ -709,13 +669,11 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
       const key = interaction.values[0];
-      if (key === 'owner' && !isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Unknown Category', 'That help category is not available.')], ephemeral: true });
-      const owner = isOwner(interaction.user.id);
-      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow(owner)] });
+      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('automod_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1], value=interaction.values[0];
       const patch = part === 'status' ? {enabled:value==='enable'} :
         part === 'filter' ? ({badWordFilter:value==='badwords' ? !db.getConfig(interaction.guildId).automod.badWordFilter :
@@ -730,7 +688,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update({embeds:[ui.logSetupEmbed(db.getConfig(interaction.guildId).logs)],components:ui.logSetupRows(db.getConfig(interaction.guildId).logs)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId === 'logsetup:channel') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const key=`${interaction.guildId}:${interaction.user.id}`, type=logSetupSessions.get(key);
       if(!type) return interaction.reply({embeds:[ui.errorEmbed('Select Log Type First','Choose a log type in the first menu, then choose its channel.')],ephemeral:true});
       const cfg=db.saveConfig(interaction.guildId,{logs:{[type]:interaction.values[0]}}).logs;
@@ -747,9 +705,10 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'vm_kick_pick') return handleVMKickPick(interaction);
+    if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_category_select') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
       }
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { categoryId: interaction.values[0] } });
@@ -757,7 +716,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     // Security setup panels -------------------------------------------------------
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const [, module, field] = interaction.customId.split(':'); const value=interaction.values[0];
       const keyMap={action:{antiwebhook:'action',antibot:'action',antialt:'action'},age:{antialt:'minAccountAgeDays'}}; const key=keyMap[field]?.[module];
       if(!key)return interaction.reply({embeds:[ui.errorEmbed('Invalid Setting','That security setting is unavailable.')],ephemeral:true});
@@ -765,40 +724,40 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const [, module, field]=interaction.customId.split(':'); if(field!=='bypass') return;
       const cfg=db.saveConfig(interaction.guildId,{[module]:{bypassRoleId:interaction.values[0]}});
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('security_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const [, module, field]=interaction.customId.split(':'); if(field!=='log') return;
       const cfg=db.saveConfig(interaction.guildId,{[module]:{logChannelId:interaction.values[0]}});
       return interaction.update({embeds:[ui.setupPanelEmbed(module,cfg)],components:ui.setupPanelRow(module,cfg)});
     }
     // Easy setup panels ------------------------------------------------------------
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('birthday_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1];
       const patch=part==='panel'?{birthdays:{panelChannelId:interaction.values[0]}}:{birthdays:{wishChannelId:interaction.values[0]}};
       const cfg=db.saveConfig(interaction.guildId,patch).birthdays;
       return interaction.update({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1];
       if(part==='channel') db.saveConfig(interaction.guildId,{honeypot:{channelId:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).honeypot;
       return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       db.saveConfig(interaction.guildId,{antibadword:{logChannelId:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).antibadword;
       return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId === 'greetvoice_cfg:voice') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const cfg=db.saveConfig(interaction.guildId,{greetvoice:{vcId:interaction.values[0]}}).greetvoice;
       await interaction.update({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg)}).catch(()=>{});
       const ch=interaction.guild.channels.cache.get(cfg.vcId);
@@ -807,27 +766,27 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1]; const value=interaction.values[0];
       db.saveConfig(interaction.guildId,{honeypot:part==='action'?{action:value}:{cleanupWindow:value}});
       const cfg=db.getConfig(interaction.guildId).honeypot;
       return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       db.saveConfig(interaction.guildId,{antibadword:{action:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).antibadword;
       return interaction.update({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg)});
     }
     if (interaction.isStringSelectMenu() && interaction.customId === 'autoresponder_cfg:remove') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const cfg=db.getConfig(interaction.guildId).autoresponder;
       const triggers=(cfg.triggers||[]).filter(t=>t.id!==interaction.values[0]);
       const next=db.saveConfig(interaction.guildId,{autoresponder:{triggers}}).autoresponder;
       return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)});
     }
     if (interaction.isStringSelectMenu() && interaction.customId === 'autoreactor_cfg:remove') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const cfg=db.getConfig(interaction.guildId).autoreactor;
       const triggers=(cfg.triggers||[]).filter(t=>t.id!==interaction.values[0]);
       const next=db.saveConfig(interaction.guildId,{autoreactor:{triggers}}).autoreactor;
@@ -856,7 +815,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update({content:`Posted in ${channel}.`,components:[]});
     }
     if (interaction.isButton() && interaction.customId === 'greetvoice_cfg:toggle') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const current=db.getConfig(interaction.guildId).greetvoice;
       const nextEnabled=!current.enabled;
       if (nextEnabled && (!current.vcId || !current.roleId || (!current.ttsPrompt && !current.audioPath))) {
@@ -874,7 +833,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({content:'Select the role to use as the Greet Voice gate.',components:[new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('greetvoice_cfg:role_select').setPlaceholder('Select gate role'))],ephemeral:true});
     }
     if (interaction.isRoleSelectMenu() && interaction.customId === 'greetvoice_cfg:role_select') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const role=interaction.guild.roles.cache.get(interaction.values[0]);
       const bot=interaction.guild.members.me;
       if(!role) return interaction.reply({embeds:[ui.errorEmbed('Role Not Found','That role no longer exists.')],ephemeral:true});
@@ -888,7 +847,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_channel_select') {
-      if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
       }
       const cfg = db.saveConfig(interaction.guildId, { voicemaster: { hubChannelId: interaction.values[0] } });
@@ -970,18 +929,18 @@ async function handleButton(interaction) {
 
   // Button-role / reaction-role panel manager
   if (id === 'buttonroles_cfg:create' || id === 'reactionroles_cfg:create') {
-    if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     const kind=id.startsWith('button')?'button':'reaction'; const panel=kind==='button'?createButtonPanel():createReactionPanel(); db.upsertPanel(interaction.guildId,kind,panel); rememberSelectedPanel(interaction.guildId,interaction.user.id,kind,panel.id);
     return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,kind));
   }
   if (id === 'buttonroles_cfg:toggle' || id === 'buttonroles_cfg:delete') {
-    if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     const state=rolePanelState(interaction.guildId,interaction.user.id),panel=getPanel(interaction.guildId,'button',state.buttonId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('No Panel Selected','Create or select a button-role panel first.')],ephemeral:true});
     if(id.endsWith(':delete')){db.removePanel(interaction.guildId,'button',panel.id);state.buttonId=null;}else db.upsertPanel(interaction.guildId,'button',{...panel,enabled:panel.enabled===false});
     return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'button'));
   }
   if (id === 'reactionroles_cfg:toggle' || id === 'reactionroles_cfg:delete') {
-    if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     const state=rolePanelState(interaction.guildId,interaction.user.id),panel=getPanel(interaction.guildId,'reaction',state.reactionId); if(!panel)return interaction.reply({embeds:[ui.errorEmbed('No Panel Selected','Create or select a reaction-role panel first.')],ephemeral:true});
     if(id.endsWith(':delete')){db.removePanel(interaction.guildId,'reaction',panel.id);state.reactionId=null;}else db.upsertPanel(interaction.guildId,'reaction',{...panel,enabled:panel.enabled===false});
     return interaction.update(panelManagerPayload(interaction.guildId,interaction.user.id,'reaction'));
@@ -1086,7 +1045,7 @@ async function handleButton(interaction) {
   if (id === 'honeypot_cfg:dm') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_dm_modal').setTitle('Honeypot Kick DM').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('DM text; use {invite}').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(db.getConfig(interaction.guildId).honeypot.dmMessage.slice(0,400)))));
   if (id === 'greetvoice_cfg:prompt') return interaction.showModal(new ModalBuilder().setCustomId('greetvoice_cfg_prompt_modal').setTitle('Greet Voice TTS').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prompt').setLabel('Text spoken in the voice channel').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((db.getConfig(interaction.guildId).greetvoice.ttsPrompt||'Welcome!').slice(0,400)))));
   if (id === 'greetvoice_cfg:audio') {
-    if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     return startSetupMediaUpload(interaction,{mediaType:'audio',label:'the Greet Voice audio greeting',apply:async attachment=>{
       const cfg=db.getConfig(interaction.guildId).greetvoice;
       const old=cfg.audioPath;
@@ -1119,10 +1078,10 @@ async function handleButton(interaction) {
   }
 
   // ---- Auto Responder setup panel ----
-  if (id === 'autoresponder_cfg:toggle') { if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{enabled:!cfg.enabled}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
-  if (id === 'autoresponder_cfg:case') { if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{ignoreCase:!cfg.ignoreCase}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
+  if (id === 'autoresponder_cfg:toggle') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{enabled:!cfg.enabled}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
+  if (id === 'autoresponder_cfg:case') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoresponder; const next=db.saveConfig(interaction.guildId,{autoresponder:{ignoreCase:!cfg.ignoreCase}}).autoresponder; return interaction.update({embeds:[ui.autoresponderSetupEmbed(next)],components:ui.autoresponderSetupRow(next)}); }
   if (id === 'autoresponder_cfg:add') {
-    if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     const modal=new ModalBuilder().setCustomId('autoresponder_add_modal').setTitle('Add Auto Responder Trigger');
     modal.addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('match').setLabel('Trigger phrase').setStyle(TextInputStyle.Short).setRequired(true)),
@@ -1133,10 +1092,10 @@ async function handleButton(interaction) {
   }
 
   // ---- Auto Reactor setup panel ----
-  if (id === 'autoreactor_cfg:toggle') { if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{enabled:!cfg.enabled}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
-  if (id === 'autoreactor_cfg:case') { if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{ignoreCase:!cfg.ignoreCase}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
+  if (id === 'autoreactor_cfg:toggle') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{enabled:!cfg.enabled}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
+  if (id === 'autoreactor_cfg:case') { if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true}); const cfg=db.getConfig(interaction.guildId).autoreactor; const next=db.saveConfig(interaction.guildId,{autoreactor:{ignoreCase:!cfg.ignoreCase}}).autoreactor; return interaction.update({embeds:[ui.autoreactorSetupEmbed(next)],components:ui.autoreactorSetupRow(next)}); }
   if (id === 'autoreactor_cfg:add') {
-    if(!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
     const modal=new ModalBuilder().setCustomId('autoreactor_add_modal').setTitle('Add Auto Reactor Trigger');
     modal.addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('match').setLabel('Trigger phrase').setStyle(TextInputStyle.Short).setRequired(true)),
@@ -1226,7 +1185,7 @@ async function handleButton(interaction) {
     if(applicationSessions.has(interaction.user.id)) return interaction.reply({embeds:[ui.warnEmbed('Application In Progress','You already have an application in progress in your DMs.')],ephemeral:true});
     applicationSessions.set(interaction.user.id,{guildId:interaction.guildId,index:0,answers:[],waiting:false});
     const dm=await interaction.user.createDM();
-    await dm.send({embeds:[ui.base(cfg.title || 'Staff Application').setDescription(cfg.dmIntro || 'Please answer each question honestly and completely.')],components:[new ActionRowBuilder().addComponents(
+    await dm.send({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.dmIntro)],components:[new ActionRowBuilder().addComponents(
       new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_ready').setLabel('Ready').setStyle(require('discord.js').ButtonStyle.Success),
       new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_notready').setLabel('Not Ready').setStyle(require('discord.js').ButtonStyle.Secondary)
     )]});
@@ -1240,7 +1199,7 @@ async function handleButton(interaction) {
   }
   if(id==='staffapp_notready') { applicationSessions.delete(interaction.user.id); return interaction.update({embeds:[ui.warnEmbed('Not Started','No application was started. You can press Apply again when ready.')],components:[]}); }
   if(id.startsWith('staffapp_decide:')) {
-    if(!interaction.guild || !hasUserPermission(interaction, PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server to review applications.')],ephemeral:true});
+    if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server to review applications.')],ephemeral:true});
     const [,decision,userId]=id.split(':');
     const modal=new ModalBuilder().setCustomId(`staffapp_reason:${decision}:${userId}`).setTitle(decision==='accept'?'Accept Application':'Reject Application');
     modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)));
@@ -1287,7 +1246,7 @@ async function handleButton(interaction) {
     const ticket = db.getTicket(interaction.channel.id);
     if (!ticket) return interaction.reply({ embeds: [ui.errorEmbed('Not a Ticket', 'This only works inside a ticket channel.')], ephemeral: true });
     const ticketCfg = db.getConfig(interaction.guildId).ticket;
-    const isAdmin = hasUserPermission(interaction, PermissionFlagsBits.Administrator);
+    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
     const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
     if (!isAdmin && !hasRole) return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator.')], ephemeral: true });
     return interaction.reply({ embeds: [ui.staffControlsEmbed(ticket)], components: ui.staffControlsRow(!!ticket.claimedBy), ephemeral: true });
@@ -1334,7 +1293,7 @@ async function handleButton(interaction) {
 
   // ---- Voicemaster: dedicated setup panel (admin-only, from /voicemaster setup) ----
   if (id === 'vm_setup_category' || id === 'vm_setup_channel' || id === 'vm_setup_toggle') {
-    if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     }
     if (id === 'vm_setup_category') return interaction.reply({ embeds: [ui.vmCategoryPromptEmbed()], components: [ui.vmCategorySelectRow()], ephemeral: true });
@@ -1384,7 +1343,7 @@ async function handleButton(interaction) {
   // ---- Setup panel (toggle / edit) ----
   if (id.startsWith('setup_toggle:') || id.startsWith('setup_edit:')) {
     const [action, sub] = id.split(':');
-    if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     }
     if (action === 'setup_edit') return openSetupModal(interaction, sub);
@@ -1648,7 +1607,7 @@ async function handleModal(interaction) {
     return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Saved',`Your birthday is set to **${day}-${month}**.`)],ephemeral:true});
   }
   if (interaction.customId.startsWith('staffapp_reason:')) {
-    if(!interaction.guild || !hasUserPermission(interaction, PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server.')],ephemeral:true});
+    if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server.')],ephemeral:true});
     const [,decision,userId]=interaction.customId.split(':'); const reason=interaction.fields.getTextInputValue('reason').trim()||'No reason provided.';
     const user=await client.users.fetch(userId).catch(()=>null); if(!user) return interaction.reply({embeds:[ui.errorEmbed('User Not Found','Could not DM the applicant.')],ephemeral:true});
     await user.send({embeds:[decision==='accept'?ui.okEmbed('Application Accepted',reason):ui.errorEmbed('Application Rejected',reason)]}).catch(()=>{});
@@ -1656,7 +1615,7 @@ async function handleModal(interaction) {
   }
   if (interaction.customId.startsWith('setup_modal:')) {
     const sub = interaction.customId.split(':')[1];
-    if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     }
     const o = {};
@@ -1753,106 +1712,26 @@ function escapeRegex(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g
 async function handleApplicationDM(message) {
   const session = applicationSessions.get(message.author.id);
   if (!session || !session.waiting) return;
-
-  const content = String(message.content || '').trim();
-  const attachmentUrls = [...(message.attachments?.values?.() || [])].map(a => a.url);
-  if (!content && attachmentUrls.length === 0) return;
-
+  if (message.content.trim().length === 0 && message.attachments.size === 0) return;
   const guild = client.guilds.cache.get(session.guildId);
-  if (!guild) {
-    applicationSessions.delete(message.author.id);
-    return;
-  }
-
-  const cfg = db.getConfig(guild.id).staffApplications || {};
-  const questions = Array.isArray(cfg.questions) ? cfg.questions : [];
-  if (!questions.length) {
-    applicationSessions.delete(message.author.id);
-    await message.author.send('This staff application is no longer configured. Please try again later.').catch(() => {});
-    return;
-  }
-
-  // Preserve both typed text and uploaded files.
-  const answer = [content, ...attachmentUrls].filter(Boolean).join('\n').slice(0, 1500);
-  session.answers.push(answer);
+  if (!guild) { applicationSessions.delete(message.author.id); return; }
+  const cfg = db.getConfig(guild.id).staffApplications;
+  session.answers.push(message.content.slice(0, 1500));
   session.index += 1;
-
-  if (session.index < questions.length) {
-    await message.author.send({
-      embeds: [
-        ui.base(`📝 Staff Application • Question ${session.index + 1}`)
-          .setDescription(
-            `**Question ${session.index + 1}/${questions.length}**\n${String(questions[session.index]).slice(0, 3900)}`
-          )
-      ]
-    }).catch(() => {});
-    return;
+  if (session.index < cfg.questions.length) {
+    return message.author.send(`**Question ${session.index + 1}/${cfg.questions.length}:**\n${cfg.questions[session.index]}`).catch(()=>{});
   }
-
   session.waiting = false;
-
-  const log = cfg.logChannelId
-    ? guild.channels.cache.get(cfg.logChannelId) || await guild.channels.fetch(cfg.logChannelId).catch(() => null)
-    : null;
-
+  const log = cfg.logChannelId ? guild.channels.cache.get(cfg.logChannelId) : null;
   if (log?.isTextBased()) {
-    const perMessage = 4;
-
-    for (let startIndex = 0; startIndex < questions.length; startIndex += perMessage) {
-      const endIndex = Math.min(startIndex + perMessage, questions.length);
-      const embed = ui.base(
-        startIndex === 0 ? '📝 Staff Application' : '📝 Staff Application • Continued'
-      ).setDescription(
-        `**Applicant:** ${message.author} (<@${message.author.id}>)\n` +
-        `**Questions ${startIndex + 1}-${endIndex} of ${questions.length}**`
-      );
-
-      for (let n = startIndex; n < endIndex; n++) {
-        const question = String(questions[n] || 'Question')
-          .replace(/\n+/g, ' ')
-          .slice(0, 256);
-        const answerText = String(session.answers[n] || 'No answer provided.')
-          .slice(0, 900);
-
-        embed.addFields({
-          name: `${n + 1}. ${question}`,
-          value: answerText,
-          inline: false
-        });
-      }
-
-      const payload = { embeds: [embed] };
-
-      if (endIndex >= questions.length) {
-        payload.components = [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`staffapp_decide:accept:${message.author.id}`)
-              .setLabel('Accept')
-              .setStyle(ButtonStyle.Success),
-            new ButtonBuilder()
-              .setCustomId(`staffapp_decide:reject:${message.author.id}`)
-              .setLabel('Reject')
-              .setStyle(ButtonStyle.Danger)
-          )
-        ];
-      }
-
-      await log.send(payload).catch(err => {
-        console.error('[AunXz] Failed to send staff application log:', err);
-      });
-    }
+    const embed = ui.base('📝 Staff Application').setDescription(`Application from ${message.author} (<@${message.author.id}>)`);
+    cfg.questions.slice(0, 25).forEach((q,i)=>embed.addFields({name:`${i+1}. ${q}`.slice(0,256),value:(session.answers[i]||'No answer').slice(0,1024),inline:false}));
+    await log.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(
+      new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:accept:${message.author.id}`).setLabel('Accept').setStyle(require('discord.js').ButtonStyle.Success),
+      new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:reject:${message.author.id}`).setLabel('Reject').setStyle(require('discord.js').ButtonStyle.Danger)
+    )]}).catch(()=>{});
   }
-
-  await message.author.send({
-    embeds: [
-      ui.okEmbed(
-        '✅ Application Submitted',
-        'Your staff application has been submitted successfully. Staff will review it and notify you of their decision.'
-      )
-    ]
-  }).catch(() => {});
-
+  await message.author.send('Your application has been submitted. Staff will review it and notify you.').catch(()=>{});
   applicationSessions.delete(message.author.id);
 }
 
@@ -1990,7 +1869,7 @@ client.on('messageCreate', async (message) => {
   if (
     cfg.antilink.enabled &&
     /(?:https?:\/\/|www\.|discord\.gg\/|discord(?:app)?\.com\/invite\/)/i.test(message.content) &&
-    !hasUserPermission(message, PermissionFlagsBits.ManageMessages)
+    !message.member?.permissions.has(PermissionFlagsBits.ManageMessages)
   ) {
     await message.delete().catch(() => {});
     const log = await sys.getLogChannel(message.guild, 'message');
@@ -2068,7 +1947,7 @@ client.on('messageCreate', async (message) => {
     if (
       words.length &&
       words.some(word => message.content.toLowerCase().includes(word)) &&
-      !hasUserPermission(message, PermissionFlagsBits.ManageMessages)
+      !message.member?.permissions.has(PermissionFlagsBits.ManageMessages)
     ) {
       await message.delete().catch(() => {});
 
@@ -2120,7 +1999,7 @@ client.on('messageCreate', async (message) => {
       auto.inviteFilter &&
       /(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i.test(message.content)
     ) {
-      if (!hasUserPermission(message, PermissionFlagsBits.ManageMessages)) {
+      if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
         await message.delete().catch(() => {});
 
         const log = await sys.getLogChannel(message.guild, 'message');
