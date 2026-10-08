@@ -154,7 +154,7 @@ const commands = [];
         });
       }
 
-      if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+      if (!isOwner(interaction.user?.id) && !interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({
           embeds: [ui.errorEmbed('Administrator Required', 'Only an Administrator can load a complete server template.')],
           ephemeral: true
@@ -343,7 +343,7 @@ commands.push({
       .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
       .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
   async execute(interaction) {
-    if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+    if(!isOwner(interaction.user?.id) && !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
     const prize=interaction.options.getString('prize');
     const winners=interaction.options.getInteger('winners')||1;
@@ -1160,7 +1160,7 @@ commands.push({
 // as an alternative to the Staff Controls buttons.
 // ---------------------------------------------------------------------------------
 function requireTicketStaff(interaction, ticketCfg) {
-  const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+  const isAdmin = isOwner(interaction.user?.id) || interaction.member.permissions.has(PermissionFlagsBits.Administrator);
   const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
   if (!isAdmin && !hasRole) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator to manage tickets.')], ephemeral: true });
@@ -1314,7 +1314,7 @@ commands.push({
     .addSubcommand(s => s.setName('reset').setDescription('reset a member\'s XP and level to 0')
       .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))),
   async execute(interaction) {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (!isOwner(interaction.user?.id) && !interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Moderate Members** or **Administrator**.')], ephemeral: true });
     }
     const sub = interaction.options.getSubcommand();
