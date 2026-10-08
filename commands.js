@@ -12,22 +12,12 @@ const templates = require('./template');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const isOwner = (id) => OWNER_IDS.includes(id);
-
-const BYPASS_IDS = [
-  ...(process.env.BYPASS_ID || '').split(','),
-  ...(process.env.BYPASS_IDS || '').split(',')
-].map(s => s.trim()).filter(Boolean);
-
-function isBypass(id) {
-  return Boolean(id && BYPASS_IDS.includes(String(id)));
-}
-
-function hasUserPermission(interaction, permission) {
-  return isBypass(interaction.user?.id) || Boolean(interaction.member?.permissions?.has(permission));
-}
+const BYPASS_IDS = (process.env.BYPASS_ID || process.env.BYPASS_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const isBypass = (id) => BYPASS_IDS.includes(String(id));
 
 function requireAdmin(interaction) {
-  if (!hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+  if (isBypass(interaction.user?.id)) return true;
+  if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     return false;
   }
@@ -41,61 +31,13 @@ function getImageAttachment(interaction, optionName) {
   return attachment;
 }
 
-function activeMembership(interaction) {
-  const row = db.membership(interaction.guildId);
-  return row && Number(row.expiresAt) > Date.now() ? row : null;
-}
-function requireMembership(interaction) {
-  const row = activeMembership(interaction);
-  if (!row) {
-    interaction.reply({ embeds: [ui.errorEmbed('Membership Required', 'This server feature requires an active AunXz membership.')], ephemeral: true }).catch(() => {});
-    return null;
-  }
-  return row;
-}
-function getImageAttachmentRequired(interaction, name) {
-  const a = interaction.options.getAttachment(name);
-  if (!a) return null;
-  const type = String(a.contentType || '').toLowerCase();
-  const filename = String(a.name || '').toLowerCase();
-  const isImage = type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(filename);
-  return isImage ? a : null;
-}
-
-async function downloadImageAttachment(attachment) {
-  const size = Number(attachment?.size || 0);
-  if (size && size > 10 * 1024 * 1024) throw new Error('That image is larger than 10 MB. Please upload a smaller file.');
-  const response = await fetch(attachment.url);
-  if (!response.ok) throw new Error(`Discord CDN returned HTTP ${response.status}.`);
-  const contentLength = Number(response.headers.get('content-length') || 0);
-  if (contentLength > 10 * 1024 * 1024) throw new Error('That image is larger than 10 MB. Please upload a smaller file.');
-  return Buffer.from(await response.arrayBuffer());
-}
-function parseCustomEmojiInput(raw, client) {
-  const value = String(raw || '').trim();
-  let m = value.match(/^<a?:([A-Za-z0-9_~.-]+):(\d+)>$/);
-  if (m) return { key: `custom_${m[1]}`, value };
-  m = value.match(/^([A-Za-z0-9_~.-]+)\/(\d+)$/);
-  if (m) return { key: `custom_${m[1]}`, value: `<:${m[1]}:${m[2]}>` };
-  if (/^\d+$/.test(value)) {
-    const emoji = client?.emojis?.cache?.get(value);
-    if (emoji) return { key: `custom_${emoji.name || value}`, value: emoji.toString() };
-    return { key: `custom_${value}`, value: null };
-  }
-  if (/^[\p{Extended_Pictographic}\uFE0F\u200D]+$/u.test(value)) {
-    const cps = [...value].map(ch => ch.codePointAt(0).toString(16)).join('-');
-    return { key: `unicode_${cps}`, value };
-  }
-  return { key: `custom_${value.replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || Date.now()}`, value };
-}
-
 function botMember(interaction) {
   return interaction.guild?.members?.me || interaction.guild?.members?.cache?.get(interaction.client.user.id) || null;
 }
 
 function actionPermissionError(interaction, permission, label) {
   const member = interaction.member;
-  if (!member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+  if (!isBypass(interaction.user?.id) && !member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
     return ui.errorEmbed('Missing Permissions', `You need **${label}** to use this action.`);
   }
   const bot = botMember(interaction);
@@ -111,7 +53,7 @@ function hierarchyError(interaction, target, actionLabel) {
   if (target.id === interaction.guild.ownerId) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} the server owner.`);
   if (target.id === interaction.client.user.id) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} myself.`);
   if (target.roles?.highest?.position >= bot.roles.highest.position) return ui.errorEmbed('Role Hierarchy', `I cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than my highest role.`);
-  if (interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
+  if (!isBypass(interaction.user?.id) && interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
     return ui.errorEmbed('Role Hierarchy', `You cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than your highest role.`);
   }
   return null;
@@ -403,7 +345,7 @@ commands.push({
       .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
       .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
   async execute(interaction) {
-    if(!hasUserPermission(interaction, PermissionFlagsBits.ManageGuild))
+    if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
     const prize=interaction.options.getString('prize');
     const winners=interaction.options.getInteger('winners')||1;
@@ -426,8 +368,7 @@ commands.push({
 commands.push({
   data: new SlashCommandBuilder().setName('help').setDescription('Browse everything the bot can do.'),
   async execute(interaction) {
-    const owner = isOwner(interaction.user.id);
-    await interaction.reply({ embeds: [ui.helpHomeEmbed(interaction.client, owner)], components: [ui.helpSelectRow(owner)] });
+    await interaction.reply({ embeds: [ui.helpHomeEmbed(interaction.client)], components: [ui.helpSelectRow()] });
   }
 });
 
@@ -1209,7 +1150,7 @@ commands.push({
 // as an alternative to the Staff Controls buttons.
 // ---------------------------------------------------------------------------------
 function requireTicketStaff(interaction, ticketCfg) {
-  const isAdmin = hasUserPermission(interaction, PermissionFlagsBits.Administrator);
+  const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
   const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
   if (!isAdmin && !hasRole) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator to manage tickets.')], ephemeral: true });
@@ -1363,7 +1304,7 @@ commands.push({
     .addSubcommand(s => s.setName('reset').setDescription('reset a member\'s XP and level to 0')
       .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))),
   async execute(interaction) {
-    if (!hasUserPermission(interaction, PermissionFlagsBits.ModerateMembers) && !hasUserPermission(interaction, PermissionFlagsBits.Administrator)) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Moderate Members** or **Administrator**.')], ephemeral: true });
     }
     const sub = interaction.options.getSubcommand();
@@ -1413,55 +1354,51 @@ commands.push({
   ownerOnly: true,
   data: new SlashCommandBuilder().setName('emoji').setDescription('[Owner] View or change every emoji the bot uses.')
     .addSubcommand(s => s.setName('list').setDescription('Show every emoji currently used by the bot.'))
-    .addSubcommand(s => s.setName('set').setDescription('Change one registered emoji.')
-      .addStringOption(o => o.setName('name').setDescription('Emoji key from /emoji list').setRequired(true))
-      .addStringOption(o => o.setName('value').setDescription('Unicode or custom emoji, or name/id').setRequired(true)))
+    .addSubcommand(s => s.setName('set').setDescription('Change one emoji everywhere it is used.')
+      .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true))
+      .addStringOption(o => o.setName('value').setDescription('Unicode emoji or custom emoji such as <:name:id>.').setRequired(true)))
     .addSubcommand(s => s.setName('reset').setDescription('Restore one emoji to its default.')
-      .addStringOption(o => o.setName('name').setDescription('Emoji key').setRequired(true)))
-    .addSubcommand(s => s.setName('save').setDescription('Export all emoji keys and current values.'))
-    .addSubcommand(s => s.setName('load').setDescription('Restore emojis from a snapshot code or saved text.')
-      .addStringOption(o => o.setName('code').setDescription('Snapshot code or key:value text').setRequired(true).setMaxLength(6000))),
+      .addStringOption(o => o.setName('name').setDescription('Name from /emoji list').setRequired(true)))
+    .addSubcommand(s => s.setName('save').setDescription('Save a snapshot of every bot emoji and return a random restore code.'))
+    .addSubcommand(s => s.setName('load').setDescription('Load an emoji snapshot using its random code.')
+      .addStringOption(o => o.setName('code').setDescription('Snapshot code from /emoji save').setRequired(true))),
   async execute(interaction) {
-    if (!isOwner(interaction.user.id)) return;
+    if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
     const sub = interaction.options.getSubcommand();
-    if (sub === 'list') return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides(), 1)], components: ui.emojisListRows(1), ephemeral: true });
+    if (sub === 'list') {
+      return interaction.reply({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides(), 1)], components: ui.emojisListRows(1), ephemeral: true });
+    }
     if (sub === 'save') {
-      const values = ui.emojiSnapshotObject();
+      const values = {};
+      for (const key of ui.EMOJI_KEYS) values[key] = ui.emoji(key);
       const code = db.saveEmojiSnapshot(values);
-      const text = ui.formatEmojiSnapshot(values);
-      return interaction.reply({ embeds: [ui.okEmbed('💾 Emoji Snapshot Saved', '**Snapshot code:** `' + code + '`\n\n**Copyable emoji map:**\n```\n' + text.slice(0, 3500) + '\n```\n\nUse **/emoji load** with the snapshot code, or paste the map back into the loader.')], ephemeral: true });
+      return interaction.reply({ embeds: [ui.okEmbed('💾 Emoji Snapshot Saved', `Snapshot saved.
+
+**Code:** \`${code}\`\n
+Use **/emoji load** with this code to restore these emojis later.`)], ephemeral: true });
     }
     if (sub === 'load') {
-      const raw = interaction.options.getString('code', true).trim();
-      let snapshot = db.getEmojiSnapshot(raw);
-      if (!snapshot && raw.includes(':')) {
-        snapshot = {};
-        for (const line of raw.split(/\r?\n/)) {
-          const m = line.match(/^\s*([^:]+):\s*(.*?)\s*$/);
-          if (!m) continue;
-          let value = m[2].trim();
-          const custom = value.match(/^([A-Za-z0-9_~.-]+)\/(\d+)$/);
-          if (custom) value = `<:${custom[1]}:${custom[2]}>`;
-          if (m[1].trim() && value) snapshot[m[1].trim()] = value;
-        }
+      const code = interaction.options.getString('code').trim();
+      const snapshot = db.getEmojiSnapshot(code);
+      if (!snapshot) return interaction.reply({ embeds: [ui.errorEmbed('Snapshot Not Found', `No emoji snapshot exists for \`${code}\`.`)], ephemeral: true });
+      for (const key of ui.EMOJI_KEYS) {
+        const value = snapshot[key];
+        if (value) db.setEmojiOverride(key, value);
       }
-      if (!snapshot || !Object.keys(snapshot).length) return interaction.reply({ embeds: [ui.errorEmbed('Snapshot Not Found', 'Use a valid snapshot code or paste the `key: emoji` map from **/emoji save**.')], ephemeral: true });
-      const applied = db.applyEmojiSnapshot(snapshot);
-      return interaction.reply({ embeds: [ui.okEmbed('📥 Emoji Snapshot Loaded', `Restored **${Object.keys(snapshot).length}** emoji values. **${Object.keys(applied).length}** emoji overrides are now active.`)] });
+      return interaction.reply({ embeds: [ui.okEmbed('📥 Emoji Snapshot Loaded', `Restored **${Object.keys(snapshot).length}** emoji values from snapshot \`${code}\`.`)] });
     }
-    const name = interaction.options.getString('name', true).trim().toLowerCase();
+    const name = interaction.options.getString('name').trim().toLowerCase();
+    if (!ui.EMOJI_KEYS.includes(name)) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Unknown Emoji', `**${name}** is not a valid emoji name. Use **/emoji list** first.`)], ephemeral: true });
+    }
     if (sub === 'set') {
-      const value = interaction.options.getString('value', true).trim();
-      if (!ui.EMOJI_KEYS.includes(name) && !/^custom_|^unicode_|^auto_/i.test(name)) return interaction.reply({ embeds: [ui.errorEmbed('Unknown Emoji Key', `**${name}** is not in the emoji registry. Use **/emoji list** first or add it through **/em add**.`)], ephemeral: true });
-      const parsed = parseCustomEmojiInput(value, interaction.client);
-      if (!parsed.value) return interaction.reply({ embeds: [ui.errorEmbed('Emoji Not Found', 'For a custom emoji ID, paste the emoji as `<:name:id>` or use `name/id`.')], ephemeral: true });
-      db.setEmojiOverride(name, parsed.value);
-      return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Updated`, `**${name}** is now ${value}.`)] });
+      const value = interaction.options.getString('value').trim();
+      if (!value) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Emoji', 'The emoji value cannot be empty.')], ephemeral: true });
+      db.setEmojiOverride(name, value);
+      return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Updated`, `**${name}** is now ${value}. All matching button icons and embed text use it immediately.`)] });
     }
-    if (sub === 'reset') {
-      db.resetEmojiOverride(name);
-      return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Reset`, `**${name}** was reset.`)] });
-    }
+    db.resetEmojiOverride(name);
+    return interaction.reply({ embeds: [ui.okEmbed(`${ui.emoji('success')} Emoji Reset`, `**${name}** is back to its default: ${ui.DEFAULT_EMOJIS[name]}`)] });
   }
 });
 
@@ -1471,23 +1408,10 @@ commands.push({
   data: new SlashCommandBuilder().setName('em').setDescription('[Owner] Browse and edit AunXz embed text and emojis.')
     .addSubcommand(s => s.setName('list').setDescription('List registered embed texts and discovered emojis.'))
     .addSubcommand(s => s.setName('edit').setDescription('Edit one registered embed text.')
-      .addStringOption(o => o.setName('name').setDescription('Name shown by /em list').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s => s.setName('add').setDescription('Add a custom emoji key.')
-      .addStringOption(o => o.setName('emoji').setDescription('Paste <:name:id>, name/id, or an emoji ID.').setRequired(true))),
+      .addStringOption(o => o.setName('name').setDescription('Name shown by /em list').setRequired(true).setAutocomplete(true))),
   async execute(interaction) {
     if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
     const sub = interaction.options.getSubcommand();
-    if (sub === 'add') {
-      const input = interaction.options.getString('emoji', true).trim();
-      let parsed = parseCustomEmojiInput(input, interaction.client);
-      if (/^\d+$/.test(input) && !parsed.value) {
-        const remote = await interaction.client.emojis.fetch(input).catch(() => null);
-        if (remote) parsed = { key: `custom_${remote.name || input}`, value: remote.toString() };
-      }
-      if (!parsed.value) return interaction.reply({ embeds: [ui.errorEmbed('Emoji Not Found', 'I could not resolve that emoji ID. Paste the copied emoji such as `<:delete:2726272>` or use `delete/2726272`.')], ephemeral: true });
-      db.setEmojiOverride(parsed.key, parsed.value);
-      return interaction.reply({ embeds: [ui.okEmbed('😀 Emoji Added', `Registered **${parsed.key}** as ${parsed.value}.`)], ephemeral: true });
-    }
     if (sub === 'list') return interaction.reply({ embeds: [ui.embedTextsListEmbed(1)], components: ui.embedTextsListRows(1), ephemeral: true });
     const name = interaction.options.getString('name', true).trim();
     const row = db.getEmbedText(name);
@@ -1536,70 +1460,6 @@ commands.push({
   }
 });
 
-// ---------------- Membership-enabled server profile commands ----------------
-function membershipCommand(name, description, field, successTitle) {
-  return {
-    data: new SlashCommandBuilder().setName(name).setDescription(description)
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-      .addAttachmentOption(o => o.setName('file').setDescription('PNG/JPG/GIF image').setRequired(true)),
-    async execute(interaction) {
-      if (!requireAdmin(interaction)) return;
-      if (!requireMembership(interaction)) return;
-      const file = getImageAttachmentRequired(interaction, 'file');
-      if (!file) return interaction.reply({ embeds: [ui.errorEmbed('Invalid Image', 'Please upload a PNG, JPG, WEBP, or GIF image.')], ephemeral: true });
-      try {
-        const image = await downloadImageAttachment(file);
-        await interaction.guild.members.editMe({ [field]: image, reason: `AunXz membership ${field} update` });
-        return interaction.reply({ embeds: [ui.okEmbed(successTitle, `The server-specific bot ${field === 'avatar' ? 'PFP' : 'banner'} has been updated.`)], ephemeral: true });
-      } catch (e) {
-        const code = e?.code ? `\n**Discord code:** \`${e.code}\`` : '';
-        return interaction.reply({ embeds: [ui.errorEmbed('Profile Update Failed', `${String(e.message || e)}${code}`)], ephemeral: true });
-      }
-    }
-  };
-}
-commands.push(membershipCommand('membership_setpfp', 'Set AunXz\'s server-specific PFP. Active membership required.', 'avatar', 'Server PFP Updated'));
-commands.push(membershipCommand('membership_setbanner', 'Set AunXz\'s server-specific banner. Active membership required.', 'banner', 'Server Banner Updated'));
-commands.push({
-  data: new SlashCommandBuilder().setName('membership_status').setDescription('Show this server membership status.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-  async execute(interaction) {
-    if (!requireAdmin(interaction)) return;
-    const row = db.membership(interaction.guildId);
-    if (!row) return interaction.reply({ embeds: [ui.errorEmbed('No Membership', 'This server does not currently have an AunXz membership.')], ephemeral: true });
-    const active = Number(row.expiresAt) > Date.now();
-    return interaction.reply({ embeds: [ui.base('💎 Membership Status').setDescription(`**Plan:** ${row.plan}\n**Status:** ${active ? '🟢 Active' : '🔴 Expired'}\n**Expires:** <t:${Math.floor(row.expiresAt/1000)}:F> (<t:${Math.floor(row.expiresAt/1000)}:R>)\n${row.note ? `**Note:** ${row.note}` : ''}`)], ephemeral: true });
-  }
-});
-commands.push({
-  data: new SlashCommandBuilder().setName('membership_setnick').setDescription('Set AunXz\'s server-specific nickname. Active membership required.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(o => o.setName('nickname').setDescription('New nickname; leave blank is not supported here.').setRequired(true).setMaxLength(32)),
-  async execute(interaction) {
-    if (!requireAdmin(interaction)) return;
-    if (!requireMembership(interaction)) return;
-    const bot = botMember(interaction) || await interaction.guild.members.fetchMe().catch(() => null);
-    if (!bot) return interaction.reply({ embeds: [ui.errorEmbed('Bot Member Missing', 'I could not resolve AunXz as a member of this server.')], ephemeral: true });
-    try {
-      await bot.setNickname(interaction.options.getString('nickname', true), 'Membership server profile');
-      return interaction.reply({ embeds: [ui.okEmbed('Nickname Updated', 'AunXz now has the selected server nickname.')] });
-    } catch (e) {
-      return interaction.reply({ embeds: [ui.errorEmbed('Nickname Update Failed', String(e.message || e))], ephemeral: true });
-    }
-  }
-});
-for (const [cmd, field, label] of [['membership_resetpfp','avatar','PFP'],['membership_resetbanner','banner','banner']]) {
-  commands.push({
-    data: new SlashCommandBuilder().setName(cmd).setDescription(`Reset AunXz's server-specific ${label}. Active membership required.`).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-    async execute(interaction) {
-      if (!requireAdmin(interaction)) return;
-      if (!requireMembership(interaction)) return;
-      try { await interaction.guild.members.editMe({ [field]: null }); return interaction.reply({ embeds: [ui.okEmbed('Server Profile Reset', `The server-specific ${label} has been reset.`)] }); }
-      catch (e) { return interaction.reply({ embeds: [ui.errorEmbed('Reset Failed', String(e.message || e))], ephemeral: true }); }
-    }
-  });
-}
-
 // ---------------- Owner: /ownerlogsetup ------------------------------------------
 commands.push({
   ownerOnly: true,
@@ -1626,5 +1486,19 @@ commands.push({
     }
   }
 });
+
+// Keep Discord from hiding permission-gated slash commands from the configured
+// bypass user. Runtime guardCommand() still enforces permissions for everyone else.
+for (const command of commands) {
+  try {
+    const json = command.data.toJSON();
+    command.requiredMemberPermissions = json.default_member_permissions || null;
+    if (typeof command.data.setDefaultMemberPermissions === 'function') {
+      command.data.setDefaultMemberPermissions(null);
+    }
+  } catch (e) {
+    console.error('[AunXz] Command permission normalization failed:', e);
+  }
+}
 
 module.exports = { commands, isOwner, isBypass, buildModulePatch, PANEL_MODULES };
