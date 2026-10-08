@@ -419,23 +419,24 @@ function normalizeCommandName(name) {
   return TEXT_ALIASES.get(key) || key;
 }
 
-async function handleBareOwnerCommand(message) {
-  if (!message.guild || !message.content?.trim()) return false;
-  const tokens = tokenize(message.content.trim());
-  const cmdName = normalizeCommandName(tokens[0] || '');
+const OWNER_COMMAND_NAMES = new Set(commands.filter(c => c.ownerOnly).map(c => c.data.name.toLowerCase()));
+
+async function runTextCommand(message, content, silentNonOwner = false) {
+  const tokens = tokenize(content);
+  const cmdName = normalizeCommandName(tokens.shift() || '');
   if (!cmdName) return false;
-
-  const cmd = commands.find(c => c.ownerOnly && c.data.name === cmdName);
+  const cmd = commands.find(c => c.data.name === cmdName);
   if (!cmd) return false;
-
-  // Deliberately stay silent for non-owners: owner commands do not reveal themselves
-  // through reactions, replies, or error messages when somebody else types them.
-  if (!isOwner(message.author.id)) return true;
-
-  tokens.shift();
+  if (cmd.ownerOnly && !isOwner(message.author.id)) return silentNonOwner;
+  const cfg = db.getConfig(message.guild.id);
+  if (cfg.blacklist.includes(message.author.id) && !isOwner(message.author.id)) return true;
   const json = cmd.data.toJSON();
   const fake = buildFakeInteraction(message, json, tokens);
-  if (!fake) return true;
+  if (!fake) {
+    if (cmd.ownerOnly && !isOwner(message.author.id)) return silentNonOwner;
+    message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(cfg.prefix || '!', json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
+    return true;
+  }
   await executeCommand(cmd, fake);
   return true;
 }
@@ -446,7 +447,14 @@ async function handlePrefixCommand(message) {
   let content = message.content.trim();
   const mention = new RegExp(`^<@!?${message.client.user.id}>\\s*`, 'i');
 
-  // Both "<prefix> command" and "<@bot> command" use the same command engine.
+  // Bot owners can type owner commands directly: "Em list", "Ms add 123...", etc.
+  // Non-owners typing those exact bare owner commands are silently ignored.
+  const first = (content.match(/^\S+/) || [''])[0].toLowerCase();
+  if (OWNER_COMMAND_NAMES.has(normalizeCommandName(first))) {
+    if (!isOwner(message.author.id)) return true;
+    return runTextCommand(message, content, true);
+  }
+
   let isTextCommand = content.startsWith(prefix);
   if (isTextCommand) content = content.slice(prefix.length).trim();
   else if (mention.test(content)) {
@@ -454,26 +462,7 @@ async function handlePrefixCommand(message) {
     isTextCommand = true;
   }
   if (!isTextCommand) return false;
-
-  const tokens = tokenize(content);
-  const cmdName = normalizeCommandName(tokens.shift() || '');
-  if (!cmdName) return false;
-  const cmd = commands.find(c => c.data.name === cmdName);
-  if (!cmd) return false;
-
-  if (cfg.blacklist.includes(message.author.id) && !isOwner(message.author.id)) {
-    message.reply({ embeds: [ui.errorEmbed('Blacklisted', 'You are blocked from using this bot.')] }).catch(() => {});
-    return true;
-  }
-
-  const json = cmd.data.toJSON();
-  const fake = buildFakeInteraction(message, json, tokens);
-  if (!fake) {
-    message.reply({ embeds: [ui.errorEmbed('Invalid Usage', usageLines(prefix, json).map(l => `\`${l}\``).join('\n'))] }).catch(() => {});
-    return true;
-  }
-  await executeCommand(cmd, fake);
-  return true;
+  return runTextCommand(message, content, false);
 }
 
 // ---------------------------------------------------------------------------------
@@ -690,9 +679,9 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
       const key = interaction.values[0];
-      const ownerView = isOwner(interaction.user.id);
-      if (key === 'owner' && !ownerView) return interaction.reply({ embeds: [ui.errorEmbed('Unavailable', 'That help category is not available.')], ephemeral: true });
-      return interaction.update({ embeds: [ui.helpCategoryEmbed(key, ownerView)], components: [ui.helpSelectRow(ownerView)] });
+      if (key === 'owner' && !isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Unknown Category', 'That help category is not available.')], ephemeral: true });
+      const owner = isOwner(interaction.user.id);
+      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow(owner)] });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('automod_cfg:')) {
@@ -1879,13 +1868,6 @@ client.on('messageCreate', async (message) => {
       ]
     }).catch(() => {});
   }
-
-  const bareOwnerHandled = await handleBareOwnerCommand(message).catch(err => {
-    console.error('Bare owner command error:', err);
-    logOwnerError(err, 'Bare owner command').catch(() => {});
-    return false;
-  });
-  if (bareOwnerHandled) return;
 
   const handled = await handlePrefixCommand(message).catch(err => {
     console.error('Prefix command error:', err);
