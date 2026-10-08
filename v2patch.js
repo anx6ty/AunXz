@@ -29,8 +29,8 @@ async function withFallback(original, normalized, originalPayload, thisArg) {
     return await original.call(thisArg, normalized);
   } catch (error) {
     if (!componentError(error) || normalized === originalPayload) throw error;
-    // Hard fallback keeps the bot functional if Discord rejects a V2 layout because of a
-    // newly introduced component validation rule. The normal path is V2.
+    // Fallback is still useful for a Discord rollout incompatibility, but remove
+    // only the V2 flag. The UI layer already sanitizes duplicate custom_ids first.
     console.error('[AunXz] Components V2 payload rejected; using standard message fallback:', error);
     return original.call(thisArg, stripV2(originalPayload));
   }
