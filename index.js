@@ -419,6 +419,27 @@ function normalizeCommandName(name) {
   return TEXT_ALIASES.get(key) || key;
 }
 
+async function handleBareOwnerCommand(message) {
+  if (!message.guild || !message.content?.trim()) return false;
+  const tokens = tokenize(message.content.trim());
+  const cmdName = normalizeCommandName(tokens[0] || '');
+  if (!cmdName) return false;
+
+  const cmd = commands.find(c => c.ownerOnly && c.data.name === cmdName);
+  if (!cmd) return false;
+
+  // Deliberately stay silent for non-owners: owner commands do not reveal themselves
+  // through reactions, replies, or error messages when somebody else types them.
+  if (!isOwner(message.author.id)) return true;
+
+  tokens.shift();
+  const json = cmd.data.toJSON();
+  const fake = buildFakeInteraction(message, json, tokens);
+  if (!fake) return true;
+  await executeCommand(cmd, fake);
+  return true;
+}
+
 async function handlePrefixCommand(message) {
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
@@ -669,7 +690,9 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'help_select') {
       const key = interaction.values[0];
-      return interaction.update({ embeds: [ui.helpCategoryEmbed(key)], components: [ui.helpSelectRow()] });
+      const ownerView = isOwner(interaction.user.id);
+      if (key === 'owner' && !ownerView) return interaction.reply({ embeds: [ui.errorEmbed('Unavailable', 'That help category is not available.')], ephemeral: true });
+      return interaction.update({ embeds: [ui.helpCategoryEmbed(key, ownerView)], components: [ui.helpSelectRow(ownerView)] });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('automod_cfg:')) {
@@ -1607,12 +1630,4 @@ async function handleModal(interaction) {
     return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Saved',`Your birthday is set to **${day}-${month}**.`)],ephemeral:true});
   }
   if (interaction.customId.startsWith('staffapp_reason:')) {
-    if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server.')],ephemeral:true});
-    const [,decision,userId]=interaction.customId.split(':'); const reason=interaction.fields.getTextInputValue('reason').trim()||'No reason provided.';
-    const user=await client.users.fetch(userId).catch(()=>null); if(!user) return interaction.reply({embeds:[ui.errorEmbed('User Not Found','Could not DM the applicant.')],ephemeral:true});
-    await user.send({embeds:[decision==='accept'?ui.okEmbed('Application Accepted',reason):ui.errorEmbed('Application Rejected',reason)]}).catch(()=>{});
-    return interaction.reply({embeds:[ui.okEmbed('Decision Recorded',`${decision==='accept'?'Accepted':'Rejected'} <@${userId}>. Reason: ${reason}`)]});
-  }
-  if (interaction.customId.startsWith('setup_modal:')) {
-    const sub = interaction.customId.split(':')[1];
-    if (!interaction.member.permissions.has(Permission
+    if(!interaction.guild || 
