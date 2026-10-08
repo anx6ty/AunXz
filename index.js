@@ -14,7 +14,7 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
-const { commands, isOwner, isBypass, buildModulePatch, PANEL_MODULES } = require('./commands');
+const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
 const v2patch = require('./v2patch');
 v2patch.apply();
 
@@ -328,7 +328,7 @@ async function guardCommand(interaction, cmd) {
   const cfg = db.getConfig(interaction.guildId);
   const json = cmd.data.toJSON();
   const required = cmd.requiredMemberPermissions || json.default_member_permissions;
-  if (required && !isBypass(interaction.user?.id) && !interaction.member.permissions.has(BigInt(required))) {
+  if (required && !isOwner(interaction.user?.id) && !interaction.member.permissions.has(BigInt(required))) {
     return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
   }
   if (!commandIsSetupOnly(interaction)) {
