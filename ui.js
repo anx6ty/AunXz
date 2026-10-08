@@ -451,9 +451,9 @@ function emojisListRows(page = 1, pageSize = 8) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safe = Math.min(totalPages, Math.max(1, Number(page) || 1));
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`emoji:list:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`emoji:list:prev:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'),
     new ButtonBuilder().setCustomId(`emoji:page:${safe}`).setLabel(`${safe}/${totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`emoji:list:${Math.min(totalPages, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= totalPages).setEmoji('▶️')
+    new ButtonBuilder().setCustomId(`emoji:list:next:${Math.min(totalPages, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= totalPages).setEmoji('▶️')
   )];
 }
 
@@ -469,9 +469,9 @@ function embedTextsListEmbed(page = 1, pageSize = 6) {
 function embedTextsListRows(page = 1, pageSize = 6) {
   const total = Math.max(1, Math.ceil(db.listEmbedTexts(500).length / pageSize));
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`em:list:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`em:list:prev:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'),
     new ButtonBuilder().setCustomId(`em:page:${page}`).setLabel(`${page}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`em:list:${Math.min(total, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= total).setEmoji('▶️')
+    new ButtonBuilder().setCustomId(`em:list:next:${Math.min(total, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= total).setEmoji('▶️')
   )];
 }
 
@@ -914,9 +914,9 @@ function membershipListRows(rows, page = 1, pageSize = 5) {
   const total = Math.max(1, Math.ceil(rows.length / pageSize));
   const safe = Math.min(total, Math.max(1, Number(page) || 1));
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`ms:list:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`ms:list:prev:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'),
     new ButtonBuilder().setCustomId(`ms:page:${safe}`).setLabel(`${safe}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`ms:list:${Math.min(total, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= total).setEmoji('▶️')
+    new ButtonBuilder().setCustomId(`ms:list:next:${Math.min(total, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= total).setEmoji('▶️')
   )];
 }
 
@@ -960,6 +960,32 @@ function flattenComponentRows(value, out = []) {
   return out;
 }
 
+// Discord rejects a whole message when two interactive children share a custom_id.
+// This validator is deliberately conservative: it preserves the first control and
+// drops only later duplicates, which is especially important for disabled pagination
+// buttons where a one-page list naturally used to generate identical Prev/Next IDs.
+function sanitizeUniqueCustomIds(rows) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rows || []) {
+    const data = typeof row?.toJSON === 'function' ? row.toJSON() : row;
+    const children = Array.isArray(data?.components) ? data.components : [];
+    if (!children.length) continue;
+    const kept = [];
+    for (const child of children) {
+      const id = child?.custom_id;
+      if (id && seen.has(id)) {
+        console.warn(`[AunXz] Removed duplicate component custom_id: ${id}`);
+        continue;
+      }
+      if (id) seen.add(id);
+      kept.push(child);
+    }
+    if (kept.length) out.push(new ActionRowBuilder({ type: 1, components: kept }));
+  }
+  return out;
+}
+
 function embedToContainer(embedLike, rows = []) {
   const d = typeof embedLike?.toJSON === 'function' ? embedLike.toJSON() : (embedLike || {});
   const container = new ContainerBuilder();
@@ -988,7 +1014,7 @@ function embedToContainer(embedLike, rows = []) {
     container.addSeparatorComponents(new SeparatorBuilder().setDivider(true));
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${foot.join(' • ')}`.slice(0, 4000)));
   }
-  const validRows = flattenComponentRows(rows);
+  const validRows = sanitizeUniqueCustomIds(flattenComponentRows(rows));
   if (validRows.length) {
     container.addSeparatorComponents(new SeparatorBuilder().setDivider(false));
     container.addActionRowComponents(...validRows);
