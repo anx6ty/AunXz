@@ -442,6 +442,7 @@ async function runTextCommand(message, content, silentNonOwner = false) {
 }
 
 async function handlePrefixCommand(message) {
+  if (!message.guild) return false;
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
   let content = message.content.trim();
@@ -492,14 +493,24 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('emoji:list:')) {
-      if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
-      const page = Number(interaction.customId.split(':')[2]) || 1;
+      if (!isOwner(interaction.user.id)) return;
+      const parts = interaction.customId.split(':');
+      const page = Number(parts[3]) || 1;
       return interaction.update({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides(), page)], components: ui.emojisListRows(page) });
     }
     if (interaction.isButton() && interaction.customId.startsWith('em:list:')) {
-      if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
-      const page = Number(interaction.customId.split(':')[2]) || 1;
+      if (!isOwner(interaction.user.id)) return;
+      const parts = interaction.customId.split(':');
+      const page = Number(parts[3]) || 1;
       return interaction.update({ embeds: [ui.embedTextsListEmbed(page)], components: ui.embedTextsListRows(page) });
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('ms:list:')) {
+      if (!isOwner(interaction.user.id)) return;
+      const parts = interaction.customId.split(':');
+      const page = Number(parts[3]) || 1;
+      const rows = db.listMemberships();
+      return interaction.update({ embeds: [ui.membershipListEmbed(rows, page)], components: ui.membershipListRows(rows, page) });
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('ownerlogsetup:')) {
@@ -717,7 +728,6 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
     if (interaction.isStringSelectMenu() && interaction.customId === 'vm_kick_pick') return handleVMKickPick(interaction);
-    if (interaction.isStringSelectMenu() && interaction.customId === 'role_select') return handleButton(interaction);
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'vm_setup_category_select') {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
