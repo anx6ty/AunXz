@@ -209,6 +209,15 @@ const DEFAULT_CONFIG = {
   antialt: { enabled: false, action: 'kick', minAccountAgeDays: 7, logChannelId: null },
   starboard: { enabled: false, channelId: null, threshold: 3 },
   inviteTracker: { enabled: false },
+  stats: {
+    enabled: false,
+    categoryId: null,
+    categoryName: '📊・server-stats',
+    refreshSeconds: 300,
+    server: {},
+    social: {},
+    custom: []
+  },
   maintenance: false,
   blacklist: []
 };
