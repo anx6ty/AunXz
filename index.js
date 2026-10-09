@@ -15,10 +15,18 @@ const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
 const { commands, isOwner, buildModulePatch, PANEL_MODULES, handleDangerousConfirmation } = require('./commands');
+const ownerTools = require('./ownerCommands');
+commands.push(...ownerTools.commands);
+ownerTools.setCommandRegistry(commands);
 const v2patch = require('./v2patch');
+const statsetup = require('./statsetup');
+const stickyMessages = require('./stickymessage');
 v2patch.apply();
 
 const applicationSessions = new Map(); // userId -> { guildId, index, answers, waiting }
+const applicationCooldowns = new Map(); // `${guildId}:${userId}` -> timestamp
+const greetVoiceCooldowns = new Map(); // `${guildId}:${userId}` -> timestamp
+const STAFF_APPLICATION_COOLDOWN_MS = 10 * 60 * 1000;
 const birthdayWishesSent = new Set();
 const logSetupSessions = new Map();
 const rolePanelSessions = new Map(); // guild:user -> { buttonId, reactionId }
@@ -88,9 +96,10 @@ async function sendOwnerLog(type, embed, components = []) {
     return false;
   }
 }
-async function logOwnerError(error, context = '') {
+async function logOwnerError(error, context = '', interaction = null) {
   const err = error instanceof Error ? error : new Error(String(error));
   console.error(err);
+  try { ownerTools.saveError(err, context, interaction); } catch (saveErr) { console.error('[OwnerTools] Error persistence failed:', saveErr); }
   const text = (context ? `**Context:** ${context}\n` : '') + `**Error:** \`${String(err.message || err).slice(0, 1800)}\`` + (err.stack ? `\n**Stack:**\n\`\`\`\n${err.stack.slice(0, 3000)}\n\`\`\`` : '');
   await sendOwnerLog('error', ui.errorEmbed(`${ui.emoji('error')} Bot Error`, text));
 }
@@ -118,6 +127,21 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const publicBody = commands.filter(c => !c.ownerOnly).map(c => c.data.toJSON());
   const ownerBody = commands.filter(c => c.ownerOnly).map(c => c.data.toJSON());
+
+  // Fail visibly during startup if a future patch introduces duplicate slash names or
+  // a text alias that shadows a real command name. Discord rejects duplicate payloads.
+  const seenCommandNames = new Map();
+  const duplicateCommandNames = [];
+  for (const command of commands) {
+    const name = String(command?.data?.name || '').toLowerCase();
+    if (!name) continue;
+    if (seenCommandNames.has(name)) duplicateCommandNames.push(`${name} (${seenCommandNames.get(name)} and another registration)`);
+    else seenCommandNames.set(name, name);
+  }
+  if (duplicateCommandNames.length) console.warn(`[CommandAudit] Duplicate slash command names: ${duplicateCommandNames.join(', ')}`);
+  for (const [alias, target] of (typeof TEXT_ALIASES !== 'undefined' ? TEXT_ALIASES : new Map())) {
+    if (seenCommandNames.has(alias) && alias !== target) console.warn(`[CommandAudit] Text alias \`${alias}\` shadows slash command \`/${alias}\` (target: /${target}).`);
+  }
 
   // Public commands go out globally so every server the bot is in gets them (takes up to ~1h to
   // propagate on first deploy; instant after that on updates within the same command set).
@@ -147,11 +171,17 @@ async function finishGiveaways() {
       const pool=participants.filter(id => guild.members.cache.has(id));
       const shuffled=[...pool].sort(()=>Math.random()-0.5);
       const winners=shuffled.slice(0, Math.min(g.winners, shuffled.length));
-      db.updateGiveaway(guild.id,g.id,{status:'ended'});
+      db.updateGiveaway(guild.id,g.id,{status:'ended',winnerIds:JSON.stringify(winners)});
       const ch=g.channelId ? guild.channels.cache.get(g.channelId) : null;
       if (ch) {
         const text=winners.length ? winners.map(id=>`<@${id}>`).join(', ') : 'No valid entries.';
-        await ch.send({embeds:[ui.base('🏆 Giveaway Ended').setDescription(`**Prize:** ${g.prize}\\n**Winner(s):** ${text}`)]}).catch(()=>{});
+        try {
+          await ch.send({embeds:[ui.base('🏆 Giveaway Ended').setDescription(`**Prize:** ${g.prize}\n**Winner(s):** ${text}`)]});
+        } catch (error) {
+          console.error(`[Giveaway] Failed to announce ended giveaway #${g.id} in guild ${guild.id}:`, error);
+        }
+      } else {
+        console.error(`[Giveaway] Giveaway #${g.id} ended, but channel ${g.channelId || '(missing)'} is unavailable in guild ${guild.id}.`);
       }
     }
   }
@@ -165,6 +195,8 @@ client.once('ready', async () => {
   console.log(`Database: ${db.DB_PATH}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { await logOwnerError(e, 'Slash command registration'); }
+  statsetup.start(client);
+  stickyMessages.start(client);
   await publishOwnerDashboard().catch(e => logOwnerError(e, 'Owner dashboard'));
   await sendOwnerLog('online', ui.okEmbed(`${ui.emoji('online')} AunXz Online`, `AunXz is online as **${client.user.tag}**.\n**Guilds:** ${client.guilds.cache.size}\n**Ping:** ${client.ws.ping}ms`));
 });
@@ -189,7 +221,7 @@ setInterval(() => finishGiveaways().catch(console.error), 15000);
 // handlers as slash commands, via a small adapter that mimics the ChatInputCommandInteraction
 // surface those handlers use (options.getX, reply, member, guild, etc).
 // ---------------------------------------------------------------------------------
-const OPT = { SUBCOMMAND: 1, SUBCOMMAND_GROUP: 2, STRING: 3, INTEGER: 4, BOOLEAN: 5, USER: 6, CHANNEL: 7, ROLE: 8, MENTIONABLE: 9, NUMBER: 10 };
+const OPT = { SUBCOMMAND: 1, SUBCOMMAND_GROUP: 2, STRING: 3, INTEGER: 4, BOOLEAN: 5, USER: 6, CHANNEL: 7, ROLE: 8, MENTIONABLE: 9, NUMBER: 10, ATTACHMENT: 11 };
 
 function tokenize(str) {
   const tokens = [];
@@ -231,6 +263,7 @@ function resolveOptionValue(type, raw, message) {
       const id = raw.replace(/[<@!>]/g, '');
       return message.mentions.users.get(id) || message.client.users.cache.get(id) || null;
     }
+    case OPT.ATTACHMENT: return message.attachments?.first?.() || [...(message.attachments?.values?.() || [])][0] || null;
     case OPT.ROLE: {
       const id = raw.replace(/[<@&>]/g, '');
       return message.mentions.roles.get(id) || message.guild.roles.cache.get(id) ||
@@ -250,6 +283,7 @@ function parseLeafArgs(leafOptions, tokens) {
   const raw = {};
   for (let i = 0; i < leafOptions.length; i++) {
     const opt = leafOptions[i];
+    if (opt.type === OPT.ATTACHMENT) { raw[opt.name] = '__message_attachment__'; continue; }
     if (i === leafOptions.length - 1 && opt.type === OPT.STRING) {
       const rest = tokens.slice(i).join(' ');
       if (rest) raw[opt.name] = rest;
@@ -303,7 +337,7 @@ function buildFakeInteraction(message, json, tokens) {
     replied: false,
     options: {
       getString: getter, getInteger: getter, getNumber: getter, getBoolean: getter,
-      getUser: getter, getRole: getter, getChannel: getter, getMentionable: getter,
+      getUser: getter, getRole: getter, getChannel: getter, getMentionable: getter, getAttachment: getter,
       getSubcommand: () => schema.subcommand
     },
     reply: async (payload) => { fake.replied = true; return message.reply(stripEphemeral(payload)); },
@@ -378,12 +412,24 @@ async function executeCommand(cmd, interaction) {
     else await interaction.reply(payload).catch(() => {});
     return;
   }
-  if (!await guardCommand(interaction, cmd)) return;
+  const tracking = ownerTools.trackStart(cmd?.data?.name || interaction.commandName, interaction.guildId);
   try {
+    const disabled = ownerTools.checkDisabledCommand(cmd?.data?.name || interaction.commandName);
+    if (disabled) {
+      const reason = disabled.reason ? `\n**Reason:** ${String(disabled.reason).slice(0, 700)}` : '';
+      const payload = { embeds: [ui.warnEmbed('Command Temporarily Disabled', `This command is temporarily disabled by the bot owner.${reason}`)], ephemeral: true };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {});
+      else await interaction.reply(payload).catch(() => {});
+      ownerTools.trackFinish(tracking, false);
+      return;
+    }
+    if (!await guardCommand(interaction, cmd)) { ownerTools.trackFinish(tracking, false); return; }
     await cmd.execute(interaction);
+    ownerTools.trackFinish(tracking, true);
   } catch (e) {
+    ownerTools.trackFinish(tracking, false);
     console.error(`Command ${interaction.commandName} failed:`, e);
-    logOwnerError(e, `Command /${interaction.commandName}`).catch(() => {});
+    logOwnerError(e, `Command /${interaction.commandName}`, interaction).catch(() => {});
     const code = e?.code ? `\n**Discord code:** \`${e.code}\`` : '';
     const message = e?.message ? String(e.message).slice(0, 1200) : 'Something went wrong while executing the command.';
     const payload = { embeds:[ui.errorEmbed('Command Failed', `${message}${code}`)], ephemeral:true };
@@ -519,6 +565,9 @@ client.on('interactionCreate', async (interaction) => {
       }
       return;
     }
+    if (await statsetup.handleInteraction(interaction, client)) return;
+    if (await stickyMessages.handleInteraction(interaction)) return;
+    if (await ownerTools.handleInteraction(interaction, client)) return;
     if (interaction.isButton() && interaction.customId.startsWith('danger-confirm:')) {
       return await handleDangerousConfirmation(interaction);
     }
@@ -794,10 +843,17 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1];
       if(part==='channel') db.saveConfig(interaction.guildId,{honeypot:{channelId:interaction.values[0]}});
+      else if(part==='log') db.saveConfig(interaction.guildId,{honeypot:{logChannelId:interaction.values[0]}});
       const cfg=db.getConfig(interaction.guildId).honeypot;
+      return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId === 'honeypot_cfg:whitelist') {
+      if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      const ids = [...new Set((interaction.values || []).filter(id => interaction.guild.roles.cache.has(id)))];
+      const cfg=db.saveConfig(interaction.guildId,{honeypot:{whitelistRoleIds:ids}}).honeypot;
       return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
     }
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('antibadword_cfg:')) {
@@ -816,9 +872,10 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('honeypot_cfg:')) {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+      if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const part=interaction.customId.split(':')[1]; const value=interaction.values[0];
-      db.saveConfig(interaction.guildId,{honeypot:part==='action'?{action:value}:{cleanupWindow:value}});
+      if (part !== 'action') return interaction.reply({embeds:[ui.errorEmbed('Invalid Setting','That Honeypot option is not a select-menu setting.')],ephemeral:true});
+      db.saveConfig(interaction.guildId,{honeypot:{action:value}});
       const cfg=db.getConfig(interaction.guildId).honeypot;
       return interaction.update({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg)});
     }
@@ -1091,8 +1148,19 @@ async function handleButton(interaction) {
   }
   if (id === 'antibadword_cfg:words') return interaction.showModal(new ModalBuilder().setCustomId('antibadword_cfg_modal').setTitle('Custom Bad Words').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('words').setLabel('Words/phrases separated by commas').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((db.getConfig(interaction.guildId).antibadword.customWords||[]).join(', ').slice(0,400)))));
   if (id === 'antibadword_cfg:toggle') { const cfg=db.getConfig(interaction.guildId).antibadword; const next=db.saveConfig(interaction.guildId,{antibadword:{enabled:!cfg.enabled}}).antibadword; return interaction.update({embeds:[ui.antiBadwordSetupEmbed(next)],components:ui.antiBadwordSetupRow(next)}); }
-  if (id === 'honeypot_cfg:invite') { const cfg=db.getConfig(interaction.guildId).honeypot; const next=db.saveConfig(interaction.guildId,{honeypot:{createInvite:!cfg.createInvite}}).honeypot; return interaction.update({embeds:[ui.honeypotSetupEmbed(next)],components:ui.honeypotSetupRow(next)}); }
-  if (id === 'honeypot_cfg:dm') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_dm_modal').setTitle('Honeypot Kick DM').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('DM text; use {invite}').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(db.getConfig(interaction.guildId).honeypot.dmMessage.slice(0,400)))));
+  if (id.startsWith('honeypot_cfg:')) {
+    if (!interaction.guild || !interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
+    const cfg = db.getConfig(interaction.guildId).honeypot || {};
+    if (id === 'honeypot_cfg:toggle') {
+      if (!cfg.channelId && !cfg.enabled) return interaction.reply({embeds:[ui.errorEmbed('Choose a Channel','Select the honeypot channel before enabling this feature.')],ephemeral:true});
+      const next = db.saveConfig(interaction.guildId,{honeypot:{enabled:!cfg.enabled}}).honeypot;
+      return interaction.update({embeds:[ui.honeypotSetupEmbed(next)],components:ui.honeypotSetupRow(next)});
+    }
+    if (id === 'honeypot_cfg:invite') { const next=db.saveConfig(interaction.guildId,{honeypot:{createInvite:!cfg.createInvite}}).honeypot; return interaction.update({embeds:[ui.honeypotSetupEmbed(next)],components:ui.honeypotSetupRow(next)}); }
+    if (id === 'honeypot_cfg:whitelist-clear') { const next=db.saveConfig(interaction.guildId,{honeypot:{whitelistRoleIds:[]}}).honeypot; return interaction.update({embeds:[ui.honeypotSetupEmbed(next)],components:ui.honeypotSetupRow(next)}); }
+    if (id === 'honeypot_cfg:cleanup') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_cleanup_modal').setTitle('Honeypot Cleanup Window').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('window').setLabel('none, 10m, 1h, or 24h').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(cfg.cleanupWindow || 'none')))));
+    if (id === 'honeypot_cfg:dm') return interaction.showModal(new ModalBuilder().setCustomId('honeypot_cfg_dm_modal').setTitle('Honeypot Kick DM').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('DM text; use {invite}').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(String(cfg.dmMessage || 'You were removed. {invite}').slice(0,400)))));
+  }
   if (id === 'greetvoice_cfg:prompt') return interaction.showModal(new ModalBuilder().setCustomId('greetvoice_cfg_prompt_modal').setTitle('Greet Voice TTS').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prompt').setLabel('Text spoken in the voice channel').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((db.getConfig(interaction.guildId).greetvoice.ttsPrompt||'Welcome!').slice(0,400)))));
   if (id === 'greetvoice_cfg:audio') {
     if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
@@ -1229,17 +1297,43 @@ async function handleButton(interaction) {
       return interaction.reply({embeds:[ui.errorEmbed('Role Update Failed',`${e?.message || 'Discord rejected the role change.'}${e?.code?`\n**Discord code:** \`${e.code}\``:''}`)],ephemeral:true});
     }
   }
-  if (id==='staffapp_apply') {
-    const cfg=db.getConfig(interaction.guildId).staffApplications;
-    if(!cfg.enabled || !cfg.questions?.length) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','Applications are not configured yet.')],ephemeral:true});
-    if(applicationSessions.has(interaction.user.id)) return interaction.reply({embeds:[ui.warnEmbed('Application In Progress','You already have an application in progress in your DMs.')],ephemeral:true});
-    applicationSessions.set(interaction.user.id,{guildId:interaction.guildId,index:0,answers:[],waiting:false});
-    const dm=await interaction.user.createDM();
-    await dm.send({embeds:[ui.base(cfg.staffApplications.title).setDescription(cfg.staffApplications.dmIntro)],components:[new ActionRowBuilder().addComponents(
-      new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_ready').setLabel('Ready').setStyle(require('discord.js').ButtonStyle.Success),
-      new (require('discord.js').ButtonBuilder)().setCustomId('staffapp_notready').setLabel('Not Ready').setStyle(require('discord.js').ButtonStyle.Secondary)
-    )]});
-    return interaction.reply({embeds:[ui.okEmbed('Check your DMs','I sent you the application start message.')],ephemeral:true});
+  if (id === 'staffapp_apply') {
+    if (!interaction.guildId || !interaction.guild) return interaction.reply({embeds:[ui.errorEmbed('Server Only','Use Apply from the server where the application panel was posted.')],ephemeral:true});
+    const cfg = db.getConfig(interaction.guildId).staffApplications || {};
+    if (!cfg.enabled || !Array.isArray(cfg.questions) || !cfg.questions.length) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','Applications are not configured yet. Ask an administrator to finish `/staffapplicationssetup`.')],ephemeral:true});
+    const cooldownKey = `${interaction.guildId}:${interaction.user.id}`;
+    const cooldownUntil = applicationCooldowns.get(cooldownKey) || 0;
+    if (cooldownUntil > Date.now()) return interaction.reply({embeds:[ui.warnEmbed('Application Cooldown', `You can apply again <t:${Math.ceil(cooldownUntil / 1000)}:R>.`)],ephemeral:true});
+    if (applicationSessions.has(interaction.user.id)) return interaction.reply({embeds:[ui.warnEmbed('Application In Progress','You already have an application in progress. Finish or cancel it before starting another.')],ephemeral:true});
+    // Acknowledge first so the Apply button never expires while the DM is being created.
+    await interaction.deferReply({ephemeral:true});
+    const session = { guildId: interaction.guildId, index: 0, answers: [], waiting: false, createdAt: Date.now() };
+    applicationSessions.set(interaction.user.id, session);
+    try {
+      const dm = await interaction.user.createDM();
+      await dm.send({embeds:[ui.base(cfg.title || 'Staff Applications').setDescription(cfg.dmIntro || 'Are you ready to start your application?')],components:[new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('staffapp_ready').setLabel('Ready').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('staffapp_notready').setLabel('Not Ready').setStyle(ButtonStyle.Secondary)
+      )]});
+      return interaction.editReply({embeds:[ui.okEmbed('Check Your DMs','I sent the application start message. If you cannot see it, check your server privacy settings and message requests.')]});
+    } catch (error) {
+      console.warn(`[StaffApplication] Could not DM ${interaction.user.id}:`, error?.message || error);
+      applicationSessions.delete(interaction.user.id);
+      // Discord modals are the fallback when the member has DMs closed. Modal capacity is 5 fields;
+      // if the form contains more questions, staff can ask for the remaining answers after submission.
+      const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`staffapp_modal_start:${interaction.guildId}`).setLabel('Apply Here Instead').setStyle(ButtonStyle.Primary));
+      return interaction.editReply({embeds:[ui.errorEmbed('DMs Are Closed','I could not send you a DM. You can enable server DMs in Privacy Settings, or use the private application form below (up to five questions in one modal).')],components:[row]});
+    }
+  }
+  if (id.startsWith('staffapp_modal_start:')) {
+    const guildId = id.split(':')[1];
+    const cfg = db.getConfig(guildId).staffApplications || {};
+    if (!cfg.enabled || !cfg.questions?.length) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','This application form is no longer available.')],ephemeral:true});
+    const modal = new ModalBuilder().setCustomId(`staffapp_modal_submit:${guildId}`).setTitle(String(cfg.title || 'Staff Application').slice(0,45));
+    cfg.questions.slice(0,5).forEach((question, index) => {
+      modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(`answer_${index}`).setLabel(String(question || `Question ${index + 1}`).slice(0,45)).setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000)));
+    });
+    return interaction.showModal(modal);
   }
   if(id==='staffapp_ready') {
     const session=applicationSessions.get(interaction.user.id); if(!session) return interaction.reply({embeds:[ui.errorEmbed('No Application','Press Apply in the server first.')],ephemeral:true});
@@ -1251,7 +1345,7 @@ async function handleButton(interaction) {
   if(id.startsWith('staffapp_decide:')) {
     if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server to review applications.')],ephemeral:true});
     const [,decision,userId]=id.split(':');
-    const modal=new ModalBuilder().setCustomId(`staffapp_reason:${decision}:${userId}`).setTitle(decision==='accept'?'Accept Application':'Reject Application');
+    const modal=new ModalBuilder().setCustomId(`staffapp_reason:${decision}:${userId}`).setTitle(decision==='accept'?'Accept Application':decision==='ask'?'Ask Applicant a Question':'Reject Application');
     modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)));
     return interaction.showModal(modal);
   }
@@ -1601,6 +1695,7 @@ async function handleModal(interaction) {
   if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'honeypot_cfg_dm_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{honeypot:{dmMessage:msg||'You were removed. {invite}'}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'honeypot_cfg_cleanup_modal') { const value=interaction.fields.getTextInputValue('window').trim().toLowerCase(); if(!['none','10m','1h','24h'].includes(value)) return interaction.reply({embeds:[ui.errorEmbed('Invalid Cleanup Window','Choose exactly `none`, `10m`, `1h`, or `24h`.')],ephemeral:true}); const cfg=db.saveConfig(interaction.guildId,{honeypot:{cleanupWindow:value}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'greetvoice_cfg_prompt_modal') {
     const prompt = interaction.fields.getTextInputValue('prompt').trim().slice(0, 400);
     if (!prompt) return interaction.reply({ embeds: [ui.errorEmbed('TTS Message Required', 'Enter the welcome message that should be spoken in the voice channel.')], ephemeral: true });
@@ -1663,12 +1758,32 @@ async function handleModal(interaction) {
     const cfg=db.getConfig(interaction.guildId); db.saveConfig(interaction.guildId,{birthdays:{entries:{...(cfg.birthdays.entries||{}),[interaction.user.id]:`${month}-${day}`}}});
     return interaction.reply({embeds:[ui.okEmbed('🎂 Birthday Saved',`Your birthday is set to **${day}-${month}**.`)],ephemeral:true});
   }
+  if (interaction.customId.startsWith('staffapp_modal_submit:')) {
+    const guildId = interaction.customId.split(':')[1];
+    const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return interaction.reply({embeds:[ui.errorEmbed('Server Unavailable','The application server is no longer available.')],ephemeral:true});
+    const cfg = db.getConfig(guildId).staffApplications || {};
+    if (!cfg.enabled || !cfg.questions?.length) return interaction.reply({embeds:[ui.errorEmbed('Unavailable','This application form is no longer available.')],ephemeral:true});
+    const cooldownKey = `${guildId}:${interaction.user.id}`;
+    const cooldownUntil = applicationCooldowns.get(cooldownKey) || 0;
+    if (cooldownUntil > Date.now()) return interaction.reply({embeds:[ui.warnEmbed('Application Cooldown',`You can apply again <t:${Math.ceil(cooldownUntil/1000)}:R>.`)],ephemeral:true});
+    const answers = cfg.questions.slice(0,5).map((_q,index)=>interaction.fields.getTextInputValue(`answer_${index}`).trim().slice(0,1000));
+    const result = await postStaffApplication(guild, interaction.user, cfg, answers);
+    if (!result.ok) return interaction.reply({embeds:[ui.errorEmbed('Application Not Submitted',result.error)],ephemeral:true});
+    applicationCooldowns.set(cooldownKey,Date.now()+STAFF_APPLICATION_COOLDOWN_MS);
+    return interaction.reply({embeds:[ui.okEmbed('Application Submitted',`Your form was delivered to ${result.channel}. Staff can follow up for any remaining questions.`)],ephemeral:true});
+  }
   if (interaction.customId.startsWith('staffapp_reason:')) {
     if(!interaction.guild || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','You need Manage Server.')],ephemeral:true});
     const [,decision,userId]=interaction.customId.split(':'); const reason=interaction.fields.getTextInputValue('reason').trim()||'No reason provided.';
-    const user=await client.users.fetch(userId).catch(()=>null); if(!user) return interaction.reply({embeds:[ui.errorEmbed('User Not Found','Could not DM the applicant.')],ephemeral:true});
-    await user.send({embeds:[decision==='accept'?ui.okEmbed('Application Accepted',reason):ui.errorEmbed('Application Rejected',reason)]}).catch(()=>{});
-    return interaction.reply({embeds:[ui.okEmbed('Decision Recorded',`${decision==='accept'?'Accepted':'Rejected'} <@${userId}>. Reason: ${reason}`)]});
+    const user=await client.users.fetch(userId).catch(()=>null); if(!user) return interaction.reply({embeds:[ui.errorEmbed('User Not Found','The applicant account could not be fetched, so the decision was not recorded.')],ephemeral:true});
+    try {
+      const dmEmbed = decision==='accept' ? ui.okEmbed('Application Accepted',reason) : decision==='ask' ? ui.infoEmbed('Staff Follow-up Question',reason) : ui.errorEmbed('Application Rejected',reason);
+      await user.send({embeds:[dmEmbed]});
+    } catch (error) {
+      return interaction.reply({embeds:[ui.errorEmbed('Applicant DM Failed',`The decision was not recorded because I could not DM the applicant: ${String(error?.message||error).slice(0,400)}. Ask them to enable DMs and retry.`)],ephemeral:true});
+    }
+    return interaction.reply({embeds:[ui.okEmbed('Decision Delivered',`${decision==='accept'?'Accepted':decision==='ask'?'Asked a follow-up question for':'Rejected'} <@${userId}>. The applicant was successfully notified.`)]});
   }
   if (interaction.customId.startsWith('setup_modal:')) {
     const sub = interaction.customId.split(':')[1];
@@ -1766,67 +1881,123 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
 function escapeRegex(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+async function postStaffApplication(guild, user, cfg, answers) {
+  const channel = cfg.logChannelId ? (guild.channels.cache.get(cfg.logChannelId) || await guild.channels.fetch(cfg.logChannelId).catch(() => null)) : null;
+  if (!channel?.isTextBased?.()) return { ok: false, error: 'The application review channel was deleted or is not a text channel. Ask a server admin to select a valid review channel.' };
+  const bot = guild.members.me;
+  const perms = channel.permissionsFor(bot);
+  const missing = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks].filter(p => !perms?.has(p));
+  if (missing.length) return { ok: false, error: `I need View Channel, Send Messages, and Embed Links in ${channel} to submit applications.` };
+  const embed = ui.base('📝 Staff Application').setDescription(`Application from ${user} (\`${user.id}\`)\n**Submitted:** <t:${Math.floor(Date.now()/1000)}:F>`);
+  // Leave room under Discord's 6000-character embed cap; a text attachment carries the full response set.
+  answers.slice(0, 12).forEach((answer, i) => embed.addFields({ name: `${i + 1}. ${String(cfg.questions?.[i] || `Question ${i + 1}`).slice(0,80)}`, value: String(answer || 'No answer').slice(0,250) || 'No answer', inline: false }));
+  if (answers.length > 12) embed.addFields({ name: 'Additional answers', value: `See attached transcript (${answers.length - 12} more answer(s)).`, inline: false });
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`staffapp_decide:accept:${user.id}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`staffapp_decide:reject:${user.id}`).setLabel('Deny').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`staffapp_decide:ask:${user.id}`).setLabel('Ask Question').setStyle(ButtonStyle.Secondary)
+  )];
+  const files = [];
+  if (answers.length > 12) {
+    const { AttachmentBuilder } = require('discord.js');
+    const transcript = cfg.questions.map((q,i)=>`${i+1}. ${q}\nAnswer: ${answers[i] || 'No answer'}`).join('\n\n');
+    files.push(new AttachmentBuilder(Buffer.from(transcript, 'utf8'), { name: `application-${user.id}.txt` }));
+  }
+  try { await channel.send({ embeds: [embed], components: rows, files }); return { ok: true, channel }; }
+  catch (error) { console.error('[StaffApplication] Review post failed:', error); return { ok: false, error: `Discord rejected the application post: ${String(error?.message || error).slice(0,350)}` }; }
+}
+
 async function handleApplicationDM(message) {
   const session = applicationSessions.get(message.author.id);
   if (!session || !session.waiting) return;
+  if (Date.now() - Number(session.createdAt || Date.now()) > 30 * 60 * 1000) { applicationSessions.delete(message.author.id); return message.author.send('Your application session expired. Press Apply again to start over.').catch(()=>{}); }
   if (message.content.trim().length === 0 && message.attachments.size === 0) return;
   const guild = client.guilds.cache.get(session.guildId);
   if (!guild) { applicationSessions.delete(message.author.id); return; }
-  const cfg = db.getConfig(guild.id).staffApplications;
-  session.answers.push(message.content.slice(0, 1500));
+  const cfg = db.getConfig(guild.id).staffApplications || {};
+  session.answers.push(String(message.content || (message.attachments.size ? `[Attachment: ${[...message.attachments.values()].map(a=>a.url).join(', ')}]` : '')).slice(0,1500));
   session.index += 1;
   if (session.index < cfg.questions.length) {
-    return message.author.send(`**Question ${session.index + 1}/${cfg.questions.length}:**\n${cfg.questions[session.index]}`).catch(()=>{});
+    return message.author.send(`**Question ${session.index + 1}/${cfg.questions.length}:**
+${cfg.questions[session.index]}`).catch(error=>console.warn('[StaffApplication] Could not send next DM question:',error?.message||error));
   }
   session.waiting = false;
-  const log = cfg.logChannelId ? guild.channels.cache.get(cfg.logChannelId) : null;
-  if (log?.isTextBased()) {
-    const embed = ui.base('📝 Staff Application').setDescription(`Application from ${message.author} (<@${message.author.id}>)`);
-    cfg.questions.slice(0, 25).forEach((q,i)=>embed.addFields({name:`${i+1}. ${q}`.slice(0,256),value:(session.answers[i]||'No answer').slice(0,1024),inline:false}));
-    await log.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(
-      new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:accept:${message.author.id}`).setLabel('Accept').setStyle(require('discord.js').ButtonStyle.Success),
-      new (require('discord.js').ButtonBuilder)().setCustomId(`staffapp_decide:reject:${message.author.id}`).setLabel('Reject').setStyle(require('discord.js').ButtonStyle.Danger)
-    )]}).catch(()=>{});
+  const result = await postStaffApplication(guild, message.author, cfg, session.answers);
+  if (!result.ok) {
+    applicationSessions.delete(message.author.id);
+    await message.author.send({embeds:[ui.errorEmbed('Application Not Submitted', `${result.error}
+Your answers were not sent to staff. Please contact a server administrator; you may retry after the cooldown is cleared.`)]}).catch(()=>{});
+    return;
   }
-  await message.author.send('Your application has been submitted. Staff will review it and notify you.').catch(()=>{});
+  applicationCooldowns.set(`${guild.id}:${message.author.id}`, Date.now() + STAFF_APPLICATION_COOLDOWN_MS);
+  await message.author.send({embeds:[ui.okEmbed('Application Submitted','Your application has been delivered to the staff review channel. Staff will notify you after a decision.')] }).catch(()=>{});
   applicationSessions.delete(message.author.id);
 }
 
 async function handleHoneypot(message) {
-  const cfg = db.getConfig(message.guild.id).honeypot;
-  await message.delete().catch(()=>{});
+  const cfg = db.getConfig(message.guild.id).honeypot || {};
+  if (!cfg.enabled || !cfg.channelId || cfg.channelId !== message.channelId || message.author.bot) return false;
+  const roleAllowlist = Array.isArray(cfg.whitelistRoleIds) ? cfg.whitelistRoleIds : [];
+  if (roleAllowlist.some(id => message.member?.roles?.cache?.has(id))) return false;
+  const botMember = message.guild.members.me;
+  const channelPerms = message.channel.permissionsFor(botMember);
+  if (!channelPerms?.has(PermissionFlagsBits.ManageMessages)) {
+    const log = cfg.logChannelId ? message.guild.channels.cache.get(cfg.logChannelId) : null;
+    if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('Honeypot Permission Error', `I cannot delete the honeypot message in <#${message.channelId}>. Grant me **Manage Messages** in that channel.`)]}).catch(()=>{});
+    console.error(`[Honeypot] Missing Manage Messages in guild ${message.guild.id}, channel ${message.channelId}.`);
+    return false;
+  }
+  const deleted = await message.delete().then(() => true).catch(error => { console.error('[Honeypot] Message deletion failed:', error); return false; });
+  if (!deleted) return false;
   const log = cfg.logChannelId ? message.guild.channels.cache.get(cfg.logChannelId) : null;
-  if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('🍯 Honeypot Triggered', `${message.author} posted in <#${cfg.channelId}>. Action: **${cfg.action}**.`)]}).catch(()=>{});
-  if (cfg.cleanupWindow !== 'none') {
-    const ms = cfg.cleanupWindow === '10m' ? 10*60e3 : cfg.cleanupWindow === '1h' ? 60*60e3 : 24*60*60e3;
-    const cutoff = Date.now() - ms;
-    for (const ch of message.guild.channels.cache.values()) {
-      if (!ch.isTextBased() || !ch.messages?.fetch) continue;
-      let before;
-      for (let page=0; page<5; page++) {
-        const opts={limit:100}; if(before) opts.before=before;
-        const msgs=await ch.messages.fetch(opts).catch(()=>null); if(!msgs?.size) break;
-        const mine=[...msgs.values()].filter(m=>m.author.id===message.author.id && m.createdTimestamp>=cutoff && m.id!==message.id);
-        await Promise.allSettled(mine.map(m=>m.delete().catch(()=>{})));
-        const oldest=msgs.last(); if(!oldest || oldest.createdTimestamp<cutoff || msgs.size<100) break; before=oldest.id;
+  if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('🍯 Honeypot Triggered', `${message.author} posted in <#${cfg.channelId}>. Action: **${cfg.action || 'kick'}**.`)]}).catch(error => console.error('[Honeypot] Log send failed:', error?.message || error));
+  if (cfg.cleanupWindow && cfg.cleanupWindow !== 'none') {
+    const ms = cfg.cleanupWindow === '10m' ? 10*60e3 : cfg.cleanupWindow === '1h' ? 60*60e3 : cfg.cleanupWindow === '24h' ? 24*60*60e3 : 0;
+    if (ms > 0) {
+      const cutoff = Date.now() - ms;
+      for (const ch of message.guild.channels.cache.values()) {
+        if (!ch.isTextBased() || !ch.messages?.fetch) continue;
+        let before;
+        for (let page=0; page<5; page++) {
+          const opts={limit:100}; if(before) opts.before=before;
+          const msgs=await ch.messages.fetch(opts).catch(()=>null); if(!msgs?.size) break;
+          const mine=[...msgs.values()].filter(m=>m.author.id===message.author.id && m.createdTimestamp>=cutoff && m.id!==message.id);
+          await Promise.allSettled(mine.map(m=>m.delete().catch(()=>{})));
+          const oldest=msgs.last(); if(!oldest || oldest.createdTimestamp<cutoff || msgs.size<100) break; before=oldest.id;
+        }
       }
     }
   }
   const member=await message.guild.members.fetch(message.author.id).catch(()=>null);
-  if (cfg.action==='kick' || cfg.action==='ban') {
-    let invite='';
-    if(cfg.action==='kick' && cfg.createInvite) {
-      const target=message.guild.channels.cache.get(cfg.channelId) || message.guild.systemChannel;
-      if(target?.isTextBased() && target.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.CreateInstantInvite)) {
-        invite=await target.createInvite({maxAge:86400,maxUses:1,unique:true,reason:'Honeypot recovery invite'}).then(i=>i.url).catch(()=> '');
-      }
+  const action = cfg.action || 'kick';
+  if (action === 'kick' || action === 'ban' || action === 'timeout') {
+    if (!member) { console.warn(`[Honeypot] Could not fetch member ${message.author.id}; action ${action} was skipped.`); return true; }
+    const required = action === 'kick' ? PermissionFlagsBits.KickMembers : action === 'ban' ? PermissionFlagsBits.BanMembers : PermissionFlagsBits.ModerateMembers;
+    const label = action === 'kick' ? 'Kick Members' : action === 'ban' ? 'Ban Members' : 'Moderate Members';
+    if (!botMember?.permissions?.has(required) || (member.id !== message.guild.ownerId && member.roles.highest.position >= botMember.roles.highest.position)) {
+      const reason = !botMember?.permissions?.has(required) ? `I need **${label}**.` : 'The member is at or above my highest role.';
+      if (log?.isTextBased()) log.send({embeds:[ui.errorEmbed('Honeypot Action Failed', `${action} was not completed for ${message.author}. ${reason}`)]}).catch(()=>{});
+      console.error(`[Honeypot] ${action} failed preflight in guild ${message.guild.id}: ${reason}`);
+      return true;
     }
-    if(cfg.action==='kick') {
-      await member?.kick('Honeypot trigger').catch(()=>{});
-      const dm=(cfg.dmMessage||'You were removed for posting in the honeypot channel. {invite}').replace('{invite}',invite||'');
-      await message.author.send(dm).catch(()=>{});
-    } else await member?.ban({reason:'Honeypot trigger'}).catch(()=>{});
-  } else if(cfg.action==='timeout') await member?.timeout(10*60e3,'Honeypot trigger').catch(()=>{});
+    if (action === 'kick') {
+      let invite='';
+      if (cfg.createInvite) {
+        const target = cfg.logChannelId ? message.guild.channels.cache.get(cfg.logChannelId) : message.guild.systemChannel;
+        if (target?.isTextBased() && target.permissionsFor(botMember)?.has(PermissionFlagsBits.CreateInstantInvite))
+          invite = await target.createInvite({maxAge:86400,maxUses:1,unique:true,reason:'Honeypot recovery invite'}).then(i=>i.url).catch(()=> '');
+      }
+      const acted = await member.kick('Honeypot trigger').then(()=>true).catch(error=>{ console.error('[Honeypot] Kick failed:',error); return false; });
+      const dm=String(cfg.dmMessage||'You were removed for posting in the honeypot channel. {invite}').replace('{invite}',invite||'');
+      if(acted) await message.author.send(dm).catch(()=>{});
+      else if(log?.isTextBased()) log.send({embeds:[ui.errorEmbed('Honeypot Kick Failed', `Discord rejected the kick for ${message.author}. Check role hierarchy and **Kick Members**.`)]}).catch(()=>{});
+    } else if (action === 'ban') {
+      await member.ban({reason:'Honeypot trigger'}).catch(error=>{console.error('[Honeypot] Ban failed:',error); if(log?.isTextBased()) log.send({embeds:[ui.errorEmbed('Honeypot Ban Failed',String(error?.message||error).slice(0,800))]}).catch(()=>{});});
+    } else if (action === 'timeout') {
+      await member.timeout(10*60e3,'Honeypot trigger').catch(error=>{console.error('[Honeypot] Timeout failed:',error); if(log?.isTextBased()) log.send({embeds:[ui.errorEmbed('Honeypot Timeout Failed',String(error?.message||error).slice(0,800))]}).catch(()=>{});});
+    }
+  }
+  return true;
 }
 
 function birthdayKey(date) { return `${date.getUTCMonth()+1}-${date.getUTCDate()}`; }
@@ -1891,7 +2062,19 @@ client.on('messageCreate', async (message) => {
   // Staff applications happen in DMs and intentionally have no guild.
   if (!message.guild) return handleApplicationDM(message).catch(console.error);
 
+  // Debounced per-channel sticky refresh; it runs before prefix-command early returns.
+  stickyMessages.handleMessage(message).catch(err => console.error('[StickyMessage] message handler failed:', err));
+
   const cfgAll = db.getConfig(message.guild.id);
+
+  // Honeypot: only configured, enabled and non-whitelisted channel posts trigger action.
+  const honeypot = cfgAll.honeypot || {};
+  const allowedHoneypotRoles = Array.isArray(honeypot.whitelistRoleIds) ? honeypot.whitelistRoleIds : [];
+  const bypassHoneypot = allowedHoneypotRoles.some(roleId => message.member?.roles?.cache?.has(roleId));
+  if (honeypot.enabled && honeypot.channelId === message.channelId && !bypassHoneypot) {
+    await handleHoneypot(message).catch(err => console.error('[Honeypot] handler failed:', err));
+    return;
+  }
 
   // Setup image/GIF uploads are consumed before command parsing and removed after saving.
   if (await consumeSetupMedia(message)) return;
