@@ -9,12 +9,51 @@ const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
 const templates = require('./template');
+const { randomBytes } = require('crypto');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const isOwner = (id) => OWNER_IDS.includes(id);
+const isOwner = (id) => OWNER_IDS.includes(String(id || ''));
+
+const pendingDangerousActions = new Map();
+
+function askForConfirmation(interaction, { title, description, actionLabel, run }) {
+  const token = randomBytes(8).toString('hex');
+  const record = { userId: interaction.user.id, guildId: interaction.guildId, actionLabel, run, expiresAt: Date.now() + 90000 };
+  pendingDangerousActions.set(token, record);
+  setTimeout(() => pendingDangerousActions.delete(token), 90000).unref?.();
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`danger-confirm:${token}:yes`).setLabel('Confirm').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`danger-confirm:${token}:no`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+  );
+  return interaction.reply({ embeds: [ui.warnEmbed(`⚠️ ${title}`, `${description}\n\nThis confirmation expires in 90 seconds.`)], components: [row], ephemeral: true });
+}
+
+async function handleDangerousConfirmation(interaction) {
+  const parts = String(interaction.customId || '').split(':');
+  const token = parts[1];
+  const choice = parts[2];
+  const pending = pendingDangerousActions.get(token);
+  if (!pending || Date.now() > pending.expiresAt) {
+    pendingDangerousActions.delete(token);
+    return interaction.update({ embeds: [ui.errorEmbed('Confirmation Expired', 'Run the command again to start a new confirmation.')], components: [] });
+  }
+  if (interaction.user.id !== pending.userId || interaction.guildId !== pending.guildId) {
+    return interaction.reply({ embeds: [ui.errorEmbed('Not Your Confirmation', 'Only the person who started this action can confirm or cancel it.')], ephemeral: true });
+  }
+  pendingDangerousActions.delete(token);
+  if (choice !== 'yes') return interaction.update({ embeds: [ui.infoEmbed('Action Cancelled', `Cancelled: **${pending.actionLabel}**. Nothing was changed.`)], components: [] });
+  await interaction.deferUpdate();
+  try {
+    const result = await pending.run(interaction);
+    const embed = result && typeof result.toJSON === 'function' ? result : ui.okEmbed('Action Complete', `**${pending.actionLabel}** completed.`);
+    return interaction.editReply({ embeds: [embed], components: [] });
+  } catch (error) {
+    console.error(`Confirmed action failed (${pending.actionLabel}):`, error);
+    return interaction.editReply({ embeds: [ui.errorEmbed('Action Failed', String(error?.message || error).slice(0, 1500))], components: [] });
+  }
+}
 
 function requireAdmin(interaction) {
-  if (isOwner(interaction.user?.id)) return true;
   if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Administrator** to use this.')], ephemeral: true });
     return false;
@@ -35,7 +74,7 @@ function botMember(interaction) {
 
 function actionPermissionError(interaction, permission, label) {
   const member = interaction.member;
-  if (!isOwner(interaction.user?.id) && !member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+  if (!member?.permissions?.has(permission) && !member?.permissions?.has(PermissionFlagsBits.Administrator)) {
     return ui.errorEmbed('Missing Permissions', `You need **${label}** to use this action.`);
   }
   const bot = botMember(interaction);
@@ -51,7 +90,7 @@ function hierarchyError(interaction, target, actionLabel) {
   if (target.id === interaction.guild.ownerId) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} the server owner.`);
   if (target.id === interaction.client.user.id) return ui.errorEmbed('Action Blocked', `I cannot ${actionLabel} myself.`);
   if (target.roles?.highest?.position >= bot.roles.highest.position) return ui.errorEmbed('Role Hierarchy', `I cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than my highest role.`);
-  if (!isOwner(interaction.user?.id) && interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
+  if (interaction.member.id !== interaction.guild.ownerId && target.roles?.highest?.position >= interaction.member.roles.highest.position) {
     return ui.errorEmbed('Role Hierarchy', `You cannot ${actionLabel} **${target.user.tag}** because their highest role is equal to or higher than your highest role.`);
   }
   return null;
@@ -154,7 +193,7 @@ const commands = [];
         });
       }
 
-      if (!isOwner(interaction.user?.id) && !interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+      if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({
           embeds: [ui.errorEmbed('Administrator Required', 'Only an Administrator can load a complete server template.')],
           ephemeral: true
@@ -343,7 +382,7 @@ commands.push({
       .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
       .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
   async execute(interaction) {
-    if(!isOwner(interaction.user?.id) && !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+    if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
     const prize=interaction.options.getString('prize');
     const winners=interaction.options.getInteger('winners')||1;
@@ -861,41 +900,47 @@ function modLog(interaction, embed) {
 }
 
 commands.push({
-  data: new SlashCommandBuilder().setName('ban').setDescription('Ban a member.')
+  data: new SlashCommandBuilder().setName('ban').setDescription('Ban a member after confirmation.')
     .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
     .addUserOption(o => o.setName('user').setDescription('user').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('reason')),
   async execute(interaction) {
     const user = interaction.options.getUser('user');
     const reason = interaction.options.getString('reason') || 'No reason provided';
+    if (user.id === interaction.guild.ownerId) return interaction.reply({ embeds: [ui.errorEmbed('Action Blocked', 'The server owner cannot be banned.')], ephemeral: true });
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
     const preflight = actionPreflight(interaction, member, PermissionFlagsBits.BanMembers, 'Ban Members', 'ban');
     if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
-
     const bot = botMember(interaction);
     if (!bot?.permissions?.has(PermissionFlagsBits.BanMembers) && !bot?.permissions?.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Bot Missing Permissions', 'I need **Ban Members** permission to ban members.')], ephemeral: true });
     }
-    if (member && !member.bannable) {
-      return interaction.reply({ embeds: [ui.errorEmbed('Cannot Ban Member', `Discord does not allow me to ban **${user.tag}**. Make sure my highest role is above their highest role.`)], ephemeral: true });
-    }
+    if (member && !member.bannable) return interaction.reply({ embeds: [ui.errorEmbed('Cannot Ban Member', `Discord does not allow me to ban **${user.tag}**. Check my highest role and the target's role.`)], ephemeral: true });
 
-    try {
-      await interaction.guild.bans.create(user.id, { reason });
-    } catch (e) {
-      let detail = e.message || 'unknown error';
-      if (e.code === 50013) detail = 'I do not have permission to ban this member, or my role is not high enough.';
-      else if (e.code === 10007) detail = 'The member could not be found in this server.';
-      return interaction.reply({ embeds: [ui.errorEmbed('Ban Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${detail}`)], ephemeral: true });
-    }
-    const embed = ui.okEmbed('🔨 Member Banned', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
-    await interaction.reply({ embeds: [embed] });
-    modLog(interaction, embed);
+    return askForConfirmation(interaction, {
+      title: 'Confirm Ban',
+      description: `Ban **${user.tag}** (\`${user.id}\`)?\n**Reason:** ${reason}`,
+      actionLabel: `ban ${user.tag}`,
+      run: async confirmed => {
+        if (user.id === confirmed.guild.ownerId) return ui.errorEmbed('Action Blocked', 'The server owner cannot be banned.');
+        const freshMember = await confirmed.guild.members.fetch(user.id).catch(() => null);
+        const check = actionPreflight(confirmed, freshMember, PermissionFlagsBits.BanMembers, 'Ban Members', 'ban');
+        if (check) return check;
+        const freshBot = botMember(confirmed);
+        if (!freshBot?.permissions?.has(PermissionFlagsBits.BanMembers) && !freshBot?.permissions?.has(PermissionFlagsBits.Administrator)) return ui.errorEmbed('Bot Missing Permissions', 'I need **Ban Members** permission to ban members.');
+        if (freshMember && !freshMember.bannable) return ui.errorEmbed('Cannot Ban Member', `Discord does not allow me to ban **${user.tag}**. Check my highest role and the target's role.`);
+        try { await confirmed.guild.bans.create(user.id, { reason: `${reason} | Requested by ${confirmed.user.tag}`.slice(0, 512) }); }
+        catch (e) { const detail = e.code === 50013 ? 'I do not have permission, or my role is not high enough.' : (e.message || 'Unknown error'); return ui.errorEmbed('Ban Failed', `Discord rejected the ban. **${e.code || 'Unknown error'}** — ${detail}`); }
+        const embed = ui.okEmbed('🔨 Member Banned', `**User:** ${user.tag}\n**By:** ${confirmed.user}\n**Reason:** ${reason}`);
+        modLog(confirmed, embed);
+        return embed;
+      }
+    });
   }
 });
 
 commands.push({
-  data: new SlashCommandBuilder().setName('kick').setDescription('Kick a member.')
+  data: new SlashCommandBuilder().setName('kick').setDescription('Kick a member after confirmation.')
     .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
     .addUserOption(o => o.setName('user').setDescription('user').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('reason')),
@@ -903,16 +948,28 @@ commands.push({
     const user = interaction.options.getUser('user');
     const reason = interaction.options.getString('reason') || 'No reason provided';
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+    if (!member) return interaction.reply({ embeds: [ui.errorEmbed('Member Not Found', 'That user is not currently a member of this server.')], ephemeral: true });
     const preflight = actionPreflight(interaction, member, PermissionFlagsBits.KickMembers, 'Kick Members', 'kick');
     if (preflight) return interaction.reply({ embeds: [preflight], ephemeral: true });
-    try {
-      await member.kick(reason);
-    } catch (e) {
-      return interaction.reply({ embeds: [ui.errorEmbed('Kick Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral: true });
-    }
-    const embed = ui.okEmbed('👢 Member Kicked', `**User:** ${user.tag}\n**By:** ${interaction.user}\n**Reason:** ${reason}`);
-    await interaction.reply({ embeds: [embed] });
-    modLog(interaction, embed);
+    if (!member.kickable) return interaction.reply({ embeds: [ui.errorEmbed('Cannot Kick Member', `Discord does not allow me to kick **${user.tag}**. Check my highest role and the target's role.`)], ephemeral: true });
+
+    return askForConfirmation(interaction, {
+      title: 'Confirm Kick',
+      description: `Kick **${user.tag}** (\`${user.id}\`)?\n**Reason:** ${reason}`,
+      actionLabel: `kick ${user.tag}`,
+      run: async confirmed => {
+        const freshMember = await confirmed.guild.members.fetch(user.id).catch(() => null);
+        if (!freshMember) return ui.errorEmbed('Member Not Found', 'That user is no longer in this server.');
+        const check = actionPreflight(confirmed, freshMember, PermissionFlagsBits.KickMembers, 'Kick Members', 'kick');
+        if (check) return check;
+        if (!freshMember.kickable) return ui.errorEmbed('Cannot Kick Member', `Discord does not allow me to kick **${user.tag}**. Check my highest role and the target's role.`);
+        try { await freshMember.kick(reason); }
+        catch (e) { return ui.errorEmbed('Kick Failed', `Discord rejected the kick. **${e.code || 'Unknown error'}** — ${e.message || 'Unknown error'}`); }
+        const embed = ui.okEmbed('👢 Member Kicked', `**User:** ${user.tag}\n**By:** ${confirmed.user}\n**Reason:** ${reason}`);
+        modLog(confirmed, embed);
+        return embed;
+      }
+    });
   }
 });
 
@@ -993,17 +1050,35 @@ commands.push({
 });
 
 commands.push({
-  data: new SlashCommandBuilder().setName('purge').setDescription('Bulk delete messages.')
+  data: new SlashCommandBuilder().setName('purge').setDescription('Bulk delete messages after confirmation.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
     .addIntegerOption(o => o.setName('amount').setDescription('1-100').setRequired(true).setMinValue(1).setMaxValue(100))
-    .addUserOption(o => o.setName('user').setDescription('only delete this user\'s messages')),
+    .addUserOption(o => o.setName('user').setDescription("only delete this user's messages")),
   async execute(interaction) {
     const amount = interaction.options.getInteger('amount');
     const user = interaction.options.getUser('user');
-    const msgs = await interaction.channel.messages.fetch({ limit: amount });
-    const filtered = user ? msgs.filter(m => m.author.id === user.id) : msgs;
-    try { await interaction.channel.bulkDelete(filtered, true); } catch (e) { return interaction.reply({ embeds:[ui.errorEmbed('Purge Failed', `Discord rejected the action. **${e.code || 'Unknown error'}** — ${e.message || 'unknown error'}`)], ephemeral:true }); }
-    await interaction.reply({ embeds: [ui.okEmbed('🧹 Purged', `Deleted ${filtered.size} messages.`)], ephemeral: true });
+    const permissionError = actionPermissionError(interaction, PermissionFlagsBits.ManageMessages, 'Manage Messages');
+    if (permissionError) return interaction.reply({ embeds: [permissionError], ephemeral: true });
+    if (!interaction.channel?.isTextBased?.() || !interaction.channel.messages?.fetch || !interaction.channel.bulkDelete) {
+      return interaction.reply({ embeds: [ui.errorEmbed('Unsupported Channel', 'Purge works in regular text channels and threads that support bulk deletion.')], ephemeral: true });
+    }
+    return askForConfirmation(interaction, {
+      title: 'Confirm Purge',
+      description: `Delete up to **${amount}** recent messages${user ? ` from ${user}` : ''} in ${interaction.channel}? Messages older than 14 days cannot be bulk-deleted.`,
+      actionLabel: `purge ${amount} messages`,
+      run: async confirmed => {
+        const check = actionPermissionError(confirmed, PermissionFlagsBits.ManageMessages, 'Manage Messages');
+        if (check) return check;
+        const channel = confirmed.channel;
+        const messages = await channel.messages.fetch({ limit: amount });
+        const filtered = user ? messages.filter(m => m.author.id === user.id) : messages;
+        if (!filtered.size) return ui.warnEmbed('Nothing To Purge', 'No matching recent messages were found.');
+        let deleted;
+        try { deleted = await channel.bulkDelete(filtered, true); }
+        catch (e) { return ui.errorEmbed('Purge Failed', `Discord rejected the deletion. **${e.code || 'Unknown error'}** — ${e.message || 'Unknown error'}`); }
+        return ui.okEmbed('🧹 Messages Purged', `Successfully deleted **${deleted.size}** message(s)${user ? ` from ${user}` : ''}.`);
+      }
+    });
   }
 });
 
@@ -1160,7 +1235,7 @@ commands.push({
 // as an alternative to the Staff Controls buttons.
 // ---------------------------------------------------------------------------------
 function requireTicketStaff(interaction, ticketCfg) {
-  const isAdmin = isOwner(interaction.user?.id) || interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+  const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
   const hasRole = ticketCfg.supportRoleId && interaction.member.roles.cache.has(ticketCfg.supportRoleId);
   if (!isAdmin && !hasRole) {
     interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need the support role or Administrator to manage tickets.')], ephemeral: true });
@@ -1314,7 +1389,7 @@ commands.push({
     .addSubcommand(s => s.setName('reset').setDescription('reset a member\'s XP and level to 0')
       .addUserOption(o => o.setName('user').setDescription('member').setRequired(true))),
   async execute(interaction) {
-    if (!isOwner(interaction.user?.id) && !interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return interaction.reply({ embeds: [ui.errorEmbed('Missing Permissions', 'You need **Moderate Members** or **Administrator**.')], ephemeral: true });
     }
     const sub = interaction.options.getSubcommand();
@@ -1328,6 +1403,37 @@ commands.push({
     else if (sub === 'reset') { xp = 0; level = 0; }
     db.setLevel(interaction.guildId, user.id, xp, level, rec.lastMessage);
     await interaction.reply({ embeds: [ui.okEmbed('📈 XP Updated', `${user} — **Level:** ${level} **XP:** ${xp}`)] });
+  }
+});
+
+// ---------------------------------------------------------------------------------
+// Owner-only global blacklist: block commands inside servers owned by a user.
+// ---------------------------------------------------------------------------------
+commands.push({
+  ownerOnly: true,
+  data: new SlashCommandBuilder().setName('bl').setDescription('[Owner] Block command use in servers owned by a user.')
+    .addSubcommand(s => s.setName('add').setDescription('Blacklist all servers owned by a user.')
+      .addStringOption(o => o.setName('user_id').setDescription('Discord user ID of the server owner').setRequired(true).setMinLength(15).setMaxLength(25)))
+    .addSubcommand(s => s.setName('remove').setDescription('Remove a user from the global server blacklist.')
+      .addStringOption(o => o.setName('user_id').setDescription('Discord user ID').setRequired(true).setMinLength(15).setMaxLength(25)))
+    .addSubcommand(s => s.setName('list').setDescription('List globally blacklisted server owners.')),
+  async execute(interaction) {
+    if (!isOwner(interaction.user?.id)) return interaction.reply({ embeds: [ui.errorEmbed('⛔ Owner Only', 'This command is restricted to IDs listed in `OWNER_IDS`.')], ephemeral: true });
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'list') {
+      const ids = db.getGlobalBlacklist();
+      const lines = ids.map((id, index) => `**${index + 1}.** <@${id}> — \`${id}\``);
+      return interaction.reply({ embeds: [ui.infoEmbed('🛡️ Global Server Blacklist', lines.join('\n').slice(0, 3900) || 'The global blacklist is empty.')], ephemeral: true });
+    }
+    const userId = String(interaction.options.getString('user_id', true)).trim();
+    if (!/^\d{15,25}$/.test(userId)) return interaction.reply({ embeds: [ui.errorEmbed('Invalid User ID', 'Enter a valid Discord user ID containing 15–25 digits.')], ephemeral: true });
+    if (sub === 'add') {
+      const ids = db.addGlobalBlacklist(userId);
+      const ownedGuilds = interaction.client.guilds.cache.filter(g => g.ownerId === userId).map(g => g.name);
+      return interaction.reply({ embeds: [ui.okEmbed('🚫 Owner Blacklisted', `AunXz will silently ignore commands in servers owned by <@${userId}>.\n**Currently joined matching servers:** ${ownedGuilds.length}${ownedGuilds.length ? `\n${ownedGuilds.slice(0, 8).map(name => `• ${name}`).join('\n')}` : ''}\n**Total blacklisted owners:** ${ids.length}`)], ephemeral: true });
+    }
+    const ids = db.removeGlobalBlacklist(userId);
+    return interaction.reply({ embeds: [ui.okEmbed('✅ Owner Removed From Blacklist', `Commands are no longer blocked based on server ownership for <@${userId}>.\n**Total blacklisted owners:** ${ids.length}`)], ephemeral: true });
   }
 });
 
@@ -1481,34 +1587,4 @@ commands.push({
   }
 });
 
-commands.push({
-  ownerOnly: true,
-  data: new SlashCommandBuilder().setName('eval').setDescription('[Owner] Run raw JavaScript.')
-    .addStringOption(o => o.setName('code').setDescription('code to run').setRequired(true)),
-  async execute(interaction) {
-    if (!isOwner(interaction.user.id)) return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
-    try {
-      let result = eval(interaction.options.getString('code')); // eslint-disable-line no-eval
-      if (typeof result !== 'string') result = require('util').inspect(result, { depth: 1 });
-      await interaction.reply({ embeds: [ui.okEmbed('✅ Eval Result', '```js\n' + result.slice(0, 3800) + '\n```')], ephemeral: true });
-    } catch (e) {
-      await interaction.reply({ embeds: [ui.errorEmbed('❌ Eval Error', '```\n' + e.message + '\n```')], ephemeral: true });
-    }
-  }
-});
-
-// Keep Discord from hiding permission-gated slash commands from the configured
-// owner IDs. Runtime guardCommand() still enforces permissions for everyone else.
-for (const command of commands) {
-  try {
-    const json = command.data.toJSON();
-    command.requiredMemberPermissions = json.default_member_permissions || null;
-    if (typeof command.data.setDefaultMemberPermissions === 'function') {
-      command.data.setDefaultMemberPermissions(null);
-    }
-  } catch (e) {
-    console.error('[AunXz] Command permission normalization failed:', e);
-  }
-}
-
-module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES };
+module.exports = { commands, isOwner, buildModulePatch, PANEL_MODULES, handleDangerousConfirmation };
