@@ -16,8 +16,11 @@ const ALL_PLACEHOLDERS = {
   'yt.subs':'YouTube subscribers', 'yt.views':'YouTube views', 'yt.videos':'YouTube videos', 'yt.likes':'Likes on recent YouTube videos',
   'tw.followers':'X/Twitter followers', 'tw.following':'X/Twitter following', 'tw.tweets':'X/Twitter posts', 'tw.likes':'Likes on recent X/Twitter posts',
   'tt.followers':'TikTok followers', 'tt.following':'TikTok following', 'tt.likes':'TikTok likes', 'tt.videos':'TikTok videos',
-  'server.members':'Server members', 'server.humans':'Non-bot members', 'server.bots':'Bots', 'server.staff':'Non-bot administrators', 'server.boosts':'Server boosts'
+  'server.members':'Server members', 'server.humans':'Non-bot members', 'server.bots':'Bots', 'server.staff':'Non-bot administrators', 'server.boosts':'Server boosts',
+  'server.online':'Online members (cached presence)', 'server.roles':'Server roles', 'server.channels':'Server channels'
 };
+const SERVER_ALIASES = {members:'server.members', bots:'server.bots', staff:'server.staff', boosts:'server.boosts', humans:'server.humans', online:'server.online', roles:'server.roles', channels:'server.channels'};
+const PLATFORM_ENV_KEYS = {youtube:['YOUTUBE_API_KEY','YOUTUBE_DATA_API_KEY'], instagram:['INSTAGRAM_ACCESS_TOKEN','META_GRAPH_ACCESS_TOKEN'], twitter:['X_BEARER_TOKEN','TWITTER_BEARER_TOKEN'], tiktok:['TIKTOK_ACCESS_TOKEN']};
 const PLATFORM_PREFIX = { instagram:'ig', youtube:'yt', twitter:'tw', tiktok:'tt' };
 const PLATFORM_LABEL = { instagram:'📸 Instagram', youtube:'▶️ YouTube', twitter:'𝕏 Twitter/X', tiktok:'🎵 TikTok' };
 const SOCIAL_INTERVAL_DEFAULT = Math.max(10, Number(process.env.STAT_SOCIAL_INTERVAL_MINUTES) || 12) * 60000;
@@ -31,7 +34,7 @@ let started = false;
 let botClient = null;
 
 function sessionKey(guildId, userId) { return `${guildId}:${userId}`; }
-function sessionCustomId(userId, action, extra = '') { return `statsetup:${userId}:${action}${extra ? `:${extra}` : ''}`; }
+function sessionCustomId(sessionOrUserId, action, extra = '') { const session = sessionOrUserId && typeof sessionOrUserId === 'object' ? sessionOrUserId : null; const userId = session?.userId || sessionOrUserId; const prefix = session?.commandName === 'setupstats' ? 'setupstats' : 'statsetup'; return `${prefix}:${userId}:${action}${extra ? `:${extra}` : ''}`; }
 function asArray(value) { try { const v = JSON.parse(value || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } }
 function placeholderKeys(template) { return [...new Set([...String(template || '').matchAll(/<([^<>]+)>/g)].map(m => m[1].trim()))]; }
 function formatNumber(value, fullNumbers = false) {
@@ -43,7 +46,7 @@ function formatNumber(value, fullNumbers = false) {
   return String(n);
 }
 function renderTemplate(template, metrics, fullNumbers) {
-  return String(template).replace(/<([^<>]+)>/g, (_all, key) => formatNumber(metrics[key.trim()], fullNumbers)).replace(/\s+/g, ' ').trim().slice(0, 100);
+  return String(template).replace(/<([^<>]+)>/g, (_all, key) => { const raw = key.trim(); const canonical = SERVER_ALIASES[raw] || raw; return formatNumber(metrics[canonical] ?? metrics[raw], fullNumbers); }).replace(/\s+/g, ' ').trim().slice(0, 100);
 }
 function placeholdersForType(type) {
   if (type === 'server') return Object.keys(ALL_PLACEHOLDERS).filter(k => k.startsWith('server.'));
@@ -54,14 +57,14 @@ function validateTemplate(template, type, selectedStats = []) {
   const text = String(template || '').trim();
   if (!text) return { error: 'Enter a channel-name template.' };
   if (text.length > 500) return { error: 'Templates must be 500 characters or fewer.' };
-  const used = placeholderKeys(text);
-  if (!used.length) return { error: 'Add at least one valid placeholder, such as `Members: <server.members>`.' };
-  const unknown = used.filter(key => !Object.prototype.hasOwnProperty.call(ALL_PLACEHOLDERS, key));
+  const rawUsed = placeholderKeys(text);
+  if (!rawUsed.length) return { error: 'Add a valid placeholder, such as `Members: <members>` or `Followers: <ig.followers>`.' };
+  const unknown = rawUsed.filter(key => !Object.prototype.hasOwnProperty.call(ALL_PLACEHOLDERS, key) && !(type === 'server' && SERVER_ALIASES[key]));
   if (unknown.length) return { error: `Unknown placeholder${unknown.length > 1 ? 's' : ''}: ${unknown.map(x => `\`<${x}>\``).join(', ')}. Use only the placeholders listed in the panel.` };
+  const used = rawUsed.map(key => SERVER_ALIASES[key] || key);
   const allowed = placeholdersForType(type);
   if (type === 'server' && selectedStats.length) {
-    const selectedAllowed = selectedStats.map(x => `server.${x}`);
-    if (selectedStats.includes('members')) selectedAllowed.push('server.humans', 'server.boosts');
+    const selectedAllowed = selectedStats.map(x => SERVER_ALIASES[x] || `server.${x}`);
     const invalid = used.filter(key => !selectedAllowed.includes(key));
     if (invalid.length) return { error: `Those placeholders were not selected: ${invalid.map(x => `\`<${x}>\``).join(', ')}. Select the matching stat type or remove the placeholder.` };
   } else {
@@ -84,63 +87,74 @@ function allPlaceholderFields(embed) {
 function initialPayload(session) {
   const embed = allPlaceholderFields(ui.base('📊 Stat Channel Setup')
     .setColor(ACCENT)
-    .setDescription('Create live voice-channel counters. Choose a stat type below; the channel name updates automatically.\n\n**Template example:** `Members: <server.members>`\n**Category:** choose an existing category, or leave it empty to use/create `📊 Stats`.'));
+    .setDescription(`Create live voice-channel counters. Choose a stat type below; the channel name updates automatically.\n\n**Template example:** \`${session.commandName === 'setupstats' ? 'Members: <members>' : 'Members: <server.members>'}\`\n**Category:** choose an existing category, or leave it empty to use/create \`📊 Stats\`.`));
   const typeRow = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-    .setCustomId(sessionCustomId(session.userId,'mode')).setPlaceholder('Choose Social Stats or Server Stats')
-    .addOptions({label:'Social Stats',value:'social',description:'Track Instagram, YouTube, X/Twitter, or TikTok',emoji:'🌐'},
+    .setCustomId(sessionCustomId(session,'mode')).setPlaceholder('Choose Social Stats or Server Stats')
+    .addOptions({label:'Social Media Stats',value:'social',description:'Track Instagram, YouTube, X/Twitter, or TikTok',emoji:'🌐'},
       {label:'Server Stats',value:'server',description:'Track members, bots, staff, boosts',emoji:'🏠'}));
   const categoryRow = new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder()
-    .setCustomId(sessionCustomId(session.userId,'category')).setPlaceholder(session.categoryId ? 'Category selected — choose another to change' : 'Optional: choose stats category')
+    .setCustomId(sessionCustomId(session,'category')).setPlaceholder(session.categoryId ? 'Category selected — choose another to change' : 'Optional: choose stats category')
     .setChannelTypes(ChannelType.GuildCategory).setMinValues(1).setMaxValues(1));
   const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'manage')).setLabel('Manage').setEmoji('🗂️').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'cancel')).setLabel('Cancel').setEmoji('✖️').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'manage')).setLabel('Manage').setEmoji('🗂️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'cancel')).setLabel('Cancel').setEmoji('✖️').setStyle(ButtonStyle.Secondary)
   );
   return { embeds:[embed], components:[typeRow,categoryRow,buttons] };
 }
 function socialSelectPayload(session) {
   const embed = ui.base('🌐 Choose a Platform').setColor(ACCENT)
-    .setDescription('Select the account platform. The next form asks for the account, template, and platform API credential. Credentials are stored in this guild’s SQLite database.');
+    .setDescription(session.commandName === 'setupstats' ? 'Choose a platform, then enter a channel-name template and the profile/channel URL. The bot uses a saved guild credential or a Railway environment variable to query the official platform API.' : 'Select the account platform. The next form asks for the account, template, and platform API credential. Credentials are stored in this guild’s SQLite database.');
   const row = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-    .setCustomId(sessionCustomId(session.userId,'platform')).setPlaceholder('Select social platform')
+    .setCustomId(sessionCustomId(session,'platform')).setPlaceholder('Select social platform')
     .addOptions(
-      {label:'Instagram',value:'instagram',emoji:'📸',description:'Followers, following, posts, likes'},
+      {label:'TikTok',value:'tiktok',emoji:'🎵',description:'Followers, following, likes, videos'},
       {label:'YouTube',value:'youtube',emoji:'▶️',description:'Subscribers, views, videos, recent likes'},
-      {label:'Twitter / X',value:'twitter',emoji:'𝕏',description:'Followers, following, posts, recent likes'},
-      {label:'TikTok',value:'tiktok',emoji:'🎵',description:'Followers, following, likes, videos'}));
+      {label:'Instagram',value:'instagram',emoji:'📸',description:'Followers, following, posts, likes'},
+      {label:'Twitter / X',value:'twitter',emoji:'𝕏',description:'Followers, following, posts, recent likes'}));
   const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'back')).setLabel('Back').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'cancel')).setLabel('Cancel').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'back')).setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'cancel')).setLabel('Cancel').setStyle(ButtonStyle.Danger)
   );
   return { embeds:[embed], components:[row,buttons] };
 }
 function serverTypesPayload(session) {
   const embed = ui.base('🏠 Choose Server Stats').setColor(ACCENT)
-    .setDescription(`Select one or more stat types, then press **Continue**.\n\n**Available server placeholders**\n${placeholderLines(Object.keys(ALL_PLACEHOLDERS).filter(k => k.startsWith('server.')))}\n\nSelected: ${session.selectedStats.length ? session.selectedStats.map(x => `\`${x}\``).join(', ') : 'none yet'}`);
+    .setDescription(`Select one or more stat types, then press **Continue**.\n\n**Short placeholders**\n${Object.entries(SERVER_ALIASES).map(([alias,key])=>`\`<${alias}>\` — ${ALL_PLACEHOLDERS[key]}`).join('\n')}\n\nYou can also use the full names such as \`<server.members>\`.\n\nSelected: ${session.selectedStats.length ? session.selectedStats.map(x => `\`${x}\``).join(', ') : 'none yet'}`);
   const row = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-    .setCustomId(sessionCustomId(session.userId,'server-types')).setPlaceholder('Select stat types')
-    .setMinValues(1).setMaxValues(3)
-    .addOptions({label:'Members',value:'members',emoji:'👥'},{label:'Bots',value:'bots',emoji:'🤖'},{label:'Staff (Administrators)',value:'staff',emoji:'🛡️'}));
+    .setCustomId(sessionCustomId(session,'server-types')).setPlaceholder('Select stat types')
+    .setMinValues(1).setMaxValues(8)
+    .addOptions(
+      {label:'Member Count',value:'members',emoji:'👥'},
+      {label:'Bot Count',value:'bots',emoji:'🤖'},
+      {label:'Staff Count (Administrators)',value:'staff',emoji:'🛡️'},
+      {label:'Boost Count',value:'boosts',emoji:'🚀'},
+      {label:'Human Count',value:'humans',emoji:'🧑'},
+      {label:'Online Count (cached presence)',value:'online',emoji:'🟢'},
+      {label:'Role Count',value:'roles',emoji:'🎭'},
+      {label:'Channel Count',value:'channels',emoji:'📚'}));
   const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'continue')).setLabel('Continue').setEmoji('➡️').setStyle(ButtonStyle.Success).setDisabled(!session.selectedStats.length),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'back')).setLabel('Back').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'cancel')).setLabel('Cancel').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'continue')).setLabel('Continue').setEmoji('➡️').setStyle(ButtonStyle.Success).setDisabled(!session.selectedStats.length),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'back')).setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'cancel')).setLabel('Cancel').setStyle(ButtonStyle.Danger)
   );
   return { embeds:[embed], components:[row,buttons] };
 }
 function socialModal(session, platform) {
+  const template = new TextInputBuilder().setCustomId('template').setLabel('Channel name template').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500).setPlaceholder(platform === 'youtube' ? 'Subscribers: <yt.subs>' : platform === 'tiktok' ? 'Followers: <tt.followers>' : platform === 'instagram' ? 'Followers: <ig.followers>' : 'Followers: <tw.followers>');
+  if (session.commandName === 'setupstats') {
+    const link = new TextInputBuilder().setCustomId('link').setLabel('Profile or channel URL').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(300).setPlaceholder(platform === 'youtube' ? 'https://youtube.com/@channel' : platform === 'instagram' ? 'https://instagram.com/username' : platform === 'twitter' ? 'https://x.com/username' : 'https://tiktok.com/@username');
+    return new ModalBuilder().setCustomId(sessionCustomId(session,'social-modal')).setTitle(`${PLATFORM_LABEL[platform]} Stats`.slice(0,45)).addComponents(new ActionRowBuilder().addComponents(template),new ActionRowBuilder().addComponents(link));
+  }
   const currentKey = db.getStatApiKey(session.guildId,platform) || '';
   const account = new TextInputBuilder().setCustomId('account').setLabel('Account handle or channel ID').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100).setPlaceholder(platform === 'youtube' ? '@handle or UC… channel ID' : '@handle / account ID');
-  const template = new TextInputBuilder().setCustomId('template').setLabel('Channel name template').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500).setPlaceholder('Followers: <ig.followers>');
   const keyLabel = platform === 'youtube' ? 'YouTube Data API key' : platform === 'instagram' ? 'Meta Graph API access token' : platform === 'twitter' ? 'X API bearer token' : 'TikTok API access token';
   const key = new TextInputBuilder().setCustomId('api_key').setLabel(keyLabel).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2000).setPlaceholder('Required by the official platform API');
   if (currentKey) key.setValue(currentKey.slice(0,2000));
-  return new ModalBuilder().setCustomId(sessionCustomId(session.userId,'social-modal')).setTitle(`${PLATFORM_LABEL[platform]} Stats`.slice(0,45))
-    .addComponents(new ActionRowBuilder().addComponents(account),new ActionRowBuilder().addComponents(template),new ActionRowBuilder().addComponents(key));
+  return new ModalBuilder().setCustomId(sessionCustomId(session,'social-modal')).setTitle(`${PLATFORM_LABEL[platform]} Stats`.slice(0,45)).addComponents(new ActionRowBuilder().addComponents(account),new ActionRowBuilder().addComponents(template),new ActionRowBuilder().addComponents(key));
 }
 function serverModal(session) {
-  return new ModalBuilder().setCustomId(sessionCustomId(session.userId,'server-modal')).setTitle('Server Stat Template')
-    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('template').setLabel('Channel name template').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500).setPlaceholder('Members: <server.members>')));
+  return new ModalBuilder().setCustomId(sessionCustomId(session,'server-modal')).setTitle('Server Stat Template')
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('template').setLabel('Channel name template').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500).setPlaceholder(session.commandName === 'setupstats' ? 'Members: <members>' : 'Members: <server.members>')));
 }
 function managePayload(session, page = 1) {
   const rows = db.listStatChannels(session.guildId);
@@ -157,30 +171,30 @@ function managePayload(session, page = 1) {
   const embed = ui.base('🗂️ Manage Stat Channels').setColor(ACCENT)
     .setDescription(rows.length ? list.map(r => {
       const platform = r.statType === 'server' ? '🏠 Server' : (PLATFORM_LABEL[r.statType] || r.statType);
-      return `**#${r.id}** • ${platform}\n<#${r.channelId}> • ${r.account ? `\`${r.account}\`` : 'server'}\nTemplate: \`${String(r.template).slice(0,120)}\``;
+      return `**#${r.id}** • ${platform}\n<#${r.channelId}> • ${(r.link || r.account) ? `\`${String(r.link || r.account).slice(0,100)}\`` : 'server'}\nTemplate: \`${String(r.template).slice(0,120)}\``;
     }).join('\n\n') : 'No stat channels yet. Press **Back** and create your first one.')
     .setFooter({text:`Page ${page}/${pageCount} • ${rows.length}/${MAX_CHANNELS} tracked channels`});
   const components = [];
   if (rows.length) {
-    components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(sessionCustomId(session.userId,'manage-select')).setPlaceholder('Choose a stat channel')
+    components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(sessionCustomId(session,'manage-select')).setPlaceholder('Choose a stat channel')
       .addOptions(rows.slice((page-1)*pageSize,page*pageSize).map(r => ({label:`#${r.id} • ${r.statType==='server'?'Server':PLATFORM_LABEL[r.statType]||r.statType}`.slice(0,100),value:String(r.id),description:`${r.account || r.template}`.slice(0,100),default:Number(r.id)===Number(session.selectedStatId)})))));
     components.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'page-first')).setLabel('First').setStyle(ButtonStyle.Secondary).setDisabled(page===1),
-      new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'page-prev')).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(page===1),
-      new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'page-indicator')).setLabel(`${page}/${pageCount}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-      new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'page-next')).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page===pageCount),
-      new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'page-last')).setLabel('Last').setStyle(ButtonStyle.Secondary).setDisabled(page===pageCount)
+      new ButtonBuilder().setCustomId(sessionCustomId(session,'page-first')).setLabel('First').setStyle(ButtonStyle.Secondary).setDisabled(page===1),
+      new ButtonBuilder().setCustomId(sessionCustomId(session,'page-prev')).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(page===1),
+      new ButtonBuilder().setCustomId(sessionCustomId(session,'page-indicator')).setLabel(`${page}/${pageCount}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+      new ButtonBuilder().setCustomId(sessionCustomId(session,'page-next')).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page===pageCount),
+      new ButtonBuilder().setCustomId(sessionCustomId(session,'page-last')).setLabel('Last').setStyle(ButtonStyle.Secondary).setDisabled(page===pageCount)
     ));
   }
   const actions = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'edit')).setLabel('Edit Template').setEmoji('✏️').setStyle(ButtonStyle.Primary).setDisabled(!selected),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'interval')).setLabel('Interval').setEmoji('⏱️').setStyle(ButtonStyle.Secondary).setDisabled(!selected),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'refresh')).setLabel('Refresh Now').setEmoji('🔄').setStyle(ButtonStyle.Success).setDisabled(!selected),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'full')).setLabel(selected?.fullNumbers ? 'Full Numbers: ON' : 'Full Numbers: OFF').setStyle(selected?.fullNumbers ? ButtonStyle.Success : ButtonStyle.Secondary).setDisabled(!selected),
-    new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'delete')).setLabel('Delete').setEmoji('🗑️').setStyle(ButtonStyle.Danger).setDisabled(!selected)
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'edit')).setLabel('Edit Template').setEmoji('✏️').setStyle(ButtonStyle.Primary).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'interval')).setLabel('Interval').setEmoji('⏱️').setStyle(ButtonStyle.Secondary).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'refresh')).setLabel('Refresh Now').setEmoji('🔄').setStyle(ButtonStyle.Success).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'full')).setLabel(selected?.fullNumbers ? 'Full Numbers: ON' : 'Full Numbers: OFF').setStyle(selected?.fullNumbers ? ButtonStyle.Success : ButtonStyle.Secondary).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(sessionCustomId(session,'delete')).setLabel('Delete').setEmoji('🗑️').setStyle(ButtonStyle.Danger).setDisabled(!selected)
   );
   components.push(actions);
-  components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'back')).setLabel('Back to Setup').setStyle(ButtonStyle.Secondary)));
+  components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(sessionCustomId(session,'back')).setLabel('Back to Setup').setStyle(ButtonStyle.Secondary)));
   return { embeds:[embed], components };
 }
 function beginSessionTimeout(session) {
@@ -190,7 +204,7 @@ function beginSessionTimeout(session) {
     sessions.delete(sessionKey(session.guildId,session.userId));
     try {
       if (session.panelMessage?.edit) {
-        const embeds = (session.embeds || []).map(e => { const copy=EmbedBuilder.from(e); copy.setFooter({text:'Panel expired — run /statsetup again'}); return copy; });
+        const embeds = (session.embeds || []).map(e => { const copy=EmbedBuilder.from(e); copy.setFooter({text:`Panel expired — run /${session.commandName || 'statsetup'} again`}); return copy; });
         const components = (session.components || []).map(row => ({type:1,components:(row.components||[]).map(c=>({...c.toJSON(),disabled:true}))}));
         await session.panelMessage.edit({embeds,components});
       }
@@ -215,22 +229,22 @@ async function showPayload(interaction,session,payload) {
 }
 function userCanManage(interaction) {
   const p=interaction.member?.permissions;
-  return Boolean(p?.has(PermissionFlagsBits.ManageChannels) && p?.has(PermissionFlagsBits.ManageGuild));
+  return Boolean(p?.has(PermissionFlagsBits.Administrator) || p?.has(PermissionFlagsBits.ManageChannels));
 }
 function botCanManage(guild) {
   return Boolean(guild?.members?.me?.permissions?.has(PermissionFlagsBits.ManageChannels));
 }
 function permissionError(interaction) {
-  if (!userCanManage(interaction)) return ui.errorEmbed('Missing Permissions','You need both **Manage Channels** and **Manage Server** to configure stat channels.');
+  if (!userCanManage(interaction)) return ui.errorEmbed('Missing Permissions','You need **Manage Channels** or **Administrator** to configure stat channels.');
   if (!botCanManage(interaction.guild)) return ui.errorEmbed('Bot Missing Permissions','I need **Manage Channels** to create and update stat voice channels.');
   return null;
 }
-async function command(interaction) {
-  if (!interaction.guild || !interaction.guildId) return interaction.reply({embeds:[ui.errorEmbed('Server Only','Use `/statsetup` inside a server.')],ephemeral:true});
+async function command(interaction, commandName = 'statsetup') {
+  if (!interaction.guild || !interaction.guildId) return interaction.reply({embeds:[ui.errorEmbed('Server Only',`Use /${commandName} inside a server.`)],ephemeral:true});
   const error = permissionError(interaction);
   if (error) return interaction.reply({embeds:[error],ephemeral:true});
   const action=String(interaction.options?.getString?.('action')||'setup').toLowerCase();
-  const session={guildId:interaction.guildId,userId:interaction.user.id,categoryId:null,mode:null,platform:null,selectedStats:[],step:'initial',selectedStatId:null,page:1};
+  const session={guildId:interaction.guildId,userId:interaction.user.id,commandName:commandName === 'setupstats' ? 'setupstats' : 'statsetup',categoryId:null,mode:null,platform:null,selectedStats:[],step:'initial',selectedStatId:null,page:1};
   sessions.set(sessionKey(session.guildId,session.userId),session);
   if (action==='list'||action==='manage') {
     session.step='manage';
@@ -241,10 +255,11 @@ async function command(interaction) {
 }
 function activeSession(interaction, actionId) {
   const parts=String(actionId).split(':');
+  const prefix=parts[0];
   const ownerId=parts[1];
   if (ownerId!==interaction.user?.id) return {error:'This is not your stat setup panel.'};
   const session=sessions.get(sessionKey(interaction.guildId,ownerId));
-  if (!session || session.expiresAt<Date.now()) return {error:'This stat setup panel expired. Run `/statsetup` again.'};
+  if (!session || session.commandName !== prefix || session.expiresAt<Date.now()) return {error:`This stat setup panel expired. Run /${prefix} again.`};
   if (interaction.guildId!==session.guildId) return {error:'This panel belongs to another server.'};
   beginSessionTimeout(session);
   return {session,parts};
@@ -255,8 +270,12 @@ async function responseError(interaction,message) {
   return interaction.reply(payload);
 }
 function getBotPermissionOverwrites(guild) {
-  const deny=[...new Set(Object.values(PermissionFlagsBits).filter(bit=>typeof bit==='bigint' && bit!==PermissionFlagsBits.ViewChannel))];
-  return [{id:guild.id,allow:[PermissionFlagsBits.ViewChannel],deny},{id:guild.members.me.id,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.ManageChannels]}];
+  // Keep the channel visible to @everyone while preventing joining or sending text.
+  // Do not deny unrelated permissions or modify other roles.
+  return [
+    { id: guild.id, allow: [PermissionFlagsBits.ViewChannel], deny: [PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages] },
+    { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels] }
+  ];
 }
 async function chooseCategory(guild,session) {
   if (session.categoryId) {
@@ -270,11 +289,48 @@ async function chooseCategory(guild,session) {
   category=await guild.channels.create({name:'📊 Stats',type:ChannelType.GuildCategory,reason:'Create category for stat channels'}).catch(err=>{throw new Error(`I could not create the **📊 Stats** category: ${err.message||'Discord rejected the request'}. Check Manage Channels and category limits.`);});
   return category;
 }
-async function createTrackedChannel(interaction,session,{type,template,account,placeholders,apiKey}) {
+function normalizeSocialProfileLink(type, input) {
+  let url;
+  try { url = new URL(String(input || '').trim()); } catch { throw new Error('Enter a valid full profile/channel URL beginning with https://.'); }
+  if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('The profile link must be a normal http(s) URL without embedded credentials.');
+  const host = url.hostname.toLowerCase().replace(/^www\./, '');
+  let segments;
+  try { segments = url.pathname.split('/').filter(Boolean).map(x => decodeURIComponent(x)); }
+  catch { throw new Error('The profile URL contains invalid URL encoding. Copy the public profile URL directly.'); }
+  let account = '';
+  if (type === 'youtube') {
+    if (!['youtube.com','m.youtube.com'].includes(host)) throw new Error('For YouTube, use a youtube.com channel/profile URL.');
+    if (segments[0]?.toLowerCase() === 'channel' && segments.length === 2 && /^UC[\w-]{10,}$/.test(segments[1] || '')) account = segments[1];
+    else if (segments.length === 1 && segments[0]?.startsWith('@')) account = segments[0];
+    else throw new Error('Use a direct YouTube channel URL like https://youtube.com/@channel or /channel/UC… .');
+  } else if (type === 'instagram') {
+    if (host !== 'instagram.com') throw new Error('For Instagram, use an instagram.com profile URL.');
+    const reserved = new Set(['p','reel','reels','stories','explore','accounts','direct','about']);
+    if (segments.length !== 1 || !segments[0] || reserved.has(segments[0].toLowerCase())) throw new Error('Use a direct Instagram profile URL, not a post, reel, or explore link.');
+    account = segments[0].replace(/^@/, '');
+  } else if (type === 'twitter') {
+    if (!['x.com','twitter.com','mobile.twitter.com'].includes(host)) throw new Error('For Twitter/X, use an x.com or twitter.com profile URL.');
+    const reserved = new Set(['home','explore','search','notifications','messages','settings','i']);
+    if (segments.length !== 1 || !segments[0] || reserved.has(segments[0].toLowerCase())) throw new Error('Use a direct public X profile URL, not a post or search link.');
+    account = segments[0].replace(/^@/, '');
+  } else if (type === 'tiktok') {
+    if (!['tiktok.com','m.tiktok.com'].includes(host)) throw new Error('For TikTok, use a tiktok.com profile URL.');
+    if (segments.length !== 1 || !segments[0]?.startsWith('@')) throw new Error('Use a direct TikTok profile URL like https://www.tiktok.com/@username, not a video/share link.');
+    account = segments[0].slice(1);
+  } else throw new Error('That social platform is not supported yet.');
+  if (!account || account.length > 100 || /[\s/?#]/.test(account)) throw new Error('The username or channel ID in that URL is invalid.');
+  return { account: type === 'youtube' && !account.startsWith('UC') ? (account.startsWith('@') ? account : `@${account}`) : account, link: url.toString().slice(0,1000) };
+}
+function getEnvApiKey(type) {
+  for (const name of PLATFORM_ENV_KEYS[type] || []) if (process.env[name]?.trim()) return process.env[name].trim();
+  return null;
+}
+
+async function createTrackedChannel(interaction,session,{type,template,account,placeholders,apiKey,link=null}) {
   const error=permissionError(interaction);
   if(error) {
     const permissions=interaction.member?.permissions;
-    if(!permissions?.has(PermissionFlagsBits.ManageChannels)||!permissions?.has(PermissionFlagsBits.ManageGuild)) throw new Error('You need both Manage Channels and Manage Server.');
+    if(!permissions?.has(PermissionFlagsBits.Administrator)&&!permissions?.has(PermissionFlagsBits.ManageChannels)) throw new Error('You need Manage Channels or Administrator.');
     throw new Error('I need Manage Channels to create and update stat voice channels.');
   }
   const guild=interaction.guild;
@@ -284,15 +340,17 @@ async function createTrackedChannel(interaction,session,{type,template,account,p
   tracked=db.listStatChannels(guild.id);
   if(tracked.length>=MAX_CHANNELS) throw new Error(`This server already tracks ${tracked.length}/${MAX_CHANNELS} stat channels. Delete one first or increase \`MAX_STAT_CHANNELS_PER_GUILD\`.`);
   if(!botCanManage(guild)) throw new Error('I need **Manage Channels** to create this voice channel and update its name.');
-  const category=await chooseCategory(guild,session);
-  const intervalMs=type==='server'?SERVER_INTERVAL_DEFAULT:SOCIAL_INTERVAL_DEFAULT;
+  const intervalMs=session.commandName === 'setupstats' ? 10*60000 : (type==='server'?SERVER_INTERVAL_DEFAULT:SOCIAL_INTERVAL_DEFAULT);
+  // Validate the actual live metric before creating a category/channel, so an API
+  // credential or quota error never leaves an empty Stats category behind.
   const metrics=type==='server'?await collectServerStats(guild,placeholders):await collectSocialStats(type,account,apiKey,placeholders);
   const name=renderTemplate(template,metrics,false)||'📊 Stat';
+  const category=await chooseCategory(guild,session);
   let channel=null;
   try {
     channel=await guild.channels.create({name,type:ChannelType.GuildVoice,parent:category.id,permissionOverwrites:getBotPermissionOverwrites(guild),reason:`Create ${type} statistic channel for ${interaction.user.tag}`});
     if(type!=='server') db.saveStatApiKey(guild.id,type,apiKey);
-    const row=db.createStatChannel(guild.id,channel.id,type,placeholders,template,account,intervalMs,interaction.user.id);
+    const row=db.createStatChannel(guild.id,channel.id,type,placeholders,template,account,intervalMs,interaction.user.id,link);
     db.updateStatChannel(guild.id,row.id,{lastValue:name,lastCheckedAt:Date.now()});
     return {channel,row,name};
   } catch(err) {
@@ -309,7 +367,11 @@ async function fetchJson(url,options={},label='platform API') {
     const detail=data?.error?.message || data?.error?.errors?.[0]?.message || data?.message || `HTTP ${response.status}`;
     throw new Error(`${label} rejected the request (${String(detail).slice(0,180)}). Check the credential, account access, and API quota.`);
   }
-  if(data.error && !data.data) throw new Error(`${label} error: ${String(data.error.message||data.error_description||data.error).slice(0,180)}.`);
+  if (data.error) {
+    const code = data.error.code;
+    const successCode = code === undefined || code === null || code === 0 || code === '0' || String(code).toLowerCase() === 'ok';
+    if (!successCode) throw new Error(`${label} error: ${String(data.error.message || data.error.error_description || data.error.code || 'request rejected').slice(0,180)}.`);
+  }
   return data;
 }
 async function collectSocialStats(type, account, apiKey, placeholders) {
@@ -321,7 +383,9 @@ async function collectSocialStats(type, account, apiKey, placeholders) {
     if(/^UC[\w-]{10,}$/.test(account)) params.set('id',account); else params.set('forHandle',account.replace(/^@/,''));
     const result=await fetchJson(`https://www.googleapis.com/youtube/v3/channels?${params}` ,{},'YouTube Data API');
     const item=result.items?.[0]; if(!item) throw new Error('YouTube returned no channel for that handle or channel ID.');
-    const stats=item.statistics||{};metrics['yt.subs']=Number(stats.subscriberCount||0);metrics['yt.views']=Number(stats.viewCount||0);metrics['yt.videos']=Number(stats.videoCount||0);
+    const stats=item.statistics||{};
+    if (placeholders.includes('yt.subs') && stats.hiddenSubscriberCount) throw new Error('This YouTube channel hides its subscriber count, so the API cannot provide a reliable value for <yt.subs>.');
+    metrics['yt.subs']=Number(stats.subscriberCount||0);metrics['yt.views']=Number(stats.viewCount||0);metrics['yt.videos']=Number(stats.videoCount||0);
     if(placeholders.includes('yt.likes')) {
       const playlist=item.contentDetails?.relatedPlaylists?.uploads;
       let total=0;
@@ -341,9 +405,14 @@ async function collectSocialStats(type, account, apiKey, placeholders) {
     const token=apiKey;
     let id=account;
     if(!/^\d+$/.test(account)) {
-      const me=await fetchJson(`https://graph.facebook.com/${META_GRAPH_VERSION}/me?fields=id&access_token=${encodeURIComponent(token)}`,{},'Instagram Graph API');
-      id=me.id;
-      const username=account.replace(/^@/,'');
+      // Business Discovery must be called on the connected Instagram professional
+      // account ID, not the Facebook /me ID. Resolve the account through owned pages.
+      const pages=await fetchJson(`https://graph.facebook.com/${META_GRAPH_VERSION}/me/accounts?fields=instagram_business_account{id,username}&limit=100&access_token=${encodeURIComponent(token)}`,{},'Instagram Graph API');
+      const username=account.replace(/^@/,'').toLowerCase();
+      const candidates=(pages.data||[]).map(page=>page.instagram_business_account).filter(Boolean);
+      const match=candidates.find(item=>String(item.username||'').toLowerCase()===username) || (candidates.length===1?candidates[0]:null);
+      if(!match?.id) throw new Error('No linked Instagram professional account was found for this token. Connect the Instagram Business/Creator account to a Facebook Page and grant the token the required Page/Instagram permissions.');
+      id=String(match.id);
       const query=`business_discovery.username(${username}){followers_count,follows_count,media_count,media.limit(50){like_count}}`;
       const data=await fetchJson(`https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(id)}?fields=${encodeURIComponent(query)}&access_token=${encodeURIComponent(token)}`,{},'Instagram Graph API');
       const obj=data.business_discovery;if(!obj)throw new Error('Instagram could not access that username via Business Discovery. Use an eligible public business/creator account and a token with the required permissions.');
@@ -376,25 +445,32 @@ async function collectSocialStats(type, account, apiKey, placeholders) {
   return metrics;
 }
 async function collectServerStats(guild, placeholders) {
-  const metrics={};
-  if(placeholders.includes('server.members')) metrics['server.members']=Number(guild.memberCount||0);
-  if(placeholders.includes('server.boosts')) metrics['server.boosts']=Number(guild.premiumSubscriptionCount||0);
-  const needMembers=placeholders.some(k=>['server.humans','server.bots','server.staff'].includes(k));
-  let members=[...guild.members.cache.values()];
-  if(needMembers) {
-    try { const fetched=await guild.members.fetch({withPresences:false});members=[...fetched.values()]; }
-    catch(err) { throw new Error(`I could not fetch members to calculate bots/staff. Ensure the Server Members Intent is enabled in the Discord Developer Portal and the bot has access. (${String(err?.message||err).slice(0,120)})`); }
+  const keys = new Set((placeholders || []).map(k => SERVER_ALIASES[k] || k));
+  const metrics = {};
+  if (keys.has('server.members')) metrics['server.members'] = Number(guild.memberCount || 0);
+  if (keys.has('server.boosts')) metrics['server.boosts'] = Number(guild.premiumSubscriptionCount || 0);
+  if (keys.has('server.roles')) metrics['server.roles'] = Math.max(0, guild.roles.cache.size - 1);
+  if (keys.has('server.channels')) metrics['server.channels'] = guild.channels.cache.size;
+  const needMembers = ['server.humans','server.bots','server.staff','server.online'].some(k => keys.has(k));
+  let members = [...guild.members.cache.values()];
+  if (needMembers) {
+    try { const fetched = await guild.members.fetch({ withPresences: keys.has('server.online') }); members = [...fetched.values()]; }
+    catch (err) { throw new Error(`I could not fetch all server members to calculate this stat. Enable the Server Members intent and check the bot's access. (${String(err?.message || err).slice(0,120)})`); }
   }
-  if(placeholders.includes('server.humans')) metrics['server.humans']=members.filter(m=>!m.user.bot).length;
-  if(placeholders.includes('server.bots')) metrics['server.bots']=members.filter(m=>m.user.bot).length;
-  if(placeholders.includes('server.staff')) metrics['server.staff']=members.filter(m=>!m.user.bot&&m.permissions.has(PermissionFlagsBits.Administrator)).length;
+  if (keys.has('server.humans')) metrics['server.humans'] = members.filter(m => !m.user.bot).length;
+  if (keys.has('server.bots')) metrics['server.bots'] = members.filter(m => m.user.bot).length;
+  if (keys.has('server.staff')) metrics['server.staff'] = members.filter(m => !m.user.bot && m.permissions.has(PermissionFlagsBits.Administrator)).length;
+  if (keys.has('server.online')) metrics['server.online'] = members.filter(m => m.presence && m.presence.status && m.presence.status !== 'offline').length;
   return metrics;
 }
 async function safeRename(channel, row, wanted) {
   if(channel.name===wanted) { db.updateStatChannel(row.guildId,row.id,{lastValue:wanted,lastCheckedAt:Date.now()}); return {changed:false}; }
   const now=Date.now();
   const persisted=asArray(row.renameHistory).map(Number).filter(t=>Number.isFinite(t)&&now-t<600000);
-  const recent=[...new Set([...(renameTimes.get(channel.id)||[]),...persisted])].sort((a,b)=>a-b);
+  // The in-memory list must be pruned too, or the channel would remain rate-limited
+  // forever after its first two renames in a process.
+  const inMemory=(renameTimes.get(channel.id)||[]).filter(t=>Number.isFinite(t)&&now-t<600000);
+  const recent=[...new Set([...inMemory,...persisted])].sort((a,b)=>a-b);
   renameTimes.set(channel.id,recent);
   if(recent.length>=2) {
     if(!renameTimers.has(channel.id)) {
@@ -450,7 +526,7 @@ function start(client) {
 }
 async function handleInteraction(interaction,client) {
   const id=String(interaction.customId||'');
-  if(!id.startsWith('statsetup:'))return false;
+  if(!/^(statsetup|setupstats):/.test(id))return false;
   try {
     const {error,session,parts}=activeSession(interaction,id);
     if(error)return await responseError(interaction,error).then(()=>true);
@@ -495,11 +571,11 @@ async function handleInteraction(interaction,client) {
       const row=db.getStatChannel(session.guildId,session.selectedStatId);
       if(['edit','interval','refresh','full','delete','delete-confirm','delete-cancel'].includes(action)&&!row)return await responseError(interaction,'That stat channel record no longer exists. Refresh the Manage panel.').then(()=>true);
       if(action==='edit') {
-        return await interaction.showModal(new ModalBuilder().setCustomId(sessionCustomId(session.userId,'edit-modal',String(row.id))).setTitle('Edit Stat Template').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('template').setLabel('Channel name template').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500).setValue(String(row.template).slice(0,500))))).then(()=>true);
+        return await interaction.showModal(new ModalBuilder().setCustomId(sessionCustomId(session,'edit-modal',String(row.id))).setTitle('Edit Stat Template').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('template').setLabel('Channel name template').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500).setValue(String(row.template).slice(0,500))))).then(()=>true);
       }
       if(action==='interval') {
         const mins=Math.round(Number(row.intervalMs)/60000);
-        return await interaction.showModal(new ModalBuilder().setCustomId(sessionCustomId(session.userId,'interval-modal',String(row.id))).setTitle('Change Update Interval').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('minutes').setLabel(row.statType==='server'?'Minutes (5–1440)':'Minutes (10–1440)').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(4).setValue(String(mins))))).then(()=>true);
+        return await interaction.showModal(new ModalBuilder().setCustomId(sessionCustomId(session,'interval-modal',String(row.id))).setTitle('Change Update Interval').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('minutes').setLabel(row.statType==='server'?'Minutes (5–1440)':'Minutes (10–1440)').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(4).setValue(String(mins))))).then(()=>true);
       }
       if(action==='refresh') {
         await interaction.deferUpdate();
@@ -509,40 +585,69 @@ async function handleInteraction(interaction,client) {
         return true;
       }
       if(action==='full') {
+        await interaction.deferUpdate();
         db.updateStatChannel(session.guildId,row.id,{fullNumbers:row.fullNumbers?0:1});
         const outcome=await refreshOne(client,db.getStatChannel(session.guildId,row.id),true);
-        if(!outcome.ok) console.error('[StatSetup] Toggle number format refresh failed:',outcome.error);
-        return await updatePanel(interaction,session,managePayload(session,session.page)).then(()=>true);
+        const payload=managePayload(session,session.page);
+        rememberPayload(session,payload);beginSessionTimeout(session);
+        await interaction.editReply(payload).catch(()=>{});
+        if(!outcome.ok) await interaction.followUp({embeds:[ui.errorEmbed('Number Format Saved, Refresh Failed',`The number-format preference was saved, but the live channel refresh failed: ${outcome.error||'unknown error'}`)],ephemeral:true}).catch(()=>{});
+        return true;
       }
       if(action==='delete') {
-        const confirm=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'delete-confirm')).setLabel('Delete Channel').setStyle(ButtonStyle.Danger),new ButtonBuilder().setCustomId(sessionCustomId(session.userId,'delete-cancel')).setLabel('Cancel').setStyle(ButtonStyle.Secondary));
+        const confirm=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(sessionCustomId(session,'delete-confirm')).setLabel('Delete Channel').setStyle(ButtonStyle.Danger),new ButtonBuilder().setCustomId(sessionCustomId(session,'delete-cancel')).setLabel('Cancel').setStyle(ButtonStyle.Secondary));
         return await updatePanel(interaction,session,{embeds:[ui.warnEmbed('Delete Stat Channel',`Delete <#${row.channelId}> and remove its tracking record? This cannot be undone.`)],components:[confirm]}).then(()=>true);
       }
       if(action==='delete-cancel')return await updatePanel(interaction,session,managePayload(session,session.page)).then(()=>true);
       if(action==='delete-confirm') {
+        await interaction.deferUpdate();
         const channel=client.channels.cache.get(row.channelId)||await client.channels.fetch(row.channelId).catch(()=>null);
         if(channel) {
-          if(!userCanManage(interaction))return await responseError(interaction,'You need both **Manage Channels** and **Manage Server** to delete a tracked stat channel.').then(()=>true);
-          if(!guildCanManageChannels(interaction.guild))return await responseError(interaction,'I no longer have **Manage Channels** to delete this voice channel. The database record was not removed.').then(()=>true);
-          try{await channel.delete(`Stat channel removed by ${interaction.user.tag}`);}catch(e){return await responseError(interaction,`Discord rejected the channel deletion: ${e.message||'missing permissions or hierarchy restriction'}. The database record was kept.`).then(()=>true);}
+          if(!userCanManage(interaction)) {
+            await interaction.followUp({embeds:[ui.errorEmbed('Missing Permissions','You need **Manage Channels** or **Administrator** to delete a tracked stat channel.')],ephemeral:true}).catch(()=>{});
+            return true;
+          }
+          if(!guildCanManageChannels(interaction.guild)) {
+            await interaction.followUp({embeds:[ui.errorEmbed('Bot Missing Permissions','I no longer have **Manage Channels** to delete this voice channel. The database record was not removed.')],ephemeral:true}).catch(()=>{});
+            return true;
+          }
+          try{await channel.delete(`Stat channel removed by ${interaction.user.tag}`);}catch(e){
+            await interaction.followUp({embeds:[ui.errorEmbed('Delete Failed',`Discord rejected the channel deletion: ${e.message||'missing permissions or hierarchy restriction'}. The database record was kept.`)],ephemeral:true}).catch(()=>{});
+            return true;
+          }
         }
         db.deleteStatChannel(session.guildId,row.id);session.selectedStatId=null;
-        return await updatePanel(interaction,session,managePayload(session,session.page)).then(()=>true);
+        const payload=managePayload(session,session.page);rememberPayload(session,payload);beginSessionTimeout(session);
+        await interaction.editReply(payload).catch(()=>{});
+        return true;
       }
     }
     if(interaction.isModalSubmit?.()) {
       if(action==='social-modal'||action==='server-modal') {
         const type=action==='social-modal'?session.platform:'server';
         const template=interaction.fields.getTextInputValue('template').trim();
-        const account=type==='server'?null:interaction.fields.getTextInputValue('account').trim();
-        const apiKey=type==='server'?null:interaction.fields.getTextInputValue('api_key').trim();
+        let account = type==='server' ? null : '';
+        let link = null;
+        let apiKey = null;
+        if (type !== 'server' && session.commandName === 'setupstats') {
+          let profile;
+          try { profile = normalizeSocialProfileLink(type, interaction.fields.getTextInputValue('link')); }
+          catch (e) { return await responseError(interaction, String(e?.message || e)).then(()=>true); }
+          account = profile.account;
+          link = profile.link;
+          apiKey = db.getStatApiKey(session.guildId, type) || getEnvApiKey(type);
+          if (!apiKey) return await responseError(interaction, `A platform API credential is not configured for ${PLATFORM_LABEL[type]}. Configure it in Railway environment variables or save it once with /statsetup, then retry /setupstats.`).then(()=>true);
+        } else if (type !== 'server') {
+          account = interaction.fields.getTextInputValue('account').trim();
+          apiKey = interaction.fields.getTextInputValue('api_key').trim();
+        }
         const selected=type==='server'?session.selectedStats:[];
         const validation=validateTemplate(template,type,selected);
         if(validation.error)return await responseError(interaction,validation.error).then(()=>true);
         if(type!=='server'&&!apiKey)return await responseError(interaction,`A valid API credential is required for ${PLATFORM_LABEL[type]}.`).then(()=>true);
         await interaction.deferReply({ephemeral:true});
         try {
-          const result=await createTrackedChannel(interaction,session,{type,template,account,placeholders:validation.used,apiKey});
+          const result=await createTrackedChannel(interaction,session,{type,template,account,placeholders:validation.used,apiKey,link});
           session.step='manage';session.selectedStatId=result.row.id;
           // Replace the original panel in place, and use the private modal response for the success/error detail.
           const current=managePayload(session,Math.max(1,Math.ceil(Number(result.row.id)/5)));
@@ -563,16 +668,18 @@ async function handleInteraction(interaction,client) {
           const template=interaction.fields.getTextInputValue('template').trim();
           const validation=validateTemplate(template,row.statType,[]);
           if(validation.error)return await responseError(interaction,validation.error).then(()=>true);
+          await interaction.deferReply({ephemeral:true});
           db.updateStatChannel(session.guildId,row.id,{template,placeholder:JSON.stringify(validation.used)});
         } else {
           const raw=interaction.fields.getTextInputValue('minutes').trim();const minutes=Number(raw);const min=row.statType==='server'?5:10;
           if(!Number.isInteger(minutes)||minutes<min||minutes>1440)return await responseError(interaction,`Enter a whole number from **${min} to 1440** minutes.`).then(()=>true);
+          await interaction.deferReply({ephemeral:true});
           db.updateStatChannel(session.guildId,row.id,{intervalMs:minutes*60000,lastCheckedAt:0});
         }
         const latest=db.getStatChannel(session.guildId,row.id);
         const result=await refreshOne(client,latest,true);
-        const payload=managePayload(session,session.page);session.embeds=payload.embeds;session.components=payload.components;
-        await interaction.reply({embeds:[result.ok?ui.okEmbed('Stat Channel Updated','The setting was saved and the stat channel was refreshed.'):ui.errorEmbed('Setting Saved, Refresh Failed',`The setting was saved, but the live refresh failed: ${result.error}`)],ephemeral:true});
+        const payload=managePayload(session,session.page);rememberPayload(session,payload);beginSessionTimeout(session);
+        await interaction.editReply({embeds:[result.ok?ui.okEmbed('Stat Channel Updated','The setting was saved and the stat channel was refreshed.'):ui.errorEmbed('Setting Saved, Refresh Failed',`The setting was saved, but the live refresh failed: ${result.error}`)]});
         if(session.panelMessage?.edit)await session.panelMessage.edit(payload).catch(()=>{});
         return true;
       }
@@ -586,4 +693,19 @@ async function handleInteraction(interaction,client) {
   }
 }
 function guildCanManageChannels(guild) { return Boolean(guild?.members?.me?.permissions?.has(PermissionFlagsBits.ManageChannels)); }
-module.exports={command,handleInteraction,start,refreshAll,refreshOne,validateTemplate,ALL_PLACEHOLDERS};
+const guildRefreshTimers = new Map();
+function refreshServerStatsForGuild(client, guildId) {
+  const key = String(guildId);
+  const old = guildRefreshTimers.get(key);
+  if (old) clearTimeout(old);
+  const timer = setTimeout(async () => {
+    guildRefreshTimers.delete(key);
+    for (const row of db.listStatChannels(key)) {
+      if (row.statType !== 'server') continue;
+      await refreshOne(client, row, true).catch(err => console.error('[StatSetup] Event refresh failed:', err.message || err));
+    }
+  }, 5000);
+  timer.unref?.();
+  guildRefreshTimers.set(key, timer);
+}
+module.exports={command,handleInteraction,start,refreshAll,refreshOne,refreshServerStatsForGuild,validateTemplate,ALL_PLACEHOLDERS};
