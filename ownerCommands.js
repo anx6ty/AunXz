@@ -223,6 +223,17 @@ function errorListPayload(session, token) {
   components.push(pageRows(token,session.page,total));
   return { embeds: [embed], components };
 }
+function commandStatsCount(session) {
+  const period = session.payload.period || 'all';
+  const guildId = session.payload.guildId || '';
+  const now = Date.now();
+  const fromDay = period === 'today' ? new Date(now).toISOString().slice(0,10)
+    : period === 'week' ? new Date(now - 7 * 86400000).toISOString().slice(0,10) : '0000-01-01';
+  const where = ['day>=?'];
+  const params = [fromDay];
+  if (guildId) { where.push('guildId=?'); params.push(guildId); }
+  return Number(sql.prepare(`SELECT COUNT(DISTINCT commandName) AS n FROM command_usage_daily WHERE ${where.join(' AND ')}`).get(...params)?.n || 0);
+}
 function commandStatsPayload(session, token) {
   const period = session.payload.period || 'all';
   const guildId = session.payload.guildId || '';
@@ -403,7 +414,8 @@ ownerCommand(new SlashCommandBuilder().setName('owners').setDescription('[Owner]
   const session=openListSession(interaction,'owners',{});return sendListPanel(interaction,session,coOwnersPayload);
 });
 
-// Private database backup sent directly to the executor's DMs.
+// Private database backup attached to the command's ephemeral response. This does
+// not depend on DMs being enabled and never posts the database in a public channel.
 ownerCommand(new SlashCommandBuilder().setName('backup').setDescription('[Owner] Create a private backup of the SQLite database.'),async interaction=>{
   const until=backupCooldowns.get(interaction.user.id)||0;
   if(until>Date.now()) return interaction.reply({embeds:[ui.warnEmbed('Backup Cooldown',`Try again <t:${Math.ceil(until/1000)}:R>.`)],ephemeral:true});
@@ -411,10 +423,15 @@ ownerCommand(new SlashCommandBuilder().setName('backup').setDescription('[Owner]
   await interaction.deferReply({ephemeral:true});
   try {
     const backup=await createDatabaseSnapshot();
-    await interaction.user.send({content:`Private AunXz database backup • ${new Date().toISOString()}`,files:[new AttachmentBuilder(backup.buffer,{name:backup.filename})]});
-    return interaction.editReply({embeds:[ui.okEmbed('Backup Delivered',`The database backup was sent to your DMs.\n**File size:** ${formatBytes(backup.size)}\n**Database:** ${path.basename(store.DB_PATH)}`)]});
+    // Keep the attachment in a plain ephemeral response instead of combining a file
+    // with an embed-to-Components-V2 conversion. This also works when the user's DMs
+    // are closed, because the database download is delivered directly by the command.
+    return interaction.editReply({
+      content:`✅ **Private AunXz database backup** • ${new Date().toISOString()}\n**File size:** ${formatBytes(backup.size)} • **Database:** ${path.basename(store.DB_PATH)}\nThe backup file is attached below. Only you can see this response.`,
+      files:[new AttachmentBuilder(backup.buffer,{name:backup.filename})]
+    });
   } catch(error) {
-    return interaction.editReply({embeds:[ui.errorEmbed('Backup Failed',`${String(error?.message||error).slice(0,900)}\nThe backup was never posted in a public channel.`)]});
+    return interaction.editReply({embeds:[ui.errorEmbed('Backup Failed',`${String(error?.message||error).slice(0,900)}\nNo backup file was delivered. Check the configured upload limit and that the database volume is accessible.`)]});
   }
 });
 
@@ -592,7 +609,7 @@ async function handleInteraction(interaction, client) {
       if(interaction.user.id!==session.userId)return interaction.reply({embeds:[ui.errorEmbed('Not Your Menu','This is not your owner menu.')],ephemeral:true}).then(()=>true);
       const build=session.type==='owners'?coOwnersPayload:session.type==='errors'?errorListPayload:session.type==='commandstats'?commandStatsPayload:disabledCommandsPayload;
       const {payload}=session;
-      const source=session.type==='owners'?store.listCoOwners():session.type==='errors'?store.getBotErrors(200,0,payload.commandName||null):session.type==='commandstats'?sql.prepare('SELECT COUNT(DISTINCT commandName) AS n FROM command_usage_daily').get().n:store.listDisabledCommands();
+      const source=session.type==='owners'?store.listCoOwners():session.type==='errors'?store.getBotErrors(200,0,payload.commandName||null):session.type==='commandstats'?commandStatsCount(session):store.listDisabledCommands();
       const total=session.type==='commandstats'?Math.max(1,Math.ceil(Number(source)/10)):Math.max(1,Math.ceil(source.length/(session.type==='owners'||session.type==='disabled'?8:5)));
       session.page=action==='first'?1:action==='last'?total:action==='prev'?Math.max(1,session.page-1):Math.min(total,session.page+1);
       const next=build(session,token);session.components=next.components||[];
