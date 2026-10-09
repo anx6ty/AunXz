@@ -215,16 +215,14 @@ const HELP_CATEGORIES = {
       '**/autoreactorsetup** — auto-react with emoji when a message matches a phrase\n' +
       '**/embedbuilder** — build a custom embed with link buttons and post it\n' +
       '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
+      '**/stickymessage** — keep an embed as the last message of a channel\n' +
       '**/antibadwordsetup** — multilingual profanity filter\n' +
       '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
       '**/birthdaysetup** — birthday panel + automatic wishes'
   },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
-    desc: '**/statsetup** — create and manage live social/server voice counters\n' +
-      '**/giveaway create /reroll** — configure giveaways or pick a new winner\n' +
-      '**/stickymessage** — create and manage persistent channel embeds\n' +
-      'Use **/setup list** to see every configurable module. Smaller modules use their own **/<feature> setup** command.'
+    desc: 'Use **/setup list** to see every configurable module. Smaller modules use their own **/<feature> setup** command.'
   },
   owner: {
     name: 'Owner-only', emojiKey: 'owner',
@@ -702,13 +700,10 @@ function staffApplicationEmbed(cfg) { return featureSetupEmbed('Staff Applicatio
 function birthdaySetupEmbed(cfg) { return featureSetupEmbed('Birthday System', 'Members press the birthday button and enter a date such as 8-8. The bot posts wishes in the configured wish channel.', [
   {name:'Panel',value:cfg.panelChannelId ? `<#${cfg.panelChannelId}>`:'Not set',inline:true}, {name:'Wish channel',value:cfg.wishChannelId ? `<#${cfg.wishChannelId}>`:'Not set',inline:true}
 ]); }
-function honeypotSetupEmbed(cfg = {}) { return featureSetupEmbed('Honeypot', 'This channel is a no-message zone. Messages trigger the selected action when enabled.', [
-  {name:'Status',value:cfg.enabled?'🟢 Enabled':'🔴 Disabled',inline:true},
-  {name:'Channel',value:cfg.channelId ? `<#${cfg.channelId}>`:'Not set',inline:true},
-  {name:'Action',value:cfg.action||'kick',inline:true},
-  {name:'Log Channel',value:cfg.logChannelId ? `<#${cfg.logChannelId}>`:'Not set',inline:true},
-  {name:'Cleanup',value:cfg.cleanupWindow||'none',inline:true},
-  {name:'Whitelisted Roles',value:Array.isArray(cfg.whitelistRoleIds)&&cfg.whitelistRoleIds.length?cfg.whitelistRoleIds.map(id=>`<@&${id}>`).join(', ').slice(0,1000):'None',inline:false}
+function honeypotSetupEmbed(cfg) { cfg = cfg || {}; return featureSetupEmbed('Honeypot', 'This channel is a no-message zone. A message or image sent there triggers your selected action.', [
+  {name:'Status',value:cfg.enabled===false?`${emoji('disabled')} Disabled`:`${emoji('enabled')} Enabled`,inline:true},
+  {name:'Channel',value:cfg.channelId ? `<#${cfg.channelId}>`:'Not set',inline:true}, {name:'Action',value:cfg.action||'kick',inline:true}, {name:'Cleanup',value:cfg.cleanupWindow||'none',inline:true},
+  {name:'Log channel',value:cfg.logChannelId ? `<#${cfg.logChannelId}>`:'Not set',inline:true}
 ]); }
 function birthdaySetupRow(cfg) {
   return [
@@ -725,18 +720,12 @@ function antiBadwordSetupRow(cfg) { return [
   new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('antibadword_cfg:action').setPlaceholder(`Action: ${cfg.action||'delete'}`).addOptions({label:'Delete only',value:'delete',emoji:emoji('delete')},{label:'Delete + timeout',value:'timeout',emoji:emoji('mute')})),
   new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('antibadword_cfg:words').setLabel('Add Custom Words').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')), new ButtonBuilder().setCustomId('antibadword_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled')))
 ]; }
-function honeypotSetupRow(cfg = {}) { return [
+function honeypotSetupRow(cfg) { cfg = cfg || {}; return [
   new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('honeypot_cfg:channel').setPlaceholder('Select honeypot channel').setChannelTypes(ChannelType.GuildText)),
   new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('honeypot_cfg:action').setPlaceholder(`Action: ${cfg.action||'kick'}`).addOptions({label:'Kick',value:'kick',emoji:emoji('kick')},{label:'Ban',value:'ban',emoji:emoji('shield')},{label:'Timeout',value:'timeout',emoji:emoji('mute')},{label:'Delete only',value:'delete',emoji:emoji('delete')})),
-  new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('honeypot_cfg:log').setPlaceholder(cfg.logChannelId?'Change log channel':'Select log channel').setChannelTypes(ChannelType.GuildText)),
-  new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('honeypot_cfg:whitelist').setPlaceholder('Select whitelisted roles (replaces list)').setMinValues(1).setMaxValues(10)),
-  new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('honeypot_cfg:toggle').setLabel(cfg.enabled?'Enabled':'Disabled').setStyle(cfg.enabled?ButtonStyle.Success:ButtonStyle.Danger).setEmoji(cfg.enabled?emoji('enabled'):emoji('disabled')),
-    new ButtonBuilder().setCustomId('honeypot_cfg:cleanup').setLabel(`Cleanup: ${cfg.cleanupWindow||'none'}`).setStyle(ButtonStyle.Secondary).setEmoji('🧹'),
-    new ButtonBuilder().setCustomId('honeypot_cfg:invite').setLabel(cfg.createInvite?'Invite DM: ON':'Invite DM: OFF').setStyle(cfg.createInvite?ButtonStyle.Success:ButtonStyle.Secondary).setEmoji(emoji('link')),
-    new ButtonBuilder().setCustomId('honeypot_cfg:dm').setLabel('Set Kick DM').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
-    new ButtonBuilder().setCustomId('honeypot_cfg:whitelist-clear').setLabel('Clear Roles').setStyle(ButtonStyle.Secondary).setEmoji(emoji('remove'))
-  )
+  new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('honeypot_cfg:cleanup').setPlaceholder(`Cleanup: ${cfg.cleanupWindow||'none'}`).addOptions({label:'No cleanup',value:'none'},{label:'Last 10 minutes',value:'10m'},{label:'Last 1 hour',value:'1h'},{label:'Last 24 hours',value:'24h'})),
+  new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('honeypot_cfg:log').setPlaceholder('Select log channel').setChannelTypes(ChannelType.GuildText)),
+  new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('honeypot_cfg:toggle').setLabel(cfg.enabled===false?'Disabled':'Enabled').setStyle(cfg.enabled===false?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled===false?emoji('disabled'):emoji('enabled')), new ButtonBuilder().setCustomId('honeypot_cfg:invite').setLabel(cfg.createInvite?'Invite DM: ON':'Invite DM: OFF').setStyle(cfg.createInvite?ButtonStyle.Success:ButtonStyle.Secondary).setEmoji(emoji('link')), new ButtonBuilder().setCustomId('honeypot_cfg:dm').setLabel('Set Kick DM').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')))
 ]; }
 function greetVoiceSetupEmbed(cfg) {
   const mode = cfg.mode === 'audio' ? 'Uploaded audio' : 'TTS';
