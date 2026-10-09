@@ -28,7 +28,7 @@ try {
   console.warn('[AunXz] ffmpeg-static could not be loaded:', e.message);
 }
 
-// Track the active voice connection while audio plays; playback cleanup destroys it afterward.
+// Keep one persistent connection per guild so the bot "won't leave" the greetvoice VC.
 const persistentConnections = new Map(); // guildId -> connection
 
 async function joinAndStayInVC(voiceChannel) {
@@ -118,64 +118,57 @@ function binaryDownload(url, label = 'audio') {
   });
 }
 
-async function playAudioInput(guild, vcId, input, label = 'audio', shouldPlay = null) {
+async function playAudioInput(guild, vcId, input, label = 'audio') {
   if (!guild || !vcId) throw new Error('Choose a Greet Voice channel before testing playback.');
   const channel = guild.channels.cache.get(vcId) || await guild.channels.fetch(vcId).catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('The configured Greet Voice channel was not found or is not a voice channel.');
   if (typeof input === 'string' && !fs.existsSync(input)) throw new Error(`${label} file is missing on disk. Upload it again from Greet Voice setup.`);
 
   const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
-  if (!me) throw new Error('I could not resolve my bot member in this server. Re-invite the bot and try again.');
-  const permissions = me.permissionsIn(channel);
-  if (!permissions.has(PermissionFlagsBits.ViewChannel)) throw new Error(`I cannot view ${channel}.`);
-  if (!permissions.has(PermissionFlagsBits.Connect)) throw new Error(`I cannot connect to ${channel}.`);
-  if (!permissions.has(PermissionFlagsBits.Speak)) throw new Error(`I cannot speak in ${channel}.`);
-  if (shouldPlay && !shouldPlay()) throw new Error('The member left the greeting voice channel before playback could start.');
+  if (!me?.permissionsIn(channel).has(PermissionFlagsBits.Connect)) {
+    throw new Error(`I cannot **Connect** to ${channel}.`);
+  }
+  if (!me.permissionsIn(channel).has(PermissionFlagsBits.Speak)) {
+    throw new Error(`I cannot **Speak** in ${channel}.`);
+  }
 
   const connection = await joinAndStayInVC(channel);
-  console.log(`[GreetVoice] Voice connection ready in guild ${guild.id}, channel ${vcId}.`);
-  let player = null;
-  try {
-    if (shouldPlay && !shouldPlay()) throw new Error('The member left the greeting voice channel before playback could start.');
-    player = createAudioPlayer({ behaviors: { noSubscriber: 'stop' } });
-    const subscription = connection.subscribe(player);
-    if (!subscription) throw new Error('The bot could not subscribe its audio player to the voice connection.');
-    const resource = createAudioResource(input, { inputType: StreamType.Arbitrary, silencePaddingFrames: 5 });
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = err => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try { player.stop(true); } catch {}
-        err ? reject(err) : resolve();
-      };
-      const timer = setTimeout(() => finish(new Error(`${label} playback timed out after 45 seconds.`)), 45000);
-      player.once(AudioPlayerStatus.Idle, () => { console.log(`[GreetVoice] Playback finished in guild ${guild.id}.`); finish(); });
-      player.once('error', err => finish(new Error(`Voice audio playback failed: ${err.message || err}`)));
-      try { player.play(resource); console.log(`[GreetVoice] Playback started (${label}) in guild ${guild.id}.`); }
-      catch (e) { finish(e); }
-    }).catch(err => {
-      let dependency = '';
-      try { dependency = generateDependencyReport(); } catch {}
-      if (dependency) console.error('[AunXz] Voice dependency report:\n' + dependency);
-      throw err;
-    });
-  } finally {
-    try { player?.stop(true); } catch {}
-    try { if (getVoiceConnection(guild.id) === connection) connection.destroy(); } catch {}
-    persistentConnections.delete(guild.id);
-    console.log(`[GreetVoice] Voice connection cleaned up for guild ${guild.id}.`);
-  }
+  const player = createAudioPlayer({ behaviors: { noSubscriber: 'stop' } });
+  const subscription = connection.subscribe(player);
+  if (!subscription) throw new Error('The bot could not subscribe its audio player to the voice connection.');
+
+  const resource = createAudioResource(input, {
+    inputType: StreamType.Arbitrary,
+    silencePaddingFrames: 5
+  });
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = err => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { player.stop(true); } catch {}
+      err ? reject(err) : resolve();
+    };
+    const timer = setTimeout(() => finish(new Error(`${label} playback timed out after 45 seconds.`)), 45000);
+    player.once(AudioPlayerStatus.Idle, () => finish());
+    player.once('error', err => finish(new Error(`Voice audio playback failed: ${err.message || err}`)));
+    try { player.play(resource); } catch (e) { finish(e); }
+  }).catch(err => {
+    let dependency = '';
+    try { dependency = generateDependencyReport(); } catch {}
+    if (dependency) console.error('[AunXz] Voice dependency report:\n' + dependency);
+    throw err;
+  });
 }
 
-async function playTTSInChannel(guild, vcId, prompt, shouldPlay = null) {
+async function playTTSInChannel(guild, vcId, prompt) {
   const text = String(prompt || 'Welcome!').trim().slice(0, 200) || 'Welcome!';
   const url = googleTTS.getAudioUrl(text, { lang: 'en', slow: false, host: 'https://translate.google.com' });
   const buffer = await binaryDownload(url, 'TTS audio');
   if (!buffer.length) throw new Error('TTS returned an empty audio file.');
-  if (shouldPlay && !shouldPlay()) throw new Error('The member left the greeting voice channel before playback could start.');
-  return playAudioInput(guild, vcId, Readable.from(buffer), 'TTS', shouldPlay);
+  return playAudioInput(guild, vcId, Readable.from(buffer), 'TTS');
 }
 
 async function saveGreetvoiceAudio(guildId, attachment) {
@@ -209,15 +202,14 @@ async function removeGreetvoiceAudio(audioPath) {
   await fs.promises.unlink(resolved).catch(() => {});
 }
 
-async function playGreetvoiceGreeting(guild, cfg, memberId = null) {
-  const shouldPlay = memberId ? () => guild.members.cache.get(memberId)?.voice?.channelId === cfg?.vcId : null;
+async function playGreetvoiceGreeting(guild, cfg) {
   if (!cfg?.vcId) throw new Error('Select a greeting voice channel in Greet Voice setup first.');
   if (cfg.mode === 'audio') {
     if (!cfg.audioPath) throw new Error('Audio mode is selected but no audio file is saved. Upload an audio greeting or set a TTS message.');
-    return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio', shouldPlay);
+    return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
   }
-  if (cfg.ttsPrompt && String(cfg.ttsPrompt).trim()) return playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt, shouldPlay);
-  if (cfg.audioPath) return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio', shouldPlay);
+  if (cfg.ttsPrompt && String(cfg.ttsPrompt).trim()) return playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
+  if (cfg.audioPath) return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
   throw new Error('Set a TTS message or upload an audio file in Greet Voice setup.');
 }
 
@@ -449,68 +441,48 @@ async function onMemberJoinGreetvoice(member) {
 }
 
 // TTS playback handled here so events.js just calls this on voiceStateUpdate.
-const greetvoiceCooldowns = new Map();
-const greetvoiceGuildCooldowns = new Map();
+const greetCooldowns = new Map(); // `${guildId}:${userId}` -> timestamp
+function logVoiceDependencies() { console.log('[GreetVoice] dependency report:\n' + generateDependencyReport()); }
 async function onVoiceJoinGreetvoice(oldState, newState) {
-  const guild = newState?.guild;
-  const member = newState?.member;
-  console.log(`[GreetVoice] voiceStateUpdate fired guild=${guild?.id || 'unknown'} user=${member?.id || 'unknown'} old=${oldState?.channelId || 'none'} new=${newState?.channelId || 'none'}`);
-  if (!guild || !member || member.user?.bot) return;
-  // Only a true join from disconnected state triggers this feature; channel moves do not.
-  if (oldState?.channelId || !newState?.channelId) return;
-  const cfg = db.getConfig(guild.id)?.greetvoice || {};
-  console.log(`[GreetVoice] Config loaded enabled=${Boolean(cfg.enabled)} vcId=${cfg.vcId || 'unset'} roleId=${cfg.roleId || 'unset'} mode=${cfg.mode || 'tts'}`);
-  if (!cfg.enabled || !cfg.vcId || newState.channelId !== cfg.vcId) return;
-  if (!member.voice || member.voice.channelId !== cfg.vcId) { console.log('[GreetVoice] Member left before the greeting began; skipping.'); return; }
+  const guild = newState.guild;
+  const cfg = db.getConfig(guild.id).greetvoice;
+  if (newState.channelId === oldState.channelId) return;                 // mute/deafen/stream changes
+  if (!cfg.vcId || newState.channelId !== cfg.vcId) return;              // not the greeting channel
+  const member = newState.member;
+  if (!member || member.user.bot) return;
+  console.log(`[GreetVoice] join event: ${member.user.tag} -> ${newState.channelId}`);
+  if (!cfg.enabled) { console.log('[GreetVoice] skipped: feature is disabled'); return; }
   const role = cfg.roleId ? guild.roles.cache.get(cfg.roleId) : null;
-  if (!role) { console.error(`[GreetVoice] Configured gate role ${cfg.roleId || '(missing)'} does not exist in guild ${guild.id}.`); return; }
-  if (!member.roles.cache.has(role.id)) return;
-  const now = Date.now();
-  const cooldownKey = `${guild.id}:${member.id}`;
-  const userUntil = greetvoiceCooldowns.get(cooldownKey) || 0;
-  if (userUntil > now) { console.log(`[GreetVoice] Per-user cooldown active for ${member.id}; skipping repeated join.`); return; }
-  const guildUntil = greetvoiceGuildCooldowns.get(guild.id) || 0;
-  if (guildUntil > now) { console.log(`[GreetVoice] Per-guild cooldown active for ${guild.id}; skipping overlapping greeting.`); return; }
-  greetvoiceCooldowns.set(cooldownKey, now + 60_000);
-  // A single voice player is used per guild. This prevents two rapid joins from
-  // destroying each other's connections or overlapping TTS audio.
-  greetvoiceGuildCooldowns.set(guild.id, now + 15_000);
-  if (greetvoiceCooldowns.size > 10000) for (const [k, time] of greetvoiceCooldowns) if (time <= now) greetvoiceCooldowns.delete(k);
-  if (greetvoiceGuildCooldowns.size > 5000) for (const [k, time] of greetvoiceGuildCooldowns) if (time <= now) greetvoiceGuildCooldowns.delete(k);
-  const channel = guild.channels.cache.get(cfg.vcId) || await guild.channels.fetch(cfg.vcId).catch(() => null);
-  if (!channel || channel.type !== ChannelType.GuildVoice) {
-    console.error(`[GreetVoice] Configured voice channel ${cfg.vcId} was deleted or is not a voice channel.`);
-    return;
-  }
-  const bot = guild.members.me || await guild.members.fetchMe().catch(() => null);
-  const perms = bot?.permissionsIn(channel);
-  const missing = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak].filter(p => !perms?.has(p));
-  if (missing.length) {
-    const text = `Missing bot permissions in ${channel}: ${missing.map(p => p === PermissionFlagsBits.ViewChannel ? 'View Channel' : p === PermissionFlagsBits.Connect ? 'Connect' : 'Speak').join(', ')}.`;
-    console.error(`[GreetVoice] ${text}`);
-    const log = await getLogChannel(guild, 'voice');
-    if (log) log.send({ embeds: [ui.errorEmbed('Greet Voice Permissions', text)] }).catch(() => {});
-    return;
-  }
+  if (cfg.roleId && (!role || !member.roles.cache.has(role.id))) { console.log('[GreetVoice] skipped: member does not hold the gate role'); return; }
+  const cdKey = `${guild.id}:${member.id}`; const cdMs = Math.max(0, Number(cfg.cooldownSeconds ?? 30)) * 1000;
+  if (Date.now() - (greetCooldowns.get(cdKey) || 0) < cdMs) { console.log('[GreetVoice] skipped: per-user cooldown'); return; }
+  greetCooldowns.set(cdKey, Date.now());
+  const live = await guild.members.fetch(member.id).catch(() => null);
+  if (!live || live.voice.channelId !== cfg.vcId) { console.log('[GreetVoice] skipped: member left before the greeting'); return; }
+  let played = false;
   try {
-    console.log(`[GreetVoice] Permissions checked for ${channel.id}; preparing greeting.`);
-    await playGreetvoiceGreeting(guild, cfg, member.id);
-    console.log(`[GreetVoice] Greeting completed for ${member.id}.`);
-  } catch (error) {
-    console.error('[GreetVoice] Greeting failed:', error);
+    console.log('[GreetVoice] playing greeting');
+    await playGreetvoiceGreeting(guild, cfg);
+    played = true;
+    console.log('[GreetVoice] playback finished');
+  } catch (e) {
+    console.error('[GreetVoice] playback failed:', e);
     const log = await getLogChannel(guild, 'voice');
-    if (log) log.send({ embeds: [ui.errorEmbed('Greet Voice Failed', `The greeting could not be played for ${member}: ${String(error?.message || error).slice(0,700)}
-Check View Channel, Connect and Speak, and verify the saved audio file or TTS message.`)] }).catch(() => {});
-    return;
+    if (log) {
+      log.send({ embeds: [ui.errorEmbed('🔇 Greetvoice TTS Failed',
+        `Could not play the greeting for ${member}: \`${String(e.message || e).slice(0, 700)}\`.\n` +
+        'Check that the bot can **Connect** and **Speak** in the greeting VC and that FFmpeg + an Opus encoder are installed.')] }).catch(() => {});
+    }
   }
+
+  // Only release the gate after successful playback. If audio failed, keep the role so
+  // the member can retry by leaving/rejoining the greeting VC instead of silently losing it.
+  if (!played || !role) return;
   const freshMember = await guild.members.fetch(member.id).catch(() => null);
-  // The audio player's connection is destroyed by playAudioInput() in its finally block.
-  // Never disconnect the member: Greet Voice should greet them, not kick them from voice.
-  if (freshMember?.voice?.channelId === cfg.vcId) {
-    await freshMember.roles.remove(role, 'Greet Voice greeting completed').catch(error => {
-      console.error(`[GreetVoice] Could not remove gate role ${role.id} from ${member.id}:`, error);
-    });
+  if (freshMember && freshMember.voice.channelId === cfg.vcId) {
+    await freshMember.voice.disconnect('greetvoice complete').catch(() => {});
   }
+  await freshMember?.roles.remove(role, 'greetvoice complete').catch(() => {});
 }
 
 async function handleVoiceStateUpdate(oldState, newState) {
@@ -675,7 +647,7 @@ module.exports = {
   handleAntispam,
   lockRoleToSingleChannel, onChannelCreateGreetvoiceSync, onMemberJoinGreetvoice, onVoiceJoinGreetvoice,
   xpForLevel, handleLevelingMessage,
-  handleVoicemasterJoin, handleVoiceStateUpdate,
+  handleVoicemasterJoin, handleVoiceStateUpdate, logVoiceDependencies,
   handleAutoresponder, handleAutoreactor,
   embedBuilderSessions
 };
