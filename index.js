@@ -14,7 +14,7 @@ const {
 const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
-const { commands, isOwner, buildModulePatch, PANEL_MODULES } = require('./commands');
+const { commands, isOwner, buildModulePatch, PANEL_MODULES, handleDangerousConfirmation } = require('./commands');
 const v2patch = require('./v2patch');
 v2patch.apply();
 
@@ -23,6 +23,31 @@ const birthdayWishesSent = new Set();
 const logSetupSessions = new Map();
 const rolePanelSessions = new Map(); // guild:user -> { buttonId, reactionId }
 const setupMediaSessions = new Map(); // guild:user -> { kind, panelId, field, channelId, interaction, apply, render, expiresAt }
+const commandCooldowns = new Map();
+const COMMAND_COOLDOWN_MS = 5000;
+
+function isGlobalBlacklistedGuild(guild) {
+  if (!guild?.ownerId) return false;
+  try { return db.getGlobalBlacklist().includes(String(guild.ownerId)); } catch { return false; }
+}
+
+function consumeCommandCooldown(interaction) {
+  const guildId = interaction.guildId || 'dm';
+  if (guildId !== 'dm') {
+    const membership = db.membership(guildId);
+    if (membership && Number(membership.expiresAt) > Date.now()) return 0;
+  }
+  const userId = interaction.user?.id || interaction.member?.id || 'unknown';
+  const key = `${guildId}:${userId}`;
+  const now = Date.now();
+  const expiresAt = commandCooldowns.get(key) || 0;
+  if (expiresAt > now) return expiresAt - now;
+  commandCooldowns.set(key, now + COMMAND_COOLDOWN_MS);
+  if (commandCooldowns.size > 5000) {
+    for (const [cooldownKey, until] of commandCooldowns) if (until <= now) commandCooldowns.delete(cooldownKey);
+  }
+  return 0;
+}
 
 let client = new Client({
   intents: [
@@ -102,14 +127,14 @@ async function registerCommands() {
   // Owner-only commands are deliberately NOT registered globally — they're guild-scoped to a
   // single "home" server (OWNER_GUILD_ID, falling back to GUILD_ID for backward compatibility)
   // so they don't show up as slash commands in every server the bot joins. They're still usable
-  // everywhere as text commands (<prefix>eval ..., <prefix>maintenance ...) since execute()
+  // everywhere as text commands (<prefix>maintenance ...) since execute()
   // itself checks isOwner() regardless of how it was invoked.
   const ownerGuildId = process.env.OWNER_GUILD_ID || process.env.GUILD_ID;
   if (ownerGuildId && ownerBody.length) {
     await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, ownerGuildId), { body: ownerBody });
     console.log(`Registered ${ownerBody.length} owner-only commands to guild ${ownerGuildId}.`);
   } else if (ownerBody.length) {
-    console.log(`OWNER_GUILD_ID not set — ${ownerBody.length} owner-only command(s) not registered as slash commands (still usable as text commands, e.g. !eval).`);
+    console.log(`OWNER_GUILD_ID not set — ${ownerBody.length} owner-only command(s) not registered as slash commands (still usable as text commands, e.g. !maintenance).`);
   }
 }
 
@@ -134,6 +159,9 @@ async function finishGiveaways() {
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  if (!process.env.EMBED_THUMBNAIL_URL && !process.env.BOT_AVATAR_URL) {
+    process.env.EMBED_THUMBNAIL_URL = client.user.displayAvatarURL({ extension: 'png', size: 128 });
+  }
   console.log(`Database: ${db.DB_PATH}`);
   client.user.setActivity('/help');
   try { await registerCommands(); } catch (e) { await logOwnerError(e, 'Slash command registration'); }
@@ -327,26 +355,29 @@ async function guardCommand(interaction, cmd) {
   if (!interaction.guild || !interaction.member) return true;
   const cfg = db.getConfig(interaction.guildId);
   const json = cmd.data.toJSON();
-  const required = cmd.requiredMemberPermissions || json.default_member_permissions;
-  // Bot owners are trusted to run commands in any server without the
-  // server member permission requirements or AunXz feature-toggle gate.
-  // Discord's own bot permissions/role hierarchy are still enforced when
-  // the requested action actually touches Discord resources.
-  if (!isOwner(interaction.user?.id)) {
-    if (required && !interaction.member.permissions.has(BigInt(required))) {
-      return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
-    }
-    if (!commandIsSetupOnly(interaction)) {
-      const key = commandFeatureKey(interaction);
-      if (key && !featureEnabled(cfg, key)) {
-        const setupName = key === 'ticket' ? '/tickets setup' : key === 'greetmessage' ? '/greetmessage setup' : `/${interaction.commandName} setup`;
-        return interaction.reply({ embeds:[ui.errorEmbed('Feature Disabled', `**${key}** is currently disabled. Enable it from ${setupName}.`)], ephemeral:true }).then(()=>false);
-      }
+  const required = json.default_member_permissions;
+  if (required && !interaction.member.permissions.has(BigInt(required))) {
+    return interaction.reply({ embeds:[ui.errorEmbed('Missing Permissions', `You do not have the permissions required for **/${interaction.commandName}**.`)], ephemeral:true }).then(()=>false);
+  }
+  if (!commandIsSetupOnly(interaction)) {
+    const key = commandFeatureKey(interaction);
+    if (key && !featureEnabled(cfg, key)) {
+      const setupName = key === 'ticket' ? '/tickets setup' : key === 'greetmessage' ? '/greetmessage setup' : `/${interaction.commandName} setup`;
+      return interaction.reply({ embeds:[ui.errorEmbed('Feature Disabled', `**${key}** is currently disabled. Enable it from ${setupName}.`)], ephemeral:true }).then(()=>false);
     }
   }
   return true;
 }
+
 async function executeCommand(cmd, interaction) {
+  const remaining = consumeCommandCooldown(interaction);
+  if (remaining > 0) {
+    const waitSeconds = (remaining / 1000).toFixed(1).replace(/\.0$/, '');
+    const payload = { embeds: [ui.warnEmbed('⏳ Command Cooldown', `Please wait **${waitSeconds}s** before using another command. Active server memberships skip this cooldown.`)], ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {});
+    else await interaction.reply(payload).catch(() => {});
+    return;
+  }
   if (!await guardCommand(interaction, cmd)) return;
   try {
     await cmd.execute(interaction);
@@ -426,6 +457,7 @@ function normalizeCommandName(name) {
 }
 
 async function handlePrefixCommand(message) {
+  if (isGlobalBlacklistedGuild(message.guild)) return true;
   const cfg = db.getConfig(message.guild.id);
   const prefix = cfg.prefix || '!';
   let content = message.content.trim();
@@ -446,7 +478,7 @@ async function handlePrefixCommand(message) {
   const cmd = commands.find(c => c.data.name === cmdName);
   if (!cmd) return false;
 
-  if (cfg.blacklist.includes(message.author.id) && !isOwner(message.author.id)) {
+  if (cfg.blacklist.includes(message.author.id)) {
     message.reply({ embeds: [ui.errorEmbed('Blacklisted', 'You are blocked from using this bot.')] }).catch(() => {});
     return true;
   }
@@ -478,6 +510,18 @@ function startInteractionWatchdog(interaction) {
 client.on('interactionCreate', async (interaction) => {
   const stopInteractionWatchdog = startInteractionWatchdog(interaction);
   try {
+    if (interaction.guild && isGlobalBlacklistedGuild(interaction.guild)) {
+      if (interaction.isAutocomplete()) return interaction.respond([]).catch(() => {});
+      if (interaction.isMessageComponent?.()) return interaction.deferUpdate().catch(() => {});
+      if (interaction.isRepliable?.()) {
+        await interaction.deferReply({ ephemeral: true }).catch(() => {});
+        return interaction.deleteReply().catch(() => {});
+      }
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('danger-confirm:')) {
+      return await handleDangerousConfirmation(interaction);
+    }
     if (interaction.isAutocomplete()) {
       if (interaction.commandName === 'em') {
         const focused = String(interaction.options.getString('name') || '').toLowerCase();
@@ -576,7 +620,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isChatInputCommand()) {
-      if (db.getConfig(interaction.guildId).blacklist.includes(interaction.user.id) && !isOwner(interaction.user.id)) {
+      if (interaction.guildId && db.getConfig(interaction.guildId).blacklist.includes(interaction.user.id)) {
         return interaction.reply({ embeds: [ui.errorEmbed('Blacklisted', 'You are blocked from using this bot.')], ephemeral: true });
       }
       const cmd = commands.find(c => c.data.name === interaction.commandName);
@@ -824,7 +868,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Administrator required.')],ephemeral:true});
       const current=db.getConfig(interaction.guildId).greetvoice;
       const nextEnabled=!current.enabled;
-      if (nextEnabled && (!current.vcId || !current.roleId || (!current.ttsPrompt && !current.audioPath))) {
+      if (nextEnabled && (!current.vcId || !current.roleId || (current.mode === 'audio' ? !current.audioPath : !String(current.ttsPrompt || '').trim()))) {
         return interaction.reply({embeds:[ui.errorEmbed('Not Ready','Select a voice channel, gate role, and either set a TTS prompt or upload an audio greeting before enabling Greet Voice.')],ephemeral:true});
       }
       const cfg=db.saveConfig(interaction.guildId,{greetvoice:{enabled:nextEnabled}}).greetvoice;
@@ -1557,7 +1601,14 @@ async function handleModal(interaction) {
   if (interaction.customId === 'birthday_cfg_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{birthdays:{wishMessage:msg||'Happy Birthday {user}! 🎂'}}).birthdays; return interaction.reply({embeds:[ui.birthdaySetupEmbed(cfg)],components:ui.birthdaySetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'antibadword_cfg_modal') { const words=interaction.fields.getTextInputValue('words').split(',').map(x=>x.trim()).filter(Boolean).slice(0,300); const cfg=db.saveConfig(interaction.guildId,{antibadword:{customWords:words}}).antibadword; return interaction.reply({embeds:[ui.antiBadwordSetupEmbed(cfg)],components:ui.antiBadwordSetupRow(cfg),ephemeral:true}); }
   if (interaction.customId === 'honeypot_cfg_dm_modal') { const msg=interaction.fields.getTextInputValue('message').trim(); const cfg=db.saveConfig(interaction.guildId,{honeypot:{dmMessage:msg||'You were removed. {invite}'}}).honeypot; return interaction.reply({embeds:[ui.honeypotSetupEmbed(cfg)],components:ui.honeypotSetupRow(cfg),ephemeral:true}); }
-  if (interaction.customId === 'greetvoice_cfg_prompt_modal') { const prompt=interaction.fields.getTextInputValue('prompt').trim(); const cfg=db.saveConfig(interaction.guildId,{greetvoice:{ttsPrompt:prompt,mode:'tts'}}).greetvoice; return interaction.reply({embeds:[ui.greetVoiceSetupEmbed(cfg)],components:ui.greetVoiceSetupRow(cfg),ephemeral:true}); }
+  if (interaction.customId === 'greetvoice_cfg_prompt_modal') {
+    const prompt = interaction.fields.getTextInputValue('prompt').trim().slice(0, 400);
+    if (!prompt) return interaction.reply({ embeds: [ui.errorEmbed('TTS Message Required', 'Enter the welcome message that should be spoken in the voice channel.')], ephemeral: true });
+    const current = db.getConfig(interaction.guildId).greetvoice;
+    if (current.audioPath) await sys.removeGreetvoiceAudio(current.audioPath);
+    const cfg = db.saveConfig(interaction.guildId, { greetvoice: { ttsPrompt: prompt, audioPath: null, mode: 'tts' } }).greetvoice;
+    return interaction.reply({ embeds: [ui.greetVoiceSetupEmbed(cfg)], components: ui.greetVoiceSetupRow(cfg), ephemeral: true });
+  }
   if (interaction.customId === 'autoresponder_add_modal') {
     const match=interaction.fields.getTextInputValue('match').trim();
     const mode=/^exact$/i.test(interaction.fields.getTextInputValue('mode').trim())?'exact':'contains';
@@ -1845,29 +1896,24 @@ client.on('messageCreate', async (message) => {
   // Setup image/GIF uploads are consumed before command parsing and removed after saving.
   if (await consumeSetupMedia(message)) return;
 
-   // Mentioning the bot without another command gives a server-specific quick start.
-  const mentionOnly = new RegExp(`^<@!?${client.user.id}>\\s*$`);
-
-  if (mentionOnly.test(message.content.trim())) {
-    const prefix = cfgAll.prefix || '!';
-    return message.reply({
-      embeds: [
-        ui.base(`🤖 ${client.user.username}`)
-          .setDescription(
-            `Welcome to **${message.guild.name}**!\n\n` +
-            `Start with **${prefix}help** or **/help** to see what I can do.\n\n` +
-            `**Server Prefix:** \`${prefix}\`\n` +
-            `**Bot Ping:** \`${client.ws.ping}ms\``
-          )
-      ]
-    }).catch(() => {});
+  // Globally blacklisted server owners suppress prefix commands and bot-mention replies.
+  // Automated safety systems further below continue to operate normally.
+  if (!isGlobalBlacklistedGuild(message.guild)) {
+    const mentionOnly = new RegExp(`^<@!?${client.user.id}\\s*$`);
+    if (mentionOnly.test(message.content.trim())) {
+      const prefix = cfgAll.prefix || '!';
+      return message.reply({ embeds: [ui.base(`🤖 ${client.user.username}`).setDescription(
+        `Welcome to **${message.guild.name}**!\n\n` +
+        `Start with **${prefix}help** or **/help** to see what I can do.\n\n` +
+        `**Server Prefix:** \`${prefix}\`\n**Bot Ping:** \`${client.ws.ping}ms\``
+      )] }).catch(() => {});
+    }
+    const handled = await handlePrefixCommand(message).catch(err => {
+      console.error('Prefix command error:', err);
+      return false;
+    });
+    if (handled) return;
   }
-
-  const handled = await handlePrefixCommand(message).catch(err => {
-    console.error('Prefix command error:', err);
-    return false;
-  });
-  if (handled) return;
 
   const cfg = db.getConfig(message.guild.id);
 
