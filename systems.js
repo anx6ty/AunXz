@@ -33,6 +33,11 @@ const persistentConnections = new Map(); // guildId -> connection
 
 async function joinAndStayInVC(voiceChannel) {
   let connection = getVoiceConnection(voiceChannel.guild.id);
+  if (connection && connection.joinConfig?.channelId !== voiceChannel.id) {
+    try { connection.destroy(); } catch {}
+    persistentConnections.delete(voiceChannel.guild.id);
+    connection = null;
+  }
   if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
@@ -114,8 +119,10 @@ function binaryDownload(url, label = 'audio') {
 }
 
 async function playAudioInput(guild, vcId, input, label = 'audio') {
-  const channel = guild.channels.cache.get(vcId);
-  if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Welcome voice channel was not found.');
+  if (!guild || !vcId) throw new Error('Choose a Greet Voice channel before testing playback.');
+  const channel = guild.channels.cache.get(vcId) || await guild.channels.fetch(vcId).catch(() => null);
+  if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('The configured Greet Voice channel was not found or is not a voice channel.');
+  if (typeof input === 'string' && !fs.existsSync(input)) throw new Error(`${label} file is missing on disk. Upload it again from Greet Voice setup.`);
 
   const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
   if (!me?.permissionsIn(channel).has(PermissionFlagsBits.Connect)) {
@@ -165,19 +172,23 @@ async function playTTSInChannel(guild, vcId, prompt) {
 }
 
 async function saveGreetvoiceAudio(guildId, attachment) {
-  if (!attachment?.url) throw new Error('No audio attachment was provided.');
-  const name = String(attachment.name || '').toLowerCase();
+  if (!/^\d{15,25}$/.test(String(guildId || ''))) throw new Error('A valid server ID is required to save this audio file.');
+  if (!attachment?.url) throw new Error('No audio attachment was provided. Try uploading the file again.');
+  const name = String(attachment.name || attachment.filename || '').toLowerCase();
   const type = String(attachment.contentType || '').toLowerCase();
   const audioByType = type.startsWith('audio/');
   const audioByExt = /\.(mp3|wav|ogg|oga|opus|webm|m4a|aac|flac)$/i.test(name);
   if (!audioByType && !audioByExt) throw new Error('Please upload an audio file such as MP3, WAV, OGG, M4A, AAC, or FLAC.');
 
-  const dir = path.join(db.DATA_DIR, 'greetvoice');
+  const dataDir = typeof db.DATA_DIR === 'string' && db.DATA_DIR.trim() ? db.DATA_DIR : path.dirname(db.DB_PATH);
+  if (!dataDir) throw new Error('Audio storage is not configured. Check DATABASE_PATH or RAILWAY_VOLUME_MOUNT_PATH.');
+  const dir = path.join(path.resolve(dataDir), 'greetvoice');
   await fs.promises.mkdir(dir, { recursive: true });
   const extMatch = name.match(/\.[a-z0-9]+$/i);
   const ext = extMatch ? extMatch[0].toLowerCase() : '.audio';
   const target = path.join(dir, `${guildId}${ext}`);
   const buffer = await binaryDownload(attachment.url, 'Greet Voice audio');
+  if (!buffer?.length) throw new Error('Discord returned an empty audio file. Upload it again.');
   await fs.promises.writeFile(target, buffer);
   return target;
 }
@@ -185,16 +196,21 @@ async function saveGreetvoiceAudio(guildId, attachment) {
 async function removeGreetvoiceAudio(audioPath) {
   if (!audioPath) return;
   const resolved = path.resolve(audioPath);
-  const root = path.resolve(path.join(db.DATA_DIR, 'greetvoice'));
+  const dataDir = typeof db.DATA_DIR === 'string' && db.DATA_DIR.trim() ? db.DATA_DIR : path.dirname(db.DB_PATH || __dirname);
+  const root = path.resolve(path.join(dataDir, 'greetvoice'));
   if (!resolved.startsWith(root + path.sep)) return;
   await fs.promises.unlink(resolved).catch(() => {});
 }
 
 async function playGreetvoiceGreeting(guild, cfg) {
-  if (cfg.mode === 'audio' && cfg.audioPath) return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
-  if (cfg.ttsPrompt) return playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
+  if (!cfg?.vcId) throw new Error('Select a greeting voice channel in Greet Voice setup first.');
+  if (cfg.mode === 'audio') {
+    if (!cfg.audioPath) throw new Error('Audio mode is selected but no audio file is saved. Upload an audio greeting or set a TTS message.');
+    return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
+  }
+  if (cfg.ttsPrompt && String(cfg.ttsPrompt).trim()) return playTTSInChannel(guild, cfg.vcId, cfg.ttsPrompt);
   if (cfg.audioPath) return playAudioInput(guild, cfg.vcId, cfg.audioPath, 'Greet Voice audio');
-  throw new Error('No TTS prompt or uploaded audio is configured.');
+  throw new Error('Set a TTS message or upload an audio file in Greet Voice setup.');
 }
 
 // ===================================================================================
@@ -428,7 +444,7 @@ async function onMemberJoinGreetvoice(member) {
 async function onVoiceJoinGreetvoice(oldState, newState) {
   const guild = newState.guild;
   const cfg = db.getConfig(guild.id).greetvoice;
-  if (!cfg.enabled || !cfg.vcId || newState.channelId !== cfg.vcId) return;
+  if (!cfg.enabled || !cfg.vcId || newState.channelId !== cfg.vcId || oldState.channelId === cfg.vcId) return;
   const member = newState.member;
   const role = guild.roles.cache.get(cfg.roleId);
   if (!role || !member.roles.cache.has(role.id)) return; // only gate members still holding the role
