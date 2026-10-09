@@ -9,10 +9,17 @@ const db = require('./database');
 const ui = require('./ui');
 const sys = require('./systems');
 const templates = require('./template');
+const statsetup = require('./statsetup');
+const stickyMessages = require('./stickymessage');
 const { randomBytes } = require('crypto');
 
 const OWNER_IDS = (process.env.OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const isOwner = (id) => OWNER_IDS.includes(String(id || ''));
+const MAIN_OWNER_ID = String(process.env.OWNER_ID || OWNER_IDS[0] || '').trim();
+const isOwner = (id) => {
+  if (!id) return false;
+  if (String(id) === MAIN_OWNER_ID || OWNER_IDS.includes(String(id))) return true;
+  try { return Boolean(db.getCoOwner(String(id))); } catch { return false; }
+};
 
 const pendingDangerousActions = new Map();
 
@@ -380,10 +387,52 @@ commands.push({
       .addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true))
       .addIntegerOption(o=>o.setName('winners').setDescription('Number of winners').setMinValue(1).setMaxValue(20))
       .addIntegerOption(o=>o.setName('duration_minutes').setDescription('Duration in minutes').setMinValue(1).setMaxValue(43200))
-      .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText))),
+      .addChannelOption(o=>o.setName('channel').setDescription('Giveaway channel').addChannelTypes(ChannelType.GuildText)))
+    .addSubcommand(s=>s.setName('reroll').setDescription('Choose a new winner for an ended giveaway.')
+      .addIntegerOption(o=>o.setName('giveaway_id').setDescription('The ID shown in the giveaway footer').setRequired(true).setMinValue(1))),
   async execute(interaction) {
-    if(!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
-      return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required.')],ephemeral:true});
+    if(!interaction.member?.permissions?.has(PermissionFlagsBits.ManageGuild) && !interaction.member?.permissions?.has(PermissionFlagsBits.Administrator))
+      return interaction.reply({embeds:[ui.errorEmbed('Missing Permissions','Manage Server is required to manage giveaways.')],ephemeral:true});
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'reroll') {
+      const id = interaction.options.getInteger('giveaway_id');
+      const giveaway = db.getGiveaway(interaction.guildId, id);
+      if (!giveaway) return interaction.reply({embeds:[ui.errorEmbed('Giveaway Not Found', `No giveaway with ID **${id}** exists in this server.`)], ephemeral:true});
+      if (giveaway.status !== 'ended') return interaction.reply({embeds:[ui.errorEmbed('Giveaway Not Ended', 'You can reroll only a giveaway that has already ended.')], ephemeral:true});
+      let entrants = [];
+      try { entrants = JSON.parse(giveaway.participants || '[]'); } catch (e) { console.error('[Giveaway] Invalid participant JSON:', e); }
+      if (!Array.isArray(entrants) || entrants.length === 0) return interaction.reply({embeds:[ui.errorEmbed('No Entrants', 'This giveaway has no saved entrants, so a new winner cannot be selected.')], ephemeral:true});
+      let previousWinners = [];
+      try { previousWinners = JSON.parse(giveaway.winnerIds || '[]'); } catch {}
+      if (!Array.isArray(previousWinners)) previousWinners = [];
+      // Fetch entrants not already in cache, then exclude bots and all previous winners.
+      await Promise.all(entrants.map(uid => interaction.guild.members.cache.has(uid) ? Promise.resolve() : interaction.guild.members.fetch(uid).catch(() => null)));
+      const eligible = [...new Set(entrants)].filter(uid => !previousWinners.includes(uid)).filter(uid => {
+        const m = interaction.guild.members.cache.get(uid);
+        return Boolean(m && !m.user.bot);
+      });
+      if (!eligible.length) return interaction.reply({embeds:[ui.errorEmbed('No Eligible Entrants', 'Every saved entrant has already won, left the server, or is a bot. No changes were made.')],ephemeral:true});
+      for (let i = eligible.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [eligible[i], eligible[j]] = [eligible[j], eligible[i]]; }
+      const winners = eligible.slice(0, Math.min(Number(giveaway.winners) || 1, eligible.length));
+      const channel = interaction.guild.channels.cache.get(giveaway.channelId) || await interaction.guild.channels.fetch(giveaway.channelId).catch(() => null);
+      if (!channel?.isTextBased?.()) return interaction.reply({embeds:[ui.errorEmbed('Channel Unavailable', 'The giveaway channel was deleted or is no longer accessible. The database record was kept; check the channel ID and bot permissions.')],ephemeral:true});
+      const me = interaction.guild.members.me;
+      const perms = channel.permissionsFor(me);
+      if (!perms?.has(PermissionFlagsBits.ViewChannel) || !perms?.has(PermissionFlagsBits.SendMessages) || !perms?.has(PermissionFlagsBits.EmbedLinks))
+        return interaction.reply({embeds:[ui.errorEmbed('Missing Bot Permissions', `I need **View Channel**, **Send Messages**, and **Embed Links** in ${channel} to announce the reroll.`)],ephemeral:true});
+      const nextWinners = [...new Set([...previousWinners, ...winners])];
+      const saved = db.updateGiveaway(interaction.guildId, id, { winnerIds: JSON.stringify(nextWinners) });
+      if (!saved) return interaction.reply({embeds:[ui.errorEmbed('Save Failed', 'A new winner was selected, but the database record could not be updated. No announcement was sent.')],ephemeral:true});
+      try {
+        await channel.send({embeds:[ui.base('🎉 Giveaway Rerolled').setDescription(`**Prize:** ${giveaway.prize}\n**New winner(s):** ${winners.map(uid => `<@${uid}>`).join(', ')}\n**Giveaway ID:** \`${id}\``).setFooter({text:`Rerolled by ${interaction.user.tag}`})]});
+      } catch (err) {
+        // Roll back winner history if Discord rejected the announcement, avoiding false success.
+        db.updateGiveaway(interaction.guildId, id, { winnerIds: JSON.stringify(previousWinners) });
+        console.error('[Giveaway] Reroll announcement failed:', err);
+        return interaction.reply({embeds:[ui.errorEmbed('Announcement Failed', `Discord did not accept the winner announcement (${String(err?.message || err).slice(0,300)}). The saved winner history was rolled back.`)],ephemeral:true});
+      }
+      return interaction.reply({embeds:[ui.okEmbed('Giveaway Rerolled', `New winner(s): ${winners.map(uid => `<@${uid}>`).join(', ')}\nAnnounced in ${channel}.`)],ephemeral:true});
+    }
     const prize=interaction.options.getString('prize');
     const winners=interaction.options.getInteger('winners')||1;
     const duration=(interaction.options.getInteger('duration_minutes')||1440)*60000;
@@ -397,6 +446,22 @@ commands.push({
       .setDescription(`Configure and publish this giveaway.\n\n**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** <t:${Math.floor(g.endsAt/1000)}:R>\n**Channel:** ${channel}`)
       .setFooter({text:`Giveaway #${g.id} • Hosted by ${interaction.user.tag}`})],components:[row],ephemeral:true});
   }
+});
+
+// /stickymessage — author-bound panel for one sticky embed per text channel.
+commands.push({
+  data: new SlashCommandBuilder().setName('stickymessage').setDescription('Create and manage persistent sticky embed messages.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild | PermissionFlagsBits.ManageChannels),
+  async execute(interaction) { return stickyMessages.command(interaction); }
+});
+
+// /statsetup — live social/server counter channels (prefix-compatible through the shared command adapter).
+commands.push({
+  data: new SlashCommandBuilder().setName('statsetup').setDescription('Create and manage live statistic voice channels.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels | PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('action').setDescription('Open setup or manage existing stat channels')
+      .addChoices({name:'setup',value:'setup'},{name:'list / manage',value:'list'})),
+  async execute(interaction) { return statsetup.command(interaction); }
 });
 
 // ---------------------------------------------------------------------------------
@@ -418,7 +483,7 @@ const GENERIC_MODULES = [
 ];
 const ALL_MODULE_NAMES = [
   'antinuke', 'antilink', 'antispam', 'antiraid', 'antiwebhook', 'antibot', 'antialt', 'voicemaster', 'greetvoice', 'greetmessage',
-  'leveling', 'tickets', 'logs', ...GENERIC_MODULES
+  'leveling', 'tickets', 'logs', 'statsetup', 'stickymessage', ...GENERIC_MODULES
 ];
 const GENERIC_COMMANDS = {
   welcome: 'welcome', leave: 'leave', boost: 'boost', starboard: 'starboard', invitetracker: 'inviteTracker', suggestions: 'suggestions', polls: 'polls',
