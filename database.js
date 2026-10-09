@@ -18,6 +18,7 @@ function resolveDatabasePath() {
 }
 
 const DB_PATH = resolveDatabasePath();
+const DATA_DIR = path.dirname(DB_PATH);
 ensureParent(DB_PATH);
 
 // When a Railway Volume was attached after the bot had already been using a local
@@ -190,7 +191,7 @@ const DEFAULT_CONFIG = {
   welcome: { enabled: false, channel: null, message: 'Welcome {user} to {server}! You are member #{count}.', autoroleId: null },
   leave: { enabled: false, channel: null, message: '{user} has left the server.' },
   boost: { enabled: false, channel: null, message: '{user} just boosted the server! 🚀' },
-  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null },
+  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null, audioPath: null, mode: 'tts' },
   greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!', image: null },
   antinuke: {
     enabled: false, punishment: 'ban', maxChannelDeletes: 3, maxChannelCreates: 5, maxRoleDeletes: 3, maxRoleCreates: 5,
@@ -325,6 +326,9 @@ function updateEmbedText(name, patch){
 // Owner-global config
 function getOwnerConfig(){const r=db.prepare('SELECT data FROM owner_config WHERE id=1').get();if(!r)return {};try{return JSON.parse(r.data)||{};}catch{return {};}}
 function saveOwnerConfig(partial){const current=getOwnerConfig();const merged=deepMerge(current,partial||{});db.prepare('INSERT INTO owner_config(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(JSON.stringify(merged));return merged;}
+function getGlobalBlacklist(){const ids=getOwnerConfig().blacklistedGuildOwnerIds;return [...new Set((Array.isArray(ids)?ids:[]).map(x=>String(x).trim()).filter(x=>/^\d{15,25}$/.test(x)))];}
+function addGlobalBlacklist(userId){const id=String(userId||'').trim();if(!/^\d{15,25}$/.test(id))throw new Error('Enter a valid Discord user ID.');const ids=getGlobalBlacklist();if(!ids.includes(id))ids.push(id);saveOwnerConfig({blacklistedGuildOwnerIds:ids});return ids;}
+function removeGlobalBlacklist(userId){const id=String(userId||'').trim();const ids=getGlobalBlacklist().filter(x=>x!==id);saveOwnerConfig({blacklistedGuildOwnerIds:ids});return ids;}
 
 // Owner-managed memberships
 function membership(guildId){return db.prepare('SELECT * FROM memberships WHERE guildId=?').get(guildId)||null;}
@@ -351,14 +355,14 @@ function upsertPanel(guildId,kind,panel){const key=panelArrayKey(kind);const arr
 function removePanel(guildId,kind,panelId){const key=panelArrayKey(kind);return saveConfig(guildId,{[key]:(getConfig(guildId)[key]||[]).filter(p=>p.id!==panelId)})[key];}
 
 module.exports={
-  db,DB_PATH,DEFAULT_CONFIG,getConfig,saveConfig,
+  db,DB_PATH,DATA_DIR,DEFAULT_CONFIG,getConfig,saveConfig,
   getLevel,setLevel,topLevels,addWarn,getWarns,clearWarns,
   createTicket,getTicket,setTicketStatus,closeTicket,openTicketsForUser,
   addVMChannel,getVMChannel,removeVMChannel,
   addToWhitelist,removeFromWhitelist,isWhitelisted,logAction,recentActions,getStickyRoles,setStickyRoles,bumpSpam,trackJoin,recentJoinCount,
   getEmojiOverride,setEmojiOverride,resetEmojiOverride,getAllEmojiOverrides,saveEmojiSnapshot,getEmojiSnapshot,applyEmojiSnapshot,
   registerEmbedText,getEmbedText,listEmbedTexts,updateEmbedText,
-  getOwnerConfig,saveOwnerConfig,membership,addMembership,removeMembership,listMemberships,
+  getOwnerConfig,saveOwnerConfig,getGlobalBlacklist,addGlobalBlacklist,removeGlobalBlacklist,membership,addMembership,removeMembership,listMemberships,
   createGiveaway,getGiveaway,listGiveaways,updateGiveaway,
   saveEmbed,getEmbed,listEmbeds,deleteEmbed,
   findPanel,upsertPanel,removePanel
