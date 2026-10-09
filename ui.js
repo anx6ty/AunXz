@@ -13,12 +13,13 @@ const {
   MediaGalleryBuilder, MediaGalleryItemBuilder, SeparatorBuilder, MessageFlags
 } = require('discord.js');
 const db = require('./database');
+const embedStyles = require('./embeds');
 
-const THEME = 0x2b2d31;
-const OK = 0x57f287;
-const WARN = 0xfee75c;
-const DANGER = 0xed4245;
-const BRAND_FOOTER = 'AIO • all-in-one';
+const THEME = embedStyles.COLORS.info;
+const OK = embedStyles.COLORS.success;
+const WARN = embedStyles.COLORS.warning;
+const DANGER = embedStyles.COLORS.error;
+const BRAND_FOOTER = embedStyles.BRAND_FOOTER;
 
 // ---------------- EMOJI REGISTRY ----------------
 // Every distinct emoji found in the bot UI has one canonical key. The override is stored
@@ -158,12 +159,13 @@ function decorateEmbed(embed) {
 function base(title) {
   const embed = new EmbedBuilder().setColor(THEME).setTimestamp();
   decorateEmbed(embed);
-  embed.setTitle(title).setFooter({ text: BRAND_FOOTER });
-  return embed;
+  embed.setTitle(title);
+  return embedStyles.applySharedStyle(embed, 'info');
 }
 function okEmbed(title, desc) { return base(title).setColor(OK).setDescription(desc); }
 function warnEmbed(title, desc) { return base(title).setColor(WARN).setDescription(desc); }
 function errorEmbed(title, desc) { return base(title).setColor(DANGER).setDescription(desc); }
+function infoEmbed(title, desc) { return base(title).setColor(THEME).setDescription(desc); }
 
 // ---------------- HELP MENU ----------------
 const HELP_CATEGORIES = {
@@ -225,7 +227,6 @@ const HELP_CATEGORIES = {
     name: 'Owner-only', emojiKey: 'owner',
     desc: '**/maintenance** — toggle maintenance mode\n' +
       '**/blacklist add|remove** — block a user from all commands\n' +
-      '**/eval** — run raw JS (bot owner only, use with care)\n' +
       '**/broadcast** — DM every server owner'
   }
 };
@@ -735,17 +736,15 @@ function greetVoiceSetupEmbed(cfg) {
   ]);
 }
 function greetVoiceSetupRow(cfg) { return [
-  new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('greetvoice_cfg:voice').setPlaceholder('1. Select greeting voice channel').setChannelTypes(ChannelType.GuildVoice)),
   new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('greetvoice_cfg:role').setLabel('2. Select Gate Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
-    new ButtonBuilder().setCustomId('greetvoice_cfg:prompt').setLabel('Set TTS Prompt').setStyle(ButtonStyle.Primary).setEmoji(emoji('voice')),
-    new ButtonBuilder().setCustomId('greetvoice_cfg:audio').setLabel('Upload Audio').setStyle(ButtonStyle.Primary).setEmoji('🎵'),
-    new ButtonBuilder().setCustomId('greetvoice_cfg:test').setLabel('Test').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
+    new ChannelSelectMenuBuilder().setCustomId('greetvoice_cfg:voice').setPlaceholder('Choose the welcome voice channel').setChannelTypes(ChannelType.GuildVoice)
   ),
   new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('greetvoice_cfg:mode').setLabel(`Mode: ${cfg.mode === 'audio' ? 'Audio' : 'TTS'}`).setStyle(ButtonStyle.Secondary).setEmoji('🔄'),
-    new ButtonBuilder().setCustomId('greetvoice_cfg:remove_audio').setLabel('Remove Audio').setStyle(ButtonStyle.Danger).setDisabled(!cfg.audioPath).setEmoji('🗑️'),
-    new ButtonBuilder().setCustomId('greetvoice_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled'))
+    new ButtonBuilder().setCustomId('greetvoice_cfg:role').setLabel('Gate Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:prompt').setLabel('Set TTS Message').setStyle(ButtonStyle.Primary).setEmoji(emoji('voice')),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:audio').setLabel(cfg.audioPath ? 'Replace Audio' : 'Upload Audio').setStyle(ButtonStyle.Secondary).setEmoji('🎵'),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:test').setLabel('Test Greeting').setStyle(ButtonStyle.Secondary).setEmoji(emoji('success')),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:toggle').setLabel(cfg.enabled ? 'Disable' : 'Enable').setStyle(cfg.enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(cfg.enabled ? emoji('disabled') : emoji('enabled'))
   )
 ]; }
 
@@ -988,15 +987,16 @@ function sanitizeUniqueCustomIds(rows) {
 
 function embedToContainer(embedLike, rows = []) {
   const d = typeof embedLike?.toJSON === 'function' ? embedLike.toJSON() : (embedLike || {});
+  const brand = embedStyles.getContainerBranding(d);
   const container = new ContainerBuilder();
-  if (typeof d.color === 'number') container.setAccentColor(d.color);
+  container.setAccentColor(brand.color);
   const intro = [];
   if (d.author?.name) intro.push(`**${emojify(d.author.name)}**`);
   if (d.title) intro.push(d.url ? `## [${emojify(d.title)}](${d.url})` : `## ${emojify(d.title)}`);
   if (d.description) intro.push(emojify(d.description));
   const introText = intro.join('\n').slice(0, 4000) || '\u200b';
-  if (d.thumbnail?.url) {
-    container.addSectionComponents(new SectionBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(introText)).setThumbnailAccessory(new ThumbnailBuilder().setURL(d.thumbnail.url)));
+  if (brand.thumbnail) {
+    container.addSectionComponents(new SectionBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(introText)).setThumbnailAccessory(new ThumbnailBuilder().setURL(brand.thumbnail)));
   } else {
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent(introText));
   }
@@ -1007,9 +1007,8 @@ function embedToContainer(embedLike, rows = []) {
     }
   }
   if (d.image?.url) container.addMediaGalleryComponents(new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(d.image.url)));
-  const foot = [];
-  if (d.footer?.text) foot.push(emojify(d.footer.text));
-  if (d.timestamp) foot.push(new Date(d.timestamp).toUTCString());
+  const foot = [emojify(brand.footer)];
+  foot.push(new Date(brand.timestamp).toUTCString());
   if (foot.length) {
     container.addSeparatorComponents(new SeparatorBuilder().setDivider(true));
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${foot.join(' • ')}`.slice(0, 4000)));
@@ -1024,7 +1023,6 @@ function embedToContainer(embedLike, rows = []) {
 
 function toComponentsV2(payload, force = false) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
-  if ((payload.flags || 0) & MessageFlags.IsComponentsV2) return payload;
   const embeds = Array.isArray(payload.embeds) ? payload.embeds : [];
   if (!embeds.length) return payload;
 
@@ -1047,7 +1045,7 @@ module.exports.honeypotSetupEmbed = honeypotSetupEmbed;
 
 module.exports = {
   THEME, OK, WARN, DANGER, emoji, emojify, EMOJI_KEYS, DEFAULT_EMOJIS, emojiRegistryEntries, emojiSnapshotObject, formatEmojiSnapshot,
-  base, okEmbed, warnEmbed, errorEmbed, automodSetupEmbed, automodSetupRows,
+  base, okEmbed, warnEmbed, errorEmbed, infoEmbed, automodSetupEmbed, automodSetupRows,
   HELP_CATEGORIES, helpHomeEmbed, helpCategoryEmbed, helpSelectRow,
   confirmRow,
   ticketPanelEmbed, ticketPanelRow, ticketControlRow, ticketWelcomeEmbed,
