@@ -215,14 +215,16 @@ const HELP_CATEGORIES = {
       '**/autoreactorsetup** — auto-react with emoji when a message matches a phrase\n' +
       '**/embedbuilder** — build a custom embed with link buttons and post it\n' +
       '**/honeypotsetup** — trap channel that punishes anyone who posts in it\n' +
-      '**/stickymessage** — keep an embed as the last message of a channel\n' +
       '**/antibadwordsetup** — multilingual profanity filter\n' +
       '**/greetvoicesetup** — easy panel for the role-gated VC greeting\n' +
       '**/birthdaysetup** — birthday panel + automatic wishes'
   },
   extra: {
     name: '40+ more setups', emojiKey: 'settings',
-    desc: 'Use **/setup list** to see every configurable module. Smaller modules use their own **/<feature> setup** command.'
+    desc: '**/statsetup** — create and manage live social/server voice counters\n' +
+      '**/giveaway create /reroll** — configure giveaways or pick a new winner\n' +
+      '**/stickymessage** — create and manage persistent channel embeds\n' +
+      'Use **/setup list** to see every configurable module. Smaller modules use their own **/<feature> setup** command.'
   },
   owner: {
     name: 'Owner-only', emojiKey: 'owner',
@@ -470,10 +472,11 @@ function embedTextsListEmbed(page = 1, pageSize = 6) {
 }
 function embedTextsListRows(page = 1, pageSize = 6) {
   const total = Math.max(1, Math.ceil(db.listEmbedTexts(500).length / pageSize));
+  const safePage = Math.min(total, Math.max(1, Number(page) || 1));
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`em:list:prev:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'),
-    new ButtonBuilder().setCustomId(`em:page:${page}`).setLabel(`${page}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`em:list:next:${Math.min(total, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= total).setEmoji('▶️')
+    new ButtonBuilder().setCustomId(`em:list:prev:${Math.max(1, safePage - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safePage <= 1).setEmoji('◀️'),
+    new ButtonBuilder().setCustomId(`em:page:${safePage}`).setLabel(`${safePage}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`em:list:next:${Math.min(total, safePage + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safePage >= total).setEmoji('▶️')
   )];
 }
 
@@ -559,6 +562,20 @@ function setupPanelRow(sub, cfg) {
     }
     rows.push(new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`security_cfg:${sub}:log`).setPlaceholder('Select security log channel…').addChannelTypes(ChannelType.GuildText)));
     return rows;
+  }
+  if (sub === 'greetmessage') {
+    return [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled ? 'Disable' : 'Enable').setStyle(enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(enabled ? emoji('disabled') : emoji('enabled')),
+        new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Set Welcome Text').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+        new ButtonBuilder().setCustomId('greetmessage:image_url').setLabel('Image URL').setStyle(ButtonStyle.Secondary).setEmoji('🔗'),
+        new ButtonBuilder().setCustomId('greetmessage:image_upload').setLabel('Upload Image/GIF').setStyle(ButtonStyle.Secondary).setEmoji('🖼️'),
+        new ButtonBuilder().setCustomId('greetmessage:preview').setLabel('Preview').setStyle(ButtonStyle.Success).setEmoji(emoji('success'))
+      ),
+      new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder().setCustomId('greetmessage:channel').setPlaceholder('Select welcome channel…').setChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1)
+      )
+    ];
   }
   return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`setup_toggle:${sub}`).setLabel(enabled?'Disable':'Enable').setStyle(enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(enabled?emoji('disabled'):emoji('enabled')),new ButtonBuilder().setCustomId(`setup_edit:${sub}`).setLabel('Edit Settings').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')))];
 }
@@ -700,10 +717,13 @@ function staffApplicationEmbed(cfg) { return featureSetupEmbed('Staff Applicatio
 function birthdaySetupEmbed(cfg) { return featureSetupEmbed('Birthday System', 'Members press the birthday button and enter a date such as 8-8. The bot posts wishes in the configured wish channel.', [
   {name:'Panel',value:cfg.panelChannelId ? `<#${cfg.panelChannelId}>`:'Not set',inline:true}, {name:'Wish channel',value:cfg.wishChannelId ? `<#${cfg.wishChannelId}>`:'Not set',inline:true}
 ]); }
-function honeypotSetupEmbed(cfg) { cfg = cfg || {}; return featureSetupEmbed('Honeypot', 'This channel is a no-message zone. A message or image sent there triggers your selected action.', [
-  {name:'Status',value:cfg.enabled===false?`${emoji('disabled')} Disabled`:`${emoji('enabled')} Enabled`,inline:true},
-  {name:'Channel',value:cfg.channelId ? `<#${cfg.channelId}>`:'Not set',inline:true}, {name:'Action',value:cfg.action||'kick',inline:true}, {name:'Cleanup',value:cfg.cleanupWindow||'none',inline:true},
-  {name:'Log channel',value:cfg.logChannelId ? `<#${cfg.logChannelId}>`:'Not set',inline:true}
+function honeypotSetupEmbed(cfg = {}) { return featureSetupEmbed('Honeypot', 'This channel is a no-message zone. Messages trigger the selected action when enabled.', [
+  {name:'Status',value:cfg.enabled?'🟢 Enabled':'🔴 Disabled',inline:true},
+  {name:'Channel',value:cfg.channelId ? `<#${cfg.channelId}>`:'Not set',inline:true},
+  {name:'Action',value:cfg.action||'kick',inline:true},
+  {name:'Log Channel',value:cfg.logChannelId ? `<#${cfg.logChannelId}>`:'Not set',inline:true},
+  {name:'Cleanup',value:cfg.cleanupWindow||'none',inline:true},
+  {name:'Whitelisted Roles',value:Array.isArray(cfg.whitelistRoleIds)&&cfg.whitelistRoleIds.length?cfg.whitelistRoleIds.map(id=>`<@&${id}>`).join(', ').slice(0,1000):'None',inline:false}
 ]); }
 function birthdaySetupRow(cfg) {
   return [
@@ -720,28 +740,47 @@ function antiBadwordSetupRow(cfg) { return [
   new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('antibadword_cfg:action').setPlaceholder(`Action: ${cfg.action||'delete'}`).addOptions({label:'Delete only',value:'delete',emoji:emoji('delete')},{label:'Delete + timeout',value:'timeout',emoji:emoji('mute')})),
   new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('antibadword_cfg:words').setLabel('Add Custom Words').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')), new ButtonBuilder().setCustomId('antibadword_cfg:toggle').setLabel(cfg.enabled?'Disable':'Enable').setStyle(cfg.enabled?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled?emoji('disabled'):emoji('enabled')))
 ]; }
-function honeypotSetupRow(cfg) { cfg = cfg || {}; return [
+function honeypotSetupRow(cfg = {}) { return [
   new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('honeypot_cfg:channel').setPlaceholder('Select honeypot channel').setChannelTypes(ChannelType.GuildText)),
   new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('honeypot_cfg:action').setPlaceholder(`Action: ${cfg.action||'kick'}`).addOptions({label:'Kick',value:'kick',emoji:emoji('kick')},{label:'Ban',value:'ban',emoji:emoji('shield')},{label:'Timeout',value:'timeout',emoji:emoji('mute')},{label:'Delete only',value:'delete',emoji:emoji('delete')})),
-  new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('honeypot_cfg:cleanup').setPlaceholder(`Cleanup: ${cfg.cleanupWindow||'none'}`).addOptions({label:'No cleanup',value:'none'},{label:'Last 10 minutes',value:'10m'},{label:'Last 1 hour',value:'1h'},{label:'Last 24 hours',value:'24h'})),
-  new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('honeypot_cfg:log').setPlaceholder('Select log channel').setChannelTypes(ChannelType.GuildText)),
-  new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('honeypot_cfg:toggle').setLabel(cfg.enabled===false?'Disabled':'Enabled').setStyle(cfg.enabled===false?ButtonStyle.Danger:ButtonStyle.Success).setEmoji(cfg.enabled===false?emoji('disabled'):emoji('enabled')), new ButtonBuilder().setCustomId('honeypot_cfg:invite').setLabel(cfg.createInvite?'Invite DM: ON':'Invite DM: OFF').setStyle(cfg.createInvite?ButtonStyle.Success:ButtonStyle.Secondary).setEmoji(emoji('link')), new ButtonBuilder().setCustomId('honeypot_cfg:dm').setLabel('Set Kick DM').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')))
+  new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('honeypot_cfg:log').setPlaceholder(cfg.logChannelId?'Change log channel':'Select log channel').setChannelTypes(ChannelType.GuildText)),
+  new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('honeypot_cfg:whitelist').setPlaceholder('Select whitelisted roles (replaces list)').setMinValues(1).setMaxValues(10)),
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('honeypot_cfg:toggle').setLabel(cfg.enabled?'Enabled':'Disabled').setStyle(cfg.enabled?ButtonStyle.Success:ButtonStyle.Danger).setEmoji(cfg.enabled?emoji('enabled'):emoji('disabled')),
+    new ButtonBuilder().setCustomId('honeypot_cfg:cleanup').setLabel(`Cleanup: ${cfg.cleanupWindow||'none'}`).setStyle(ButtonStyle.Secondary).setEmoji('🧹'),
+    new ButtonBuilder().setCustomId('honeypot_cfg:invite').setLabel(cfg.createInvite?'Invite DM: ON':'Invite DM: OFF').setStyle(cfg.createInvite?ButtonStyle.Success:ButtonStyle.Secondary).setEmoji(emoji('link')),
+    new ButtonBuilder().setCustomId('honeypot_cfg:dm').setLabel('Set Kick DM').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
+    new ButtonBuilder().setCustomId('honeypot_cfg:whitelist-clear').setLabel('Clear Roles').setStyle(ButtonStyle.Secondary).setEmoji(emoji('remove'))
+  )
 ]; }
+const GREET_TTS_LANGUAGES = [
+  { label: 'English (default)', value: 'en' }, { label: 'English (United States)', value: 'en-US' },
+  { label: 'English (United Kingdom)', value: 'en-GB' }, { label: 'English (Australia)', value: 'en-AU' },
+  { label: 'English (Canada)', value: 'en-CA' }, { label: 'English (India)', value: 'en-IN' }, { label: 'Urdu', value: 'ur' },
+  { label: 'Hindi', value: 'hi' }, { label: 'Arabic', value: 'ar' }, { label: 'Bengali', value: 'bn' },
+  { label: 'Punjabi', value: 'pa' }, { label: 'Spanish', value: 'es' }, { label: 'French', value: 'fr' },
+  { label: 'German', value: 'de' }, { label: 'Turkish', value: 'tr' }, { label: 'Portuguese', value: 'pt' },
+  { label: 'Indonesian', value: 'id' }, { label: 'Japanese', value: 'ja' }, { label: 'Korean', value: 'ko' },
+  { label: 'Chinese (Simplified)', value: 'zh-CN' }, { label: 'Russian', value: 'ru' }
+];
 function greetVoiceSetupEmbed(cfg) {
-  const mode = cfg.mode === 'audio' ? 'Uploaded audio' : 'TTS';
+  const mode = cfg.mode === 'audio' ? 'Uploaded audio' : 'Text-to-speech';
   const audio = cfg.audioPath ? 'Uploaded and saved' : 'Not uploaded';
-  return featureSetupEmbed('Greet Voice', 'New members receive the gate role, join the selected voice channel, hear the configured greeting, then are disconnected and released. The feature only runs when Status is Enabled.', [
+  const lang = GREET_TTS_LANGUAGES.find(item => item.value.toLowerCase() === String(cfg.ttsLang || 'en').toLowerCase());
+  return featureSetupEmbed('Greet Voice', 'New members receive the selected gate role, join the selected voice channel, hear the full greeting, then are disconnected from voice and released from the gate role. Configure the gate role carefully: only that selected role’s channel overwrites are changed.', [
     {name:'Status',value:cfg.enabled?'Enabled':'Disabled',inline:true},
     {name:'Mode',value:mode,inline:true},
-    {name:'Role',value:cfg.roleId?`<@&${cfg.roleId}>`:'Not set',inline:true},
-    {name:'Voice',value:cfg.vcId?`<#${cfg.vcId}>`:'Not set',inline:true},
-    {name:'TTS Prompt',value:cfg.ttsPrompt||'Not set',inline:false},
-    {name:'Audio',value:audio,inline:false}
+    {name:'Gate Role',value:cfg.roleId?`<@&${cfg.roleId}>`:'Not set',inline:true},
+    {name:'Greeting Voice Channel',value:cfg.vcId?`<#${cfg.vcId}>`:'Not set',inline:true},
+    {name:'TTS Language / Voice',value:lang?.label || String(cfg.ttsLang || 'English'),inline:true},
+    {name:'Speaking Speed',value:cfg.ttsSlow?'Slow':'Normal',inline:true},
+    {name:'TTS Prompt',value:cfg.ttsPrompt||'Not set — press **Set TTS Message** and send a message in this channel.',inline:false},
+    {name:'Audio File',value:audio,inline:false}
   ]);
 }
 function greetVoiceSetupRow(cfg) { return [
   new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder().setCustomId('greetvoice_cfg:voice').setPlaceholder('Choose the welcome voice channel').setChannelTypes(ChannelType.GuildVoice)
+    new ChannelSelectMenuBuilder().setCustomId('greetvoice_cfg:voice').setPlaceholder('1. Select the greeting voice channel').setChannelTypes(ChannelType.GuildVoice)
   ),
   new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('greetvoice_cfg:role').setLabel('Gate Role').setStyle(ButtonStyle.Primary).setEmoji(emoji('settings')),
@@ -749,6 +788,17 @@ function greetVoiceSetupRow(cfg) { return [
     new ButtonBuilder().setCustomId('greetvoice_cfg:audio').setLabel(cfg.audioPath ? 'Replace Audio' : 'Upload Audio').setStyle(ButtonStyle.Secondary).setEmoji('🎵'),
     new ButtonBuilder().setCustomId('greetvoice_cfg:test').setLabel('Test Greeting').setStyle(ButtonStyle.Secondary).setEmoji(emoji('success')),
     new ButtonBuilder().setCustomId('greetvoice_cfg:toggle').setLabel(cfg.enabled ? 'Disable' : 'Enable').setStyle(cfg.enabled ? ButtonStyle.Danger : ButtonStyle.Success).setEmoji(cfg.enabled ? emoji('disabled') : emoji('enabled'))
+  ),
+  new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('greetvoice_cfg:language')
+      .setPlaceholder(`TTS language / voice: ${GREET_TTS_LANGUAGES.find(item => item.value.toLowerCase() === String(cfg.ttsLang || 'en').toLowerCase())?.label || 'English'}`)
+      .addOptions(GREET_TTS_LANGUAGES.map(item => ({ label: item.label, value: item.value, default: item.value.toLowerCase() === String(cfg.ttsLang || 'en').toLowerCase() })))
+  ),
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('greetvoice_cfg:mode').setLabel(`Mode: ${cfg.mode === 'audio' ? 'Audio' : 'TTS'}`).setStyle(ButtonStyle.Secondary).setEmoji('🔄'),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:speed').setLabel(`Speed: ${cfg.ttsSlow ? 'Slow' : 'Normal'}`).setStyle(ButtonStyle.Secondary).setEmoji('🗣️'),
+    new ButtonBuilder().setCustomId('greetvoice_cfg:remove_audio').setLabel('Remove Audio').setStyle(ButtonStyle.Danger).setDisabled(!cfg.audioPath).setEmoji('🗑️')
   )
 ]; }
 
@@ -955,11 +1005,28 @@ function embedBuilderRow(draft) {
 // Rewrites { embeds, components, content, ephemeral } into a Components V2 payload.
 // Every payload that contains at least one embed is converted (with or without buttons/selects).
 // Payloads without embeds pass through untouched. `force` is kept for API compatibility.
-function flattenComponentRows(value, out = []) {
+function flattenComponentRows(value, out = [], seen = new Set()) {
   if (!value) return out;
-  if (Array.isArray(value)) { for (const item of value) flattenComponentRows(item, out); return out; }
-  if (value instanceof ActionRowBuilder || value?.type === 1 || value?.data?.type === 1) out.push(value);
-  else if (value?.toJSON && value.toJSON()?.type === 1) out.push(value);
+  if (Array.isArray(value)) {
+    for (const item of value) flattenComponentRows(item, out, seen);
+    return out;
+  }
+  if (typeof value === 'object') {
+    if (seen.has(value)) return out;
+    seen.add(value);
+  }
+
+  const data = typeof value?.toJSON === 'function' ? value.toJSON() : (value?.data || value);
+  if (value instanceof ActionRowBuilder || data?.type === 1) {
+    out.push(value instanceof ActionRowBuilder ? value : new ActionRowBuilder(data));
+    return out;
+  }
+
+  // A message already converted to Components V2 contains type-17 containers,
+  // not top-level type-1 rows. When a handler reuses message.components, pull its
+  // nested action rows out and reinsert them in the new container instead of
+  // accidentally deleting every button while updating a list/panel.
+  if (Array.isArray(data?.components)) flattenComponentRows(data.components, out, seen);
   return out;
 }
 
@@ -1063,6 +1130,6 @@ module.exports = {
   featureSetupEmbed, featureSetupRow, buttonRoleEmbed, buttonRoleSetupRows, reactionRoleSetupEmbed, reactionRoleSetupRows, staffApplicationEmbed, birthdaySetupEmbed, honeypotSetupEmbed, birthdaySetupRow, antiBadwordSetupEmbed, antiBadwordSetupRow, honeypotSetupRow, greetVoiceSetupEmbed, greetVoiceSetupRow,
   autoresponderSetupEmbed, autoresponderSetupRow, autoreactorSetupEmbed, autoreactorSetupRow,
   logSetupEmbed, logSetupRows, ownerLogSetupEmbed, ownerLogSetupRows, ownerJoinLogEmbed, ownerJoinLogRows, ownerGuildControlEmbed, ownerGuildControlRows, ownerInfoChoiceEmbed, ownerInfoChoiceRows, membershipListEmbed, membershipListRows,
-  embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer,
+  embedBuilderPreviewEmbed, embedBuilderRow, toComponentsV2, embedToContainer, GREET_TTS_LANGUAGES,
   SETUP_MODULE_META, setupPanelEmbed, setupPanelRow
 };
