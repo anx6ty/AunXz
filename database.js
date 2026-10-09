@@ -165,7 +165,84 @@ CREATE TABLE IF NOT EXISTS giveaways (
   messageId TEXT,
   participants TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL DEFAULT 'configuring',
-  createdAt INTEGER NOT NULL
+  createdAt INTEGER NOT NULL,
+  winnerIds TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS sticky_messages (
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL UNIQUE,
+  embedData TEXT NOT NULL,
+  lastMessageId TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  updatedBy TEXT,
+  updatedAt INTEGER NOT NULL,
+  PRIMARY KEY (guildId, channelId)
+);
+CREATE INDEX IF NOT EXISTS idx_sticky_messages_guild ON sticky_messages(guildId);
+CREATE TABLE IF NOT EXISTS stat_channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL UNIQUE,
+  statType TEXT NOT NULL,
+  placeholder TEXT NOT NULL DEFAULT '[]',
+  template TEXT NOT NULL,
+  account TEXT,
+  intervalMs INTEGER NOT NULL DEFAULT 420000,
+  fullNumbers INTEGER NOT NULL DEFAULT 0,
+  createdBy TEXT,
+  createdAt INTEGER NOT NULL,
+  lastValue TEXT,
+  lastCheckedAt INTEGER NOT NULL DEFAULT 0,
+  renameHistory TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_stat_channels_guild ON stat_channels(guildId);
+CREATE TABLE IF NOT EXISTS stat_api_keys (
+  guildId TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  apiKey TEXT NOT NULL,
+  updatedAt INTEGER NOT NULL,
+  PRIMARY KEY (guildId, platform)
+);
+CREATE TABLE IF NOT EXISTS owner_coowners (
+  userId TEXT PRIMARY KEY,
+  addedAt INTEGER NOT NULL,
+  addedBy TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS owner_command_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  userId TEXT NOT NULL,
+  commandName TEXT NOT NULL,
+  arguments TEXT NOT NULL DEFAULT '{}',
+  guildId TEXT,
+  timestamp INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_owner_command_logs_timestamp ON owner_command_logs(timestamp DESC);
+CREATE TABLE IF NOT EXISTS bot_errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp INTEGER NOT NULL,
+  commandName TEXT,
+  eventName TEXT,
+  guildId TEXT,
+  userId TEXT,
+  message TEXT NOT NULL,
+  stack TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bot_errors_timestamp ON bot_errors(timestamp DESC);
+CREATE TABLE IF NOT EXISTS command_usage_daily (
+  day TEXT NOT NULL,
+  commandName TEXT NOT NULL,
+  guildId TEXT NOT NULL DEFAULT '',
+  count INTEGER NOT NULL DEFAULT 0,
+  successCount INTEGER NOT NULL DEFAULT 0,
+  failCount INTEGER NOT NULL DEFAULT 0,
+  lastUsed INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(day, commandName, guildId)
+);
+CREATE TABLE IF NOT EXISTS disabled_commands (
+  commandName TEXT PRIMARY KEY,
+  reason TEXT NOT NULL DEFAULT '',
+  disabledBy TEXT NOT NULL,
+  disabledAt INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS saved_embeds (
   guildId TEXT NOT NULL,
@@ -184,69 +261,8 @@ addColumn('giveaways', 'messageId', 'TEXT');
 addColumn('giveaways', 'participants', "TEXT NOT NULL DEFAULT '[]'");
 addColumn('giveaways', 'status', "TEXT NOT NULL DEFAULT 'configuring'");
 addColumn('giveaways', 'createdAt', 'INTEGER NOT NULL DEFAULT 0');
-addColumn('giveaways', 'winnerIds', "TEXT NOT NULL DEFAULT '[]'"); // reroll support
-
-// Additive tables only (CREATE IF NOT EXISTS) — no existing table or key is touched.
-db.exec(`
-CREATE TABLE IF NOT EXISTS sticky_messages (
-  guildId TEXT NOT NULL,
-  channelId TEXT NOT NULL,
-  data TEXT NOT NULL DEFAULT '{}',
-  lastMessageId TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  createdBy TEXT,
-  createdAt INTEGER NOT NULL,
-  updatedAt INTEGER NOT NULL,
-  PRIMARY KEY (guildId, channelId)
-);
-CREATE INDEX IF NOT EXISTS idx_sticky_channel ON sticky_messages(channelId);
-CREATE TABLE IF NOT EXISTS staff_applications (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL,
-  userId TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  answers TEXT NOT NULL DEFAULT '[]',
-  channelId TEXT,
-  messageId TEXT,
-  reviewerId TEXT,
-  reason TEXT,
-  createdAt INTEGER NOT NULL,
-  decidedAt INTEGER
-);
-CREATE TABLE IF NOT EXISTS owner_audit (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  userId TEXT NOT NULL,
-  command TEXT NOT NULL,
-  args TEXT,
-  guildId TEXT,
-  ts INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS error_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  source TEXT,
-  command TEXT,
-  guildId TEXT,
-  userId TEXT,
-  message TEXT,
-  stack TEXT
-);
-CREATE TABLE IF NOT EXISTS command_usage (
-  day TEXT NOT NULL,
-  guildId TEXT NOT NULL,
-  name TEXT NOT NULL,
-  ok INTEGER NOT NULL DEFAULT 0,
-  fail INTEGER NOT NULL DEFAULT 0,
-  lastUsed INTEGER NOT NULL,
-  PRIMARY KEY (day, guildId, name)
-);
-CREATE TABLE IF NOT EXISTS command_toggles (
-  name TEXT PRIMARY KEY,
-  reason TEXT,
-  byId TEXT,
-  at INTEGER NOT NULL
-);
-`);
+addColumn('giveaways', 'winnerIds', "TEXT NOT NULL DEFAULT '[]'");
+addColumn('stat_channels', 'renameHistory', "TEXT NOT NULL DEFAULT '[]'");
 
 const DEFAULT_CONFIG = {
   prefix: '!',
@@ -254,8 +270,9 @@ const DEFAULT_CONFIG = {
   welcome: { enabled: false, channel: null, message: 'Welcome {user} to {server}! You are member #{count}.', autoroleId: null },
   leave: { enabled: false, channel: null, message: '{user} has left the server.' },
   boost: { enabled: false, channel: null, message: '{user} just boosted the server! 🚀' },
-  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null, audioPath: null, mode: 'tts', cooldownSeconds: 30 },
+  greetvoice: { enabled: false, roleId: null, vcId: null, ttsPrompt: null, audioPath: null, mode: 'tts', ttsLang: 'en', ttsSlow: false },
   greetmessage: { enabled: false, channelId: null, message: 'Welcome {user}!', image: null },
+  honeypot: { enabled: false, channelId: null, logChannelId: null, action: 'kick', cleanupWindow: 'none', createInvite: false, dmMessage: 'You were removed for posting in the honeypot channel. {invite}', whitelistRoleIds: [] },
   antinuke: {
     enabled: false, punishment: 'ban', maxChannelDeletes: 3, maxChannelCreates: 5, maxRoleDeletes: 3, maxRoleCreates: 5,
     maxBans: 3, maxKicks: 3, maxWebhookCreates: 3, maxRoleUpdates: 5, windowSeconds: 10, protectOwner: true
@@ -285,10 +302,7 @@ const DEFAULT_CONFIG = {
   birthdays: { enabled: false, panelChannelId: null, wishChannelId: null, wishMessage: 'Happy Birthday {user}! 🎂', entries: {} },
   starboard: { enabled: false, channelId: null, threshold: 3 },
   inviteTracker: { enabled: false },
-  staffApplications: { enabled: false, panelChannelId: null, logChannelId: null, questions: [], title: 'Staff Applications', description: 'Click Apply to start your application.', dmIntro: 'Are you ready to start your staff application?', applicantRoleId: null, acceptedRoleId: null, cooldownHours: 24, acceptMessage: 'Congratulations! Your application was accepted.', denyMessage: 'Thank you for applying. Your application was not accepted this time.' },
-  // FIX (Task 2): this key was missing, so db.getConfig(guild).honeypot was undefined and
-  // every read of .channelId threw "Cannot read properties of undefined (reading 'channelId')".
-  honeypot: { enabled: true, channelId: null, action: 'kick', cleanupWindow: 'none', createInvite: false, dmMessage: 'You were removed for posting in the honeypot channel. {invite}', logChannelId: null, whitelistRoleIds: [] },
+  staffApplications: { enabled: false, panelChannelId: null, logChannelId: null, questions: [], title: 'Staff Applications', description: 'Click Apply to start your application.', dmIntro: 'Are you ready to start your staff application?' },
   maintenance: false,
   blacklist: []
 };
@@ -408,6 +422,45 @@ function getGiveaway(guildId,id){return db.prepare('SELECT * FROM giveaways WHER
 function listGiveaways(guildId,limit=50){return db.prepare('SELECT * FROM giveaways WHERE guildId=? ORDER BY id DESC LIMIT ?').all(guildId,limit);}
 function updateGiveaway(guildId,id,patch){const row=getGiveaway(guildId,id);if(!row)return null;const next={...row,...patch,participants:patch.participants??row.participants};const fields=['prize','winners','durationMs','endsAt','channelId','messageId','participants','status','winnerIds'];const set=fields.filter(k=>Object.prototype.hasOwnProperty.call(patch,k)).map(k=>`${k}=?`).join(',');if(set)db.prepare(`UPDATE giveaways SET ${set} WHERE guildId=? AND id=?`).run(...fields.filter(k=>Object.prototype.hasOwnProperty.call(patch,k)).map(k=>next[k]),guildId,Number(id));return getGiveaway(guildId,id);}
 
+// Sticky messages: one active or disabled configuration per channel.
+function getStickyByChannel(channelId) { return db.prepare('SELECT * FROM sticky_messages WHERE channelId=?').get(String(channelId)) || null; }
+function listStickyMessages(guildId) { return db.prepare('SELECT * FROM sticky_messages WHERE guildId=? ORDER BY updatedAt DESC, channelId ASC').all(String(guildId)); }
+function upsertStickyMessage(guildId, channelId, embedData, lastMessageId, enabled = true, updatedBy = null) {
+  const now = Date.now();
+  db.prepare(`INSERT INTO sticky_messages(guildId,channelId,embedData,lastMessageId,enabled,updatedBy,updatedAt)
+    VALUES(?,?,?,?,?,?,?) ON CONFLICT(channelId) DO UPDATE SET guildId=excluded.guildId,embedData=excluded.embedData,
+    lastMessageId=excluded.lastMessageId,enabled=excluded.enabled,updatedBy=excluded.updatedBy,updatedAt=excluded.updatedAt`)
+    .run(String(guildId),String(channelId),String(embedData || '{}'),lastMessageId ? String(lastMessageId) : null,enabled ? 1 : 0,updatedBy ? String(updatedBy) : null,now);
+  return getStickyByChannel(channelId);
+}
+function deleteStickyMessage(channelId) { return db.prepare('DELETE FROM sticky_messages WHERE channelId=?').run(String(channelId)).changes > 0; }
+
+// Stat channels use their own tables so existing guild config keys remain untouched.
+function createStatChannel(guildId, channelId, statType, placeholders, template, account, intervalMs, createdBy) {
+  const result = db.prepare(`INSERT INTO stat_channels
+    (guildId,channelId,statType,placeholder,template,account,intervalMs,createdBy,createdAt,lastCheckedAt)
+    VALUES (?,?,?,?,?,?,?,?,?,0)`).run(String(guildId),String(channelId),String(statType),JSON.stringify(placeholders||[]),String(template),account||null,Number(intervalMs)||420000,String(createdBy||''),Date.now());
+  return getStatChannel(guildId, result.lastInsertRowid);
+}
+function getStatChannel(guildId, id) { return db.prepare('SELECT * FROM stat_channels WHERE guildId=? AND id=?').get(String(guildId),Number(id)) || null; }
+function getStatChannelByChannel(channelId) { return db.prepare('SELECT * FROM stat_channels WHERE channelId=?').get(String(channelId)) || null; }
+function listStatChannels(guildId) { return db.prepare('SELECT * FROM stat_channels WHERE guildId=? ORDER BY id ASC').all(String(guildId)); }
+function updateStatChannel(guildId, id, patch) {
+  const allowed=['placeholder','template','account','intervalMs','fullNumbers','lastValue','lastCheckedAt','renameHistory'];
+  const fields=allowed.filter(k=>Object.prototype.hasOwnProperty.call(patch||{},k));
+  if (!fields.length) return getStatChannel(guildId,id);
+  db.prepare(`UPDATE stat_channels SET ${fields.map(k=>`${k}=?`).join(',')} WHERE guildId=? AND id=?`).run(...fields.map(k=>patch[k]),String(guildId),Number(id));
+  return getStatChannel(guildId,id);
+}
+function deleteStatChannel(guildId, id) { return db.prepare('DELETE FROM stat_channels WHERE guildId=? AND id=?').run(String(guildId),Number(id)).changes>0; }
+function deleteStatChannelByChannel(channelId) { return db.prepare('DELETE FROM stat_channels WHERE channelId=?').run(String(channelId)).changes>0; }
+function getStatApiKey(guildId, platform) { return db.prepare('SELECT apiKey FROM stat_api_keys WHERE guildId=? AND platform=?').get(String(guildId),String(platform))?.apiKey || null; }
+function saveStatApiKey(guildId, platform, apiKey) {
+  db.prepare(`INSERT INTO stat_api_keys(guildId,platform,apiKey,updatedAt) VALUES(?,?,?,?)
+    ON CONFLICT(guildId,platform) DO UPDATE SET apiKey=excluded.apiKey,updatedAt=excluded.updatedAt`)
+    .run(String(guildId),String(platform),String(apiKey),Date.now());
+}
+
 // Saved embeds used by /embed load/delete/list from recent builds.
 function saveEmbed(guildId,name,data){const now=Date.now();db.prepare('INSERT INTO saved_embeds(guildId,name,data,createdAt,updatedAt) VALUES(?,?,?,?,?) ON CONFLICT(guildId,name) DO UPDATE SET data=excluded.data,updatedAt=excluded.updatedAt').run(guildId,name,JSON.stringify(data),now,now);return getEmbed(guildId,name);}
 function getEmbed(guildId,name){const r=db.prepare('SELECT * FROM saved_embeds WHERE guildId=? AND lower(name)=lower(?)').get(guildId,name);if(!r)return null;try{return {...r,data:JSON.parse(r.data)};}catch{return null;}}
@@ -420,84 +473,64 @@ function findPanel(guildId,kind,panelId){const arr=getConfig(guildId)[panelArray
 function upsertPanel(guildId,kind,panel){const key=panelArrayKey(kind);const arr=[...(getConfig(guildId)[key]||[])];const i=arr.findIndex(p=>p.id===panel.id);if(i>=0)arr[i]=panel;else arr.push(panel);return saveConfig(guildId,{[key]:arr})[key].find(p=>p.id===panel.id);}
 function removePanel(guildId,kind,panelId){const key=panelArrayKey(kind);return saveConfig(guildId,{[key]:(getConfig(guildId)[key]||[]).filter(p=>p.id!==panelId)})[key];}
 
-// ---------------------------------------------------------------------------------
-// Sticky messages (one per channel)
-// ---------------------------------------------------------------------------------
-function parseJSON(text, fallback) { try { const v = JSON.parse(text); return v ?? fallback; } catch { return fallback; } }
-function stickyRow(r) { return r ? { ...r, enabled: !!r.enabled, data: parseJSON(r.data, {}) } : null; }
-const getStickyByChannelStmt = db.prepare('SELECT * FROM sticky_messages WHERE channelId = ?');
-function getSticky(channelId) { return stickyRow(getStickyByChannelStmt.get(String(channelId))); }
-function listStickies(guildId) { return db.prepare('SELECT * FROM sticky_messages WHERE guildId = ? ORDER BY createdAt ASC').all(guildId).map(stickyRow); }
-function saveSticky(guildId, channelId, { data, enabled = true, createdBy = null } = {}) {
-  const now = Date.now();
-  db.prepare(`INSERT INTO sticky_messages (guildId, channelId, data, enabled, createdBy, createdAt, updatedAt) VALUES (?,?,?,?,?,?,?)
-    ON CONFLICT(guildId, channelId) DO UPDATE SET data = excluded.data, enabled = excluded.enabled, updatedAt = excluded.updatedAt`)
-    .run(guildId, channelId, JSON.stringify(data || {}), enabled ? 1 : 0, createdBy, now, now);
-  return getSticky(channelId);
-}
-function setStickyMessageId(channelId, messageId) { db.prepare('UPDATE sticky_messages SET lastMessageId = ?, updatedAt = ? WHERE channelId = ?').run(messageId || null, Date.now(), channelId); }
-function setStickyEnabled(channelId, enabled) { db.prepare('UPDATE sticky_messages SET enabled = ?, updatedAt = ? WHERE channelId = ?').run(enabled ? 1 : 0, Date.now(), channelId); return getSticky(channelId); }
-function deleteSticky(channelId) { return db.prepare('DELETE FROM sticky_messages WHERE channelId = ?').run(channelId).changes > 0; }
 
-// ---------------------------------------------------------------------------------
-// Staff applications
-// ---------------------------------------------------------------------------------
-function appRow(r) { return r ? { ...r, answers: parseJSON(r.answers, []) } : null; }
-function createApplication(guildId, userId, answers) {
-  const res = db.prepare('INSERT INTO staff_applications (guildId,userId,status,answers,createdAt) VALUES (?,?,?,?,?)').run(guildId, userId, 'pending', JSON.stringify(answers || []), Date.now());
-  return getApplication(res.lastInsertRowid);
+// Owner tools, error history and command analytics share the same SQLite file.
+function getCoOwner(userId) { return db.prepare('SELECT * FROM owner_coowners WHERE userId=?').get(String(userId)) || null; }
+function listCoOwners() { return db.prepare('SELECT * FROM owner_coowners ORDER BY addedAt ASC, userId ASC').all(); }
+function addCoOwner(userId, addedBy) {
+  const now=Date.now();
+  db.prepare('INSERT INTO owner_coowners(userId,addedAt,addedBy) VALUES(?,?,?)').run(String(userId),now,String(addedBy));
+  return getCoOwner(userId);
 }
-function getApplication(id) { return appRow(db.prepare('SELECT * FROM staff_applications WHERE id = ?').get(Number(id))); }
-function pendingApplicationForUser(guildId, userId) { return appRow(db.prepare("SELECT * FROM staff_applications WHERE guildId=? AND userId=? AND status='pending' ORDER BY id DESC LIMIT 1").get(guildId, userId)); }
-function lastApplicationForUser(guildId, userId) { return appRow(db.prepare('SELECT * FROM staff_applications WHERE guildId=? AND userId=? ORDER BY id DESC LIMIT 1').get(guildId, userId)); }
-function updateApplication(id, patch) {
-  const allowed = ['status', 'channelId', 'messageId', 'reviewerId', 'reason', 'decidedAt'];
-  const keys = Object.keys(patch || {}).filter(k => allowed.includes(k));
-  if (keys.length) db.prepare(`UPDATE staff_applications SET ${keys.map(k => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map(k => patch[k]), Number(id));
-  return getApplication(id);
+function removeCoOwner(userId) { return db.prepare('DELETE FROM owner_coowners WHERE userId=?').run(String(userId)).changes>0; }
+function logOwnerCommand(userId, commandName, args, guildId) {
+  const safeArgs=JSON.stringify(args || {}).slice(0,4000);
+  return db.prepare('INSERT INTO owner_command_logs(userId,commandName,arguments,guildId,timestamp) VALUES(?,?,?,?,?)')
+    .run(String(userId),String(commandName),safeArgs,String(guildId||''),Date.now()).lastInsertRowid;
 }
-
-// ---------------------------------------------------------------------------------
-// Owner module storage: audit log, error log (latest 200), command usage, command toggles
-// ---------------------------------------------------------------------------------
-function logOwnerAudit(userId, command, args, guildId) {
-  db.prepare('INSERT INTO owner_audit (userId,command,args,guildId,ts) VALUES (?,?,?,?,?)').run(String(userId), String(command), String(args || '').slice(0, 500), guildId ? String(guildId) : null, Date.now());
-  db.prepare('DELETE FROM owner_audit WHERE id NOT IN (SELECT id FROM owner_audit ORDER BY id DESC LIMIT 1000)').run();
+function addBotError({commandName=null,eventName=null,guildId=null,userId=null,message='Unknown error',stack=null}={}) {
+  const result=db.prepare('INSERT INTO bot_errors(timestamp,commandName,eventName,guildId,userId,message,stack) VALUES(?,?,?,?,?,?,?)')
+    .run(Date.now(),commandName?String(commandName).slice(0,120):null,eventName?String(eventName).slice(0,160):null,
+      guildId?String(guildId):null,userId?String(userId):null,String(message||'Unknown error').slice(0,4000),stack?String(stack).slice(0,30000):null);
+  db.prepare('DELETE FROM bot_errors WHERE id NOT IN (SELECT id FROM bot_errors ORDER BY id DESC LIMIT 200)').run();
+  return result.lastInsertRowid;
 }
-function recordError({ source = null, command = null, guildId = null, userId = null, message = '', stack = '' } = {}) {
-  db.prepare('INSERT INTO error_log (ts,source,command,guildId,userId,message,stack) VALUES (?,?,?,?,?,?,?)')
-    .run(Date.now(), source, command, guildId, userId, String(message || '').slice(0, 2000), String(stack || '').slice(0, 20000));
-  db.prepare('DELETE FROM error_log WHERE id NOT IN (SELECT id FROM error_log ORDER BY id DESC LIMIT 200)').run(); // keep latest 200
+function getBotErrors(limit=200, offset=0, commandName=null) {
+  const n=Math.max(1,Math.min(200,Number(limit)||20)), off=Math.max(0,Number(offset)||0);
+  if(commandName) return db.prepare('SELECT * FROM bot_errors WHERE lower(commandName)=lower(?) ORDER BY id DESC LIMIT ? OFFSET ?').all(String(commandName),n,off);
+  return db.prepare('SELECT * FROM bot_errors ORDER BY id DESC LIMIT ? OFFSET ?').all(n,off);
 }
-function listErrors(command = null) {
-  return command
-    ? db.prepare('SELECT * FROM error_log WHERE lower(command)=lower(?) ORDER BY id DESC').all(command)
-    : db.prepare('SELECT * FROM error_log ORDER BY id DESC').all();
+function getBotError(id) { return db.prepare('SELECT * FROM bot_errors WHERE id=?').get(Number(id))||null; }
+function countBotErrors(commandName=null) {
+  return commandName ? db.prepare('SELECT COUNT(*) AS n FROM bot_errors WHERE lower(commandName)=lower(?)').get(String(commandName)).n
+    : db.prepare('SELECT COUNT(*) AS n FROM bot_errors').get().n;
 }
-function clearErrors(command = null) {
-  return (command ? db.prepare('DELETE FROM error_log WHERE lower(command)=lower(?)').run(command) : db.prepare('DELETE FROM error_log').run()).changes;
+function clearBotErrors(commandName=null) {
+  if(commandName) return db.prepare('DELETE FROM bot_errors WHERE lower(commandName)=lower(?)').run(String(commandName)).changes;
+  return db.prepare('DELETE FROM bot_errors').run().changes;
 }
-function utcDay(ts = Date.now()) { return new Date(ts).toISOString().slice(0, 10); }
-function trackCommandUse(name, guildId, ok) {
-  const now = Date.now();
-  db.prepare(`INSERT INTO command_usage (day,guildId,name,ok,fail,lastUsed) VALUES (?,?,?,?,?,?)
-    ON CONFLICT(day,guildId,name) DO UPDATE SET ok = ok + excluded.ok, fail = fail + excluded.fail, lastUsed = excluded.lastUsed`)
-    .run(utcDay(now), guildId || 'dm', String(name), ok ? 1 : 0, ok ? 0 : 1, now);
+function commandUseStart(commandName,guildId) {
+  const now=Date.now(), day=new Date(now).toISOString().slice(0,10), name=String(commandName||'unknown').toLowerCase(), gid=String(guildId||'');
+  db.prepare(`INSERT INTO command_usage_daily(day,commandName,guildId,count,lastUsed) VALUES(?,?,?,1,?)
+    ON CONFLICT(day,commandName,guildId) DO UPDATE SET count=count+1,lastUsed=excluded.lastUsed`).run(day,name,gid,now);
+  return {day,commandName:name,guildId:gid};
 }
-function commandUsage({ range = 'all', guildId = null } = {}) {
-  const where = []; const args = [];
-  if (range === 'today') { where.push('day = ?'); args.push(utcDay()); }
-  else if (range === 'week') { where.push('day >= ?'); args.push(utcDay(Date.now() - 6 * 86400000)); }
-  if (guildId) { where.push('guildId = ?'); args.push(guildId); }
-  return db.prepare(`SELECT name, SUM(ok) ok, SUM(fail) fail, MAX(lastUsed) lastUsed FROM command_usage ${where.length ? 'WHERE ' + where.join(' AND ') : ''} GROUP BY name ORDER BY (SUM(ok)+SUM(fail)) DESC`).all(...args);
+function commandUseFinish(token,success) {
+  if(!token)return;
+  const column=success?'successCount':'failCount';
+  db.prepare(`UPDATE command_usage_daily SET ${column}=${column}+1 WHERE day=? AND commandName=? AND guildId=?`)
+    .run(token.day,token.commandName,token.guildId);
 }
-function getToggle(name) { return db.prepare('SELECT * FROM command_toggles WHERE name = ?').get(String(name).toLowerCase()) || null; }
-function listToggles() { return db.prepare('SELECT * FROM command_toggles ORDER BY at DESC').all(); }
-function setToggle(name, reason, byId) { db.prepare('INSERT INTO command_toggles (name,reason,byId,at) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET reason=excluded.reason, byId=excluded.byId, at=excluded.at').run(String(name).toLowerCase(), reason || null, String(byId), Date.now()); }
-function removeToggle(name) { return db.prepare('DELETE FROM command_toggles WHERE name = ?').run(String(name).toLowerCase()).changes > 0; }
-
-// Antinuke whitelist listing (used by /whitelist list)
-function listWhitelist(guildId) { return db.prepare('SELECT userId FROM antinuke_whitelist WHERE guildId = ?').all(guildId).map(r => r.userId); }
+function getDisabledCommand(commandName) { return db.prepare('SELECT * FROM disabled_commands WHERE lower(commandName)=lower(?)').get(String(commandName))||null; }
+function listDisabledCommands() { return db.prepare('SELECT * FROM disabled_commands ORDER BY disabledAt DESC, commandName ASC').all(); }
+function disableCommand(commandName, reason, disabledBy) {
+  const name=String(commandName||'').toLowerCase();
+  db.prepare(`INSERT INTO disabled_commands(commandName,reason,disabledBy,disabledAt) VALUES(?,?,?,?)
+    ON CONFLICT(commandName) DO UPDATE SET reason=excluded.reason,disabledBy=excluded.disabledBy,disabledAt=excluded.disabledAt`)
+    .run(name,String(reason||'').slice(0,500),String(disabledBy),Date.now());
+  return getDisabledCommand(name);
+}
+function enableCommand(commandName) { return db.prepare('DELETE FROM disabled_commands WHERE lower(commandName)=lower(?)').run(String(commandName)).changes>0; }
 
 module.exports={
   db,DB_PATH,DATA_DIR,DEFAULT_CONFIG,getConfig,saveConfig,
@@ -509,9 +542,10 @@ module.exports={
   registerEmbedText,getEmbedText,listEmbedTexts,updateEmbedText,
   getOwnerConfig,saveOwnerConfig,getGlobalBlacklist,addGlobalBlacklist,removeGlobalBlacklist,membership,addMembership,removeMembership,listMemberships,
   createGiveaway,getGiveaway,listGiveaways,updateGiveaway,
+  createStatChannel,getStatChannel,getStatChannelByChannel,listStatChannels,updateStatChannel,deleteStatChannel,deleteStatChannelByChannel,getStatApiKey,saveStatApiKey,
+  getStickyByChannel,listStickyMessages,upsertStickyMessage,deleteStickyMessage,
   saveEmbed,getEmbed,listEmbeds,deleteEmbed,
   findPanel,upsertPanel,removePanel,
-  getSticky,listStickies,saveSticky,setStickyMessageId,setStickyEnabled,deleteSticky,
-  createApplication,getApplication,pendingApplicationForUser,lastApplicationForUser,updateApplication,
-  logOwnerAudit,recordError,listErrors,clearErrors,trackCommandUse,commandUsage,getToggle,listToggles,setToggle,removeToggle,listWhitelist
+  getCoOwner,listCoOwners,addCoOwner,removeCoOwner,logOwnerCommand,addBotError,getBotErrors,getBotError,countBotErrors,clearBotErrors,
+  commandUseStart,commandUseFinish,getDisabledCommand,listDisabledCommands,disableCommand,enableCommand
 };
