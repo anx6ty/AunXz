@@ -24,13 +24,47 @@ function normalize(payload) {
   return ui.toComponentsV2(payload);
 }
 
-async function withFallback(original, normalized, originalPayload, thisArg) {
+async function withFallback(original, normalized, originalPayload, thisArg, methodName = '') {
   try {
     return await original.call(thisArg, normalized);
   } catch (error) {
+    const code = Number(error?.code);
+
+    // A component can outlive its ephemeral/original message (e.g. a confirmation
+    // pressed after Discord removed the source message). Do not retry editReply on the
+    // same missing message: surface the result in a fresh ephemeral response instead.
+    if (code === 10008 && thisArg?.isMessageComponent?.()) {
+      // Never retry a failed followUp through itself: that used to recurse when the
+      // interaction token was no longer valid. A missing original message can be
+      // replaced with a fresh acknowledgement once, but an expired token cannot.
+      if (methodName === 'followUp') {
+        console.warn('[AunXz] A component follow-up failed with Unknown Message; suppressing a recursive retry.');
+        return null;
+      }
+      const notice = {
+        ...(isPayloadObject(originalPayload) ? originalPayload : {}),
+        ephemeral: true
+      };
+      try {
+        if (methodName === 'editReply' || thisArg.deferred || thisArg.replied) {
+          console.warn('[AunXz] Original component response was missing; delivering result as a fresh ephemeral follow-up.');
+          return await thisArg.followUp(notice);
+        }
+        console.warn('[AunXz] Original component message was missing; replying privately instead of retrying the expired message.');
+        return await thisArg.reply(notice);
+      } catch (fallbackError) {
+        const fallbackCode = Number(fallbackError?.code);
+        console.error('[AunXz] Could not deliver fallback for an expired component message:', fallbackError);
+        // These errors mean there is no valid response destination left. Do not let a
+        // best-effort recovery itself become an unhandled rejection.
+        if ([10008, 10015, 10062].includes(fallbackCode)) return null;
+        throw fallbackError;
+      }
+    }
+
     if (!componentError(error) || normalized === originalPayload) throw error;
-    // Fallback is still useful for a Discord rollout incompatibility, but remove
-    // only the V2 flag. The UI layer already sanitizes duplicate custom_ids first.
+    // Hard fallback keeps the bot functional if Discord rejects a V2 layout because of a
+    // newly introduced component validation rule. The normal path remains Components V2.
     console.error('[AunXz] Components V2 payload rejected; using standard message fallback:', error);
     return original.call(thisArg, stripV2(originalPayload));
   }
@@ -52,7 +86,7 @@ function wrapInteractionMethod(interaction, name) {
   const bound = original.bind(interaction);
   const wrapped = async function(payload, ...rest) {
     const normalized = normalize(payload);
-    return withFallback(bound, normalized, payload, interaction);
+    return withFallback(bound, normalized, payload, interaction, name);
   };
   wrapped[WRAPPED] = true;
   interaction[name] = wrapped;
@@ -69,7 +103,7 @@ function patchChannelPrototype(ChannelClass) {
   const original = current;
   const wrapped = function(payload, ...rest) {
     const normalized = normalize(payload);
-    return withFallback(original, normalized, payload, this);
+    return withFallback(original, normalized, payload, this, 'send');
   };
   wrapped[PATCHED] = true;
   ChannelClass.prototype.send = wrapped;
@@ -85,7 +119,7 @@ function apply() {
     const originalEdit = djs.Message.prototype.edit;
     const wrappedEdit = function(payload, ...rest) {
       const normalized = normalize(payload);
-      return withFallback(originalEdit, normalized, payload, this);
+      return withFallback(originalEdit, normalized, payload, this, 'edit');
     };
     wrappedEdit[PATCHED] = true;
     djs.Message.prototype.edit = wrappedEdit;
