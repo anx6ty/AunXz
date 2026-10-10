@@ -325,7 +325,7 @@ add(S('owners', 'List owners and co-owners.'), {}, async i => {
   await h.paginate(i, h.listPages({ title: '👑 Bot owners', lines, emptyHint: 'Set OWNER_ID in your environment.' }), { ephemeral: true });
 });
 
-add(S('backup', 'Create a database backup and send the file to you.'), {}, async i => {
+add(S('backup', 'Create a database backup and DM the file to you.'), {}, async i => {
   const wait = 60000 - (Date.now() - (backupCooldown.get(i.user.id) || 0));
   if (wait > 0) return h.safeReply(i, { embeds: [h.warnEmbed('Cooldown', `Try again in ${Math.ceil(wait / 1000)}s.`)], ephemeral: true });
   await ack(i);
@@ -337,27 +337,16 @@ add(S('backup', 'Create a database backup and send the file to you.'), {}, async
   for (const f of [file, ...prep.tmp]) fs.unlink(f, () => {});
   const attach = list => list.map(b => new AttachmentBuilder(b.data, { name: b.name }));
 
-  // 1) the command's own (private) response — files go in the response itself, 10 per message.
-  let delivered = false; let firstError = null;
+  // Send the file(s) to the owner's DMs (never posted in the server).
   try {
-    const chunks = []; for (let n = 0; n < buffers.length; n++) chunks.push(buffers.slice(n, n + 1));   // one part per message (10 MB message cap)
-    for (let n = 0; n < chunks.length; n++) {
-      const payload = { embeds: n === 0 ? [h.successEmbed('Database backup', summary)] : [], files: attach(chunks[n]) };
-      if (n === 0) await done(i, payload); else await i.followUp({ ...payload, ephemeral: true });
+    for (let n = 0; n < buffers.length; n++) {
+      await i.user.send({ content: n === 0 ? `📦 Database backup — ${fmtBytes(size)}\n${summary}` : `Part ${n + 1}/${buffers.length}`, files: attach(buffers.slice(n, n + 1)) });
     }
-    delivered = true;
-  } catch (e) { firstError = e; console.error('[Owner] backup response upload failed:', e); }
-
-  // 2) fallback: DM the files.
-  if (!delivered) {
-    try {
-      for (let n = 0; n < buffers.length; n++) await i.user.send({ content: n === 0 ? `Database backup — ${fmtBytes(size)}` : undefined, files: attach(buffers.slice(n, n + 1)) });
-      delivered = true;
-      await done(i, { embeds: [h.successEmbed('Backup sent', `The response upload failed (${firstError?.message || 'unknown'}), so I sent it to your DMs instead.`)] });
-    } catch (e) {
-      return done(i, { embeds: [h.errorEmbed('Backup could not be delivered', `Upload: ${firstError?.message || 'failed'}\nDM: ${e?.message || 'failed'}\nOpen your DMs or lower the file size and try again.`)] });
-    }
+  } catch (e) {
+    console.error('[Owner] backup DM failed:', e);
+    return done(i, { embeds: [dmClosed(e)] });
   }
+  await done(i, { embeds: [h.successEmbed('Backup sent', `Check your DMs (${fmtBytes(size)}, ${buffers.length} file(s)).`)] });
   backupCooldown.set(i.user.id, Date.now()); db.saveOwnerConfig({ lastBackupAt: Date.now() });
 });
 
