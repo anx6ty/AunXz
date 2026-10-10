@@ -248,6 +248,18 @@ CREATE TABLE IF NOT EXISTS command_toggles (
 );
 `);
 
+// Server templates (/template save) — full snapshots stored by short code, additive table only.
+db.exec(`
+CREATE TABLE IF NOT EXISTS server_templates (
+  code TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  guildName TEXT NOT NULL DEFAULT '',
+  data TEXT NOT NULL,
+  createdBy TEXT,
+  createdAt INTEGER NOT NULL
+);
+`);
+
 const DEFAULT_CONFIG = {
   prefix: '!',
   logs: { mod: null, message: null, member: null, voice: null, antinuke: null, server: null, ticket: null, join: null },
@@ -499,8 +511,31 @@ function removeToggle(name) { return db.prepare('DELETE FROM command_toggles WHE
 // Antinuke whitelist listing (used by /whitelist list)
 function listWhitelist(guildId) { return db.prepare('SELECT userId FROM antinuke_whitelist WHERE guildId = ?').all(guildId).map(r => r.userId); }
 
+// Replace a guild's whole stored config (used by /template load so stale keys do not survive a deepMerge).
+function replaceConfig(guildId, data) {
+  upsertConfigStmt.run({ guildId, data: JSON.stringify(data || {}) });
+  return getConfig(guildId);
+}
+
+// Server templates
+function newTemplateCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < 8; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return 'AX-' + out;
+}
+function saveTemplate(guildId, guildName, data, createdBy) {
+  let code = newTemplateCode();
+  while (db.prepare('SELECT 1 FROM server_templates WHERE code=?').get(code)) code = newTemplateCode();
+  db.prepare('INSERT INTO server_templates(code,guildId,guildName,data,createdBy,createdAt) VALUES (?,?,?,?,?,?)').run(code, guildId, String(guildName || ''), data, createdBy || null, Date.now());
+  return code;
+}
+function getTemplate(code) { return db.prepare('SELECT * FROM server_templates WHERE code=?').get(String(code || '').trim().toUpperCase()) || null; }
+function listTemplates(guildId) { return db.prepare('SELECT code,guildId,guildName,createdBy,createdAt,length(data) AS size FROM server_templates WHERE guildId=? ORDER BY createdAt DESC').all(guildId); }
+function deleteTemplate(code, guildId) { return db.prepare('DELETE FROM server_templates WHERE code=? AND guildId=?').run(String(code || '').trim().toUpperCase(), guildId).changes > 0; }
+
 module.exports={
-  db,DB_PATH,DATA_DIR,DEFAULT_CONFIG,getConfig,saveConfig,
+  db,DB_PATH,DATA_DIR,DEFAULT_CONFIG,getConfig,saveConfig,replaceConfig,saveTemplate,getTemplate,listTemplates,deleteTemplate,
   getLevel,setLevel,topLevels,addWarn,getWarns,clearWarns,
   createTicket,getTicket,setTicketStatus,closeTicket,openTicketsForUser,
   addVMChannel,getVMChannel,removeVMChannel,
