@@ -76,9 +76,12 @@ function embedToContainer(embedLike, rows = [], budget = { left: MAX_TEXT }) {
 
 function countRow(r) { const j = asJSON(r); return 1 + (j?.components?.length || 0); }
 function rowsOf(components) {
-  return (components || []).filter(Boolean).map(r => (r instanceof ActionRowBuilder ? r : ActionRowBuilder.from(asJSON(r))));
+  const flat = [];
+  const walk = v => { if (Array.isArray(v)) v.forEach(walk); else if (v) flat.push(v); };
+  walk(components);                                   // callers sometimes pass [[row, row]]
+  return flat.map(r => (r instanceof ActionRowBuilder ? r : ActionRowBuilder.from(asJSON(r))))
+    .filter(r => (asJSON(r)?.components?.length || 0) > 0);   // Discord rejects empty rows
 }
-
 /**
  * Convert legacy { content, embeds, components, files } into a V2 payload.
  * `edit` adds content:null / embeds:[] so a legacy message can be turned into a V2 one.
