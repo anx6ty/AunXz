@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "deploy": "node -e \"require('./commandData').deploy()\""
+    "deploy": "node -e \"require('./commandData').deploy()\"",
+    "test:bridge": "node --test bridge/test/*.test.js"
   },
   "engines": {
     "node": ">=22.12.0"
