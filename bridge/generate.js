@@ -71,40 +71,61 @@ function extractJson(text) {
 async function callOpenRouter(messages, { signal, useJsonMode = true } = {}) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new MissingKeyError();
-  const model = process.env.OPENROUTER_MODEL || 'openrouter/auto';
-  const body = { model, messages, temperature: 0.7, max_tokens: Number(process.env.OPENROUTER_MAX_TOKENS) || 8000 };
-  if (useJsonMode) body.response_format = { type: 'json_object' };
+  const primary = process.env.OPENROUTER_MODEL || 'openrouter/auto';
+  const fallback = String(process.env.OPENROUTER_FALLBACK_MODEL || '').trim();
+  const models = [...new Set([primary, fallback].filter(Boolean))];
+  const timeoutMs = Math.max(5000, Math.min(120000, Number(process.env.OPENROUTER_TIMEOUT_MS) || 30000));
+  const retries = Math.max(0, Math.min(4, Number(process.env.OPENROUTER_MAX_RETRIES ?? 2)));
+  let lastError;
 
-  const signals = [AbortSignal.timeout(120000)];
-  if (signal) signals.push(signal);
+  for (const model of models) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const body = { model, messages, temperature: 0.7, max_tokens: Math.max(512, Math.min(12000, Number(process.env.OPENROUTER_MAX_TOKENS) || 8000)) };
+      if (useJsonMode) body.response_format = { type: 'json_object' };
+      const signals = [AbortSignal.timeout(timeoutMs)];
+      if (signal) signals.push(signal);
+      const started = Date.now();
+      let res;
+      try {
+        res = await fetch(API, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
+            'HTTP-Referer': process.env.OPENROUTER_SITE_URL || process.env.SITE_URL || 'https://github.com/anx6ty/AunXz',
+            'X-Title': process.env.OPENROUTER_APP_NAME || 'AunXz Template Studio'
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.any(signals)
+        });
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        lastError = new BridgeError('ai_error', `OpenRouter request failed or timed out (${timeoutMs} ms).`);
+        console.warn(`[OpenRouter] model=${model} attempt=${attempt + 1} latency_ms=${Date.now() - started} error=${e?.name || 'network'}`);
+        if (attempt < retries) { await new Promise(r => setTimeout(r, Math.min(1000 * (attempt + 1), 3000))); continue; }
+        break;
+      }
 
-  let res;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    res = await fetch(API, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
-        'HTTP-Referer': process.env.SITE_URL || 'http://localhost:3000', 'X-Title': 'ANXAI'
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.any(signals)
-    });
-    if (res.status !== 429 && res.status < 500) break;
-    await new Promise(r => setTimeout(r, 1500));
+      const requestId = String(res.headers.get('x-request-id') || res.headers.get('x-openrouter-request-id') || 'n/a').slice(0, 100);
+      const data = await res.json().catch(() => null);
+      console.log(`[OpenRouter] model=${model} status=${res.status} latency_ms=${Date.now() - started} request_id=${requestId} tokens=${Number(data?.usage?.total_tokens) || 0}`);
+      if (res.ok) {
+        const text = data?.choices?.[0]?.message?.content;
+        if (text && String(text).trim()) return { text: String(text), usage: data.usage || null, model, requestId, latencyMs: Date.now() - started };
+        lastError = new BridgeError('ai_error', 'The AI returned an empty reply. Try again or pick another model.');
+        break;
+      }
+      const detail = String(data?.error?.message || res.statusText || '').replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 200);
+      if (res.status === 400 && useJsonMode) return callOpenRouter(messages, { signal, useJsonMode: false });
+      if (res.status === 401) throw new BridgeError('ai_auth', 'OpenRouter rejected the API key (401). Check OPENROUTER_API_KEY.');
+      if (res.status === 402) { lastError = new BridgeError('ai_credits', 'OpenRouter reports not enough credits (402). Add credits or choose a free model.'); break; }
+      if (res.status === 429) lastError = new BridgeError('ai_rate_limited', 'OpenRouter rate limit reached. Try again in a moment.');
+      else if (res.status >= 500) lastError = new BridgeError('ai_error', `OpenRouter provider error ${res.status}.`);
+      else { lastError = new BridgeError('ai_error', `OpenRouter error ${res.status}: ${detail}`); break; }
+      if (attempt < retries) await new Promise(r => setTimeout(r, Math.min(1000 * (attempt + 1), 3000)));
+    }
+    console.warn(`[OpenRouter] switching_to_fallback=${models.indexOf(model) < models.length - 1}`);
   }
-
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const detail = String(data?.error?.message || res.statusText || '').replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 200);
-    if (res.status === 400 && useJsonMode) return callOpenRouter(messages, { signal, useJsonMode: false }); // model without JSON mode
-    if (res.status === 401) throw new BridgeError('ai_auth', 'OpenRouter rejected the API key (401). Check OPENROUTER_API_KEY.');
-    if (res.status === 402) throw new BridgeError('ai_credits', 'OpenRouter reports not enough credits (402). Add credits or choose a free model in OPENROUTER_MODEL.');
-    if (res.status === 429) throw new BridgeError('ai_rate_limited', 'OpenRouter rate limit reached. Try again in a moment.');
-    throw new BridgeError('ai_error', `OpenRouter error ${res.status}: ${detail}`);
-  }
-  const text = data?.choices?.[0]?.message?.content;
-  if (!text || !String(text).trim()) throw new BridgeError('ai_error', 'The AI returned an empty reply. Try again or pick another model.');
-  return { text: String(text), usage: data.usage || null };
+  throw lastError || new BridgeError('ai_error', 'OpenRouter request failed.');
 }
 
 /**
@@ -115,6 +136,28 @@ async function callOpenRouter(messages, { signal, useJsonMode = true } = {}) {
  * @param {(s:string)=>void} [p.onStatus]
  * @param {AbortSignal} [p.signal]
  */
+function applyNamingStyle(spec, prompt) {
+  const text = String(prompt || '');
+  const style = (text.match(/NAMING_STYLE=([a-z-]+)/i) || [])[1];
+  if (!style || style === 'auto' || style === 'minimal') return spec;
+  const clean = value => String(value || '').replace(/^[\s﹒ꔫεïз໒୨ৎゝ𓂃╭│╰〢・┊┃┆︱﹕›»「」『』⟡୨୧꒰꒱♡✦✧⋆༄]+|[\s﹒ꔫεïз໒୨ৎゝ𓂃╭│╰〢・┊┃┆︱﹕›»「」『』⟡୨୧꒰꒱♡✦✧⋆༄]+$/gu, '').trim();
+  const wrap = (name, emoji, isLast = false) => {
+    const n = clean(name).replace(/\s+/g, '-').toLowerCase().slice(0, 70) || 'channel';
+    if (style === 'emoji-divider') return `${emoji || '✦'}・${n}`;
+    if (style === 'tree') return `${isLast ? '╰' : '╭'}・${n}`;
+    if (style === 'unicode') return `﹒𓂃﹒${n}﹒𓂃﹒`;
+    if (style === 'emoji-symbols') return `${emoji || '✦'}﹒${n}﹒୨ৎ`;
+    return name;
+  };
+  if (Array.isArray(spec.channels)) spec.channels = spec.channels.map((c, i) => ({ ...c, name: wrap(c.name, c.emoji, i === spec.channels.length - 1) }));
+  if (Array.isArray(spec.categories)) spec.categories = spec.categories.map((cat, ci) => ({
+    ...cat,
+    name: style === 'tree' ? `${ci === spec.categories.length - 1 ? '╰' : '╭'}・${clean(cat.name).slice(0, 70)}` : wrap(cat.name, cat.emoji, ci === spec.categories.length - 1),
+    channels: (cat.channels || []).map((c, i, a) => ({ ...c, name: wrap(c.name, c.emoji, i === a.length - 1) }))
+  }));
+  return spec;
+}
+
 async function generateTemplate({ prompt, refineFrom, requestedBy, onStatus = () => {}, signal } = {}) {
   const userPrompt = String(prompt || '').trim().slice(0, MAX_PROMPT);
   if (!userPrompt) throw new BridgeError('invalid_spec', 'Describe the server you want first.');
@@ -137,7 +180,7 @@ async function generateTemplate({ prompt, refineFrom, requestedBy, onStatus = ()
     messages.push({ role: 'assistant', content: text });
 
     let parsed;
-    try { parsed = extractJson(text); }
+    try { parsed = extractJson(text); parsed = applyNamingStyle(parsed, userPrompt); }
     catch (e) {
       lastErrors = [{ path: '$', message: `reply was not valid JSON (${e.message})` }];
       messages.push({ role: 'user', content: `Your reply could not be parsed: ${e.message}. Reply again with ONE valid JSON object only.` });
@@ -155,7 +198,7 @@ async function generateTemplate({ prompt, refineFrom, requestedBy, onStatus = ()
     try {
       // Send the AI's original JSON (hex colours etc.): the bot validates and normalises it itself.
       const built = await buildTemplate(parsed, { requestedBy, signal });
-      return { spec: parsed, ...built, attempts: attempt, usage };
+      return { spec: parsed, ...built, attempts: attempt, usage, model: u?.model || null, latencyMs: u?.latencyMs || null, requestId: u?.requestId || null };
     } catch (e) {
       if (e instanceof BridgeError && e.code === 'invalid_spec') {
         lastErrors = e.errors;
