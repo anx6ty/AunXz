@@ -1,0 +1,103 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const groq = require('../groq');
+
+const originalFetch = global.fetch;
+const envKeys = ['GROQ_API_KEY', 'GROQ_MODEL', 'GROQ_FALLBACK_MODEL', 'GROQ_BASE_URL', 'GROQ_TIMEOUT_MS', 'GROQ_MAX_RETRIES', 'GROQ_USER_RPM', 'GROQ_GUILD_RPM'];
+const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+function resetEnv() {
+  for (const key of envKeys) delete process.env[key];
+  process.env.GROQ_API_KEY = 'test-key-not-real';
+  process.env.GROQ_MAX_RETRIES = '0';
+  groq._internals.resetForTests();
+}
+function okResponse(content = 'hello', model = 'openai/gpt-oss-20b') {
+  return new Response(JSON.stringify({ model, choices: [{ message: { content } }], usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 } }), {
+    status: 200, headers: { 'Content-Type': 'application/json', 'x-request-id': 'req-test' }
+  });
+}
+
+test.beforeEach(() => { resetEnv(); });
+test.after(() => {
+  global.fetch = originalFetch;
+  for (const key of envKeys) { if (savedEnv[key] === undefined) delete process.env[key]; else process.env[key] = savedEnv[key]; }
+  groq._internals.resetForTests();
+});
+
+test('uses the verified default model and the official compatible endpoint', async () => {
+  let sent;
+  global.fetch = async (url, options) => { sent = { url: String(url), options, body: JSON.parse(options.body) }; return okResponse('accurate reply'); };
+  const result = await groq.chatCompletion({ task: 'unit', guildId: 'g-model', userId: 'u-model', messages: [{ role: 'user', content: 'Hello' }] });
+  assert.equal(sent.url, 'https://api.groq.com/openai/v1/chat/completions');
+  assert.equal(sent.options.headers.Authorization, 'Bearer test-key-not-real');
+  assert.equal(sent.body.model, 'openai/gpt-oss-20b');
+  assert.equal(result.content, 'accurate reply');
+  assert.equal(result.requestId, 'req-test');
+  assert.equal(groq.getMetrics().unit.successful, 1);
+});
+
+test('rejects missing API key without making a network request', async () => {
+  delete process.env.GROQ_API_KEY;
+  global.fetch = async () => { throw new Error('should not call fetch'); };
+  await assert.rejects(groq.chatCompletion({ messages: [{ role: 'user', content: 'hi' }] }), error => error.code === 'ai_missing_key');
+});
+
+test('validates input size and message roles before calling the API', async () => {
+  global.fetch = async () => { throw new Error('should not call fetch'); };
+  await assert.rejects(groq.chatCompletion({ messages: [{ role: 'tool', content: 'bad role' }] }), error => error.code === 'ai_validation');
+  await assert.rejects(groq.chatCompletion({ messages: [{ role: 'user', content: 'x'.repeat(16001) }] }), error => error.code === 'ai_validation');
+});
+
+test('classifies authentication failure and never logs the provider body', async () => {
+  const oldWarn = console.warn; const logs = [];
+  console.warn = (...args) => logs.push(args.join(' '));
+  global.fetch = async () => new Response(JSON.stringify({ error: { message: 'Bearer secret provider diagnostic' } }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+  try {
+    await assert.rejects(groq.chatCompletion({ task: 'auth', guildId: 'g-auth', userId: 'u-auth', messages: [{ role: 'user', content: 'hi' }] }), error => error.code === 'ai_auth');
+    assert.ok(logs.every(line => !line.includes('secret provider diagnostic')));
+    assert.equal(groq.getMetrics().auth.failed, 1);
+  } finally { console.warn = oldWarn; }
+});
+
+test('honors retry-after for a transient rate limit and retries once', async () => {
+  process.env.GROQ_MAX_RETRIES = '1';
+  let calls = 0;
+  global.fetch = async () => {
+    calls++;
+    if (calls === 1) return new Response(JSON.stringify({ error: { message: 'rate limited' } }), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '0' } });
+    return okResponse('recovered');
+  };
+  const result = await groq.chatCompletion({ task: 'retry', guildId: 'g-retry', userId: 'u-retry', messages: [{ role: 'user', content: 'retry me' }] });
+  assert.equal(calls, 2);
+  assert.equal(result.content, 'recovered');
+});
+
+test('falls back on a retryable primary-model failure but not on authentication failure', async () => {
+  process.env.GROQ_MODEL = 'openai/primary-test';
+  process.env.GROQ_FALLBACK_MODEL = 'openai/fallback-test';
+  let calls = [];
+  global.fetch = async (url, options) => {
+    const model = JSON.parse(options.body).model; calls.push(model);
+    return model === 'openai/primary-test'
+      ? new Response(JSON.stringify({ error: { message: 'provider temporarily unavailable' } }), { status: 503 })
+      : okResponse('fallback', model);
+  };
+  const result = await groq.chatCompletion({ task: 'fallback', guildId: 'g-fb', userId: 'u-fb', messages: [{ role: 'user', content: 'hello' }] });
+  assert.deepEqual(calls, ['openai/primary-test', 'openai/fallback-test']);
+  assert.equal(result.model, 'openai/fallback-test');
+});
+
+test('deduplicates identical in-flight calls for the same user and scope', async () => {
+  let calls = 0; let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  global.fetch = async () => { calls++; await gate; return okResponse('shared'); };
+  const request = { task: 'dedup', guildId: 'g-dedup', userId: 'u-dedup', messages: [{ role: 'user', content: 'same request' }] };
+  const a = groq.chatCompletion(request);
+  const b = groq.chatCompletion(request);
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.equal(calls, 1);
+  assert.equal(ra.content, rb.content);
+});
