@@ -1,4 +1,4 @@
-// AunXz/index.js — boot, command registration, interaction router, event wiring.
+// AunXz/index.js — boot, registration, prefix + slash routing, events.
 'use strict';
 require('dotenv').config();
 console.log('[AunXz] Booting…');
@@ -7,7 +7,7 @@ const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ButtonStyle, StringSelectMenuBuilder, ChannelSelectMenuBuilder,
   UserSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle,
-  ActionRowBuilder, EmbedBuilder, PermissionFlagsBits, AuditLogEvent
+  ActionRowBuilder, EmbedBuilder, PermissionFlagsBits, AuditLogEvent, ChannelType
 } = require('discord.js');
 const db = require('./database');
 const sys = require('./systems');
@@ -15,7 +15,7 @@ const ui = require('./ui');
 const cmd = require('./commands');
 
 // =============================================================================
-// ENV VALIDATION
+// ENV
 // =============================================================================
 const REQUIRED = ['DISCORD_TOKEN', 'CLIENT_ID'];
 const missing = REQUIRED.filter(k => !process.env[k]);
@@ -41,7 +41,7 @@ const client = new Client({
 });
 
 // =============================================================================
-// RUNTIME SESSIONS
+// SESSIONS
 // =============================================================================
 const sessions = new Map();
 const SESSION_TTL_MS = 5 * 60 * 1000;
@@ -53,14 +53,14 @@ setInterval(() => {
 }, 60000).unref?.();
 
 // =============================================================================
-// ERROR HANDLING
+// ERRORS
 // =============================================================================
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e?.message || e));
 process.on('uncaughtException', e => console.error('[uncaughtException]', e));
 client.on('error', e => console.error('[client error]', e?.message || e));
 
 async function logError(err, ctx = '', meta = {}) {
-  console.error(`[${ctx}]`, err?.message || err);
+  console.error(`[${ctx}]`, err?.stack || err?.message || err);
   try {
     db.recordError({
       source: ctx,
@@ -81,8 +81,7 @@ client.once('ready', async () => {
   console.log(`   Database: ${db.DB_PATH}`);
   client.user.setActivity('/help', { type: 3 });
 
-  // ---- Command registration ---------------------------------------------
-  // Public commands → global. Owner-only commands → GUILD_ID / OWNER_GUILD_ID.
+  // ---- Slash command registration ----
   try {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
@@ -96,14 +95,13 @@ client.once('ready', async () => {
       await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, ownerGuildId), { body: ownerBody });
       console.log(`✅ Registered ${ownerBody.length} owner-only commands to guild ${ownerGuildId}.`);
     } else if (ownerBody.length) {
-      console.warn(`⚠️  OWNER_GUILD_ID / GUILD_ID not set — ${ownerBody.length} owner-only commands are NOT registered.`);
+      console.warn(`⚠️  OWNER_GUILD_ID / GUILD_ID not set — ${ownerBody.length} owner-only commands NOT registered.`);
     }
   } catch (e) { await logError(e, 'Command registration'); }
 
-  // Prime automod cache for every guild the bot is in
   for (const g of client.guilds.cache.values()) sys.refreshAutomod(g.id);
 
-  // ---- Giveaway scheduler -----------------------------------------------
+  // ---- Giveaway scheduler ----
   setInterval(async () => {
     try {
       const now = Date.now();
@@ -121,27 +119,26 @@ client.once('ready', async () => {
         const ch = g.channelId ? guild.channels.cache.get(g.channelId) : null;
         if (ch?.isTextBased()) ch.send({
           content: winners.length
-            ? `🎉 Giveaway ended! Winners for **${g.prize}**: ${winners.map(w => `<@${w}>`).join(', ')}`
+            ? `${ui.emoji('giveaway')} Giveaway ended! Winners for **${g.prize}**: ${winners.map(w => `<@${w}>`).join(', ')}`
             : `Giveaway for **${g.prize}** ended with no valid entries.`
         }).catch(() => {});
       }
     } catch (e) { console.error('giveaway tick', e?.message); }
   }, 15000).unref?.();
 
-  // ---- Join tracker pruning ---------------------------------------------
+  // ---- Join tracker pruning ----
   setInterval(() => {
     for (const g of client.guilds.cache.values()) db.pruneJoins(g.id, 3600);
   }, 300000).unref?.();
 
-  // ---- Birthday wishes (once per hour, dedupe per day) ------------------
-  const birthdaySent = new Map(); // "guild:user:yyyy-mm-dd" -> ts
+  // ---- Birthday wishes ----
+  const birthdaySent = new Map();
   setInterval(async () => {
     try {
       const now = new Date();
       const month = now.getUTCMonth() + 1, day = now.getUTCDate();
       const dayToken = now.toISOString().slice(0, 10);
-      const rows = db.birthdaysFor(month, day);
-      for (const r of rows) {
+      for (const r of db.birthdaysFor(month, day)) {
         const guild = client.guilds.cache.get(r.guildId);
         if (!guild) continue;
         const cfg = db.getConfig(guild.id).birthdays;
@@ -155,14 +152,13 @@ client.once('ready', async () => {
           ch.send({ content: text, allowedMentions: { users: [r.userId] } }).catch(() => {});
         }
       }
-      // prune
       const cutoff = Date.now() - 8 * 86400000;
       for (const [k, ts] of birthdaySent) if (ts < cutoff) birthdaySent.delete(k);
     } catch (e) { console.error('birthday tick', e?.message); }
   }, 3600000).unref?.();
 
-  // ---- Scheduled events runner ------------------------------------------
-  setInterval(async () => {
+  // ---- Scheduled events ----
+  setInterval(() => {
     try {
       const due = db.dueEvents(Date.now(), 25);
       for (const ev of due) db.deleteEvent(ev.id);
@@ -183,14 +179,11 @@ function uniqueByName(list) {
 // =============================================================================
 client.on('interactionCreate', async interaction => {
   try {
-    // Autocomplete short-circuit
     if (interaction.isAutocomplete()) return;
 
-    // Global blacklist
     if (interaction.user && db.getGlobalBlacklist().includes(interaction.user.id)) {
       return interaction.reply({ content: 'You are blocked from using AunXz.', ephemeral: true }).catch(() => {});
     }
-    // Maintenance mode (owner bypasses)
     if (db.getOwnerConfig().maintenance && !sys.isOwner(interaction.user.id)) {
       return interaction.reply({ content: 'AunXz is in maintenance mode.', ephemeral: true }).catch(() => {});
     }
@@ -198,7 +191,6 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isChatInputCommand()) {
       const c = cmd.commands.find(x => x.data.name === interaction.commandName);
       if (!c) return;
-      // Owner-only safety: check even if Discord let the command through
       if (c.ownerOnly && !sys.isOwner(interaction.user.id)) {
         return interaction.reply({ embeds: [ui.errEmbed('Denied', 'Owner only.')], ephemeral: true }).catch(() => {});
       }
@@ -209,7 +201,14 @@ client.on('interactionCreate', async interaction => {
           ephemeral: true
         });
       }
-      return await c.execute(interaction);
+      try {
+        await c.execute(interaction);
+        db.trackCommandUse(interaction.commandName, interaction.guildId, true);
+      } catch (e) {
+        db.trackCommandUse(interaction.commandName, interaction.guildId, false);
+        throw e;
+      }
+      return;
     }
 
     if (interaction.isStringSelectMenu())  return await handleSelect(interaction);
@@ -224,31 +223,202 @@ client.on('interactionCreate', async interaction => {
       guildId: interaction.guildId,
       userId: interaction.user?.id
     });
-    const payload = { embeds: [ui.errEmbed('Error', 'Something went wrong. The issue has been logged.')], ephemeral: true };
+    // Build a short message that includes the real error for admins
+    const detail = String(e?.message || e).slice(0, 200);
+    const payload = { embeds: [ui.errEmbed('Error', `\`${detail}\`\n\nThe issue has been logged.`)] };
     try {
-      if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
-      else await interaction.reply(payload);
+      if (interaction.deferred || interaction.replied) await interaction.followUp({ ...payload, ephemeral: true });
+      else await interaction.reply({ ...payload, ephemeral: true });
     } catch {}
   }
 });
 
 // =============================================================================
-// BUTTON HANDLER
+// PREFIX COMMAND ROUTER
+// =============================================================================
+const OPT_TYPE = { SUBCOMMAND: 1, SUBCOMMAND_GROUP: 2, STRING: 3, INTEGER: 4, BOOLEAN: 5, USER: 6, CHANNEL: 7, ROLE: 8, MENTIONABLE: 9, NUMBER: 10 };
+
+function prefixParseTokens(cmdJson, tokens) {
+  let options = cmdJson.options || [];
+  let subcommand = null;
+
+  if (options.length && (options[0].type === OPT_TYPE.SUBCOMMAND || options[0].type === OPT_TYPE.SUBCOMMAND_GROUP)) {
+    const name = String(tokens.shift() || '').toLowerCase();
+    const first = options.find(o => o.name === name);
+    if (!first) return null;
+    if (first.type === OPT_TYPE.SUBCOMMAND_GROUP) {
+      const subName = String(tokens.shift() || '').toLowerCase();
+      const sub = (first.options || []).find(o => o.name === subName);
+      if (!sub) return null;
+      subcommand = subName;
+      options = sub.options || [];
+    } else {
+      subcommand = name;
+      options = first.options || [];
+    }
+  }
+
+  const values = {};
+  for (let i = 0; i < options.length; i++) {
+    const opt = options[i];
+    let raw = tokens[i];
+    // Last option, if it's STRING, greedily consumes remaining tokens (for reasons, messages)
+    if (i === options.length - 1 && opt.type === OPT_TYPE.STRING) {
+      raw = tokens.slice(i).join(' ');
+    }
+    if (raw === undefined || raw === '') {
+      if (opt.required) return null;
+      continue;
+    }
+    values[opt.name] = { type: opt.type, raw: String(raw) };
+  }
+  return { subcommand, values };
+}
+
+function resolvePrefixValue(value, message) {
+  if (!value) return null;
+  const { type, raw } = value;
+  switch (type) {
+    case OPT_TYPE.STRING: return raw;
+    case OPT_TYPE.INTEGER: { const n = parseInt(raw, 10); return Number.isFinite(n) ? n : null; }
+    case OPT_TYPE.NUMBER: { const n = parseFloat(raw); return Number.isFinite(n) ? n : null; }
+    case OPT_TYPE.BOOLEAN: return /^(true|yes|on|enable|y)$/i.test(raw) ? true : /^(false|no|off|disable|n)$/i.test(raw) ? false : null;
+    case OPT_TYPE.USER: {
+      const idMatch = raw.match(/^<@!?(\d{15,25})>$/);
+      if (idMatch) return message.client.users.cache.get(idMatch[1]) || message.mentions.users.first() || null;
+      const named = message.guild.members.cache.find(m =>
+        m.user.username.toLowerCase() === raw.toLowerCase() ||
+        m.displayName.toLowerCase() === raw.toLowerCase() ||
+        m.user.tag.toLowerCase() === raw.toLowerCase());
+      return named?.user || null;
+    }
+    case OPT_TYPE.CHANNEL: {
+      const idMatch = raw.match(/^<#(\d{15,25})>$/);
+      if (idMatch) return message.guild.channels.cache.get(idMatch[1]) || null;
+      const named = message.guild.channels.cache.find(c => c.name.toLowerCase() === raw.toLowerCase());
+      return named || null;
+    }
+    case OPT_TYPE.ROLE: {
+      const idMatch = raw.match(/^<@&(\d{15,25})>$/);
+      if (idMatch) return message.guild.roles.cache.get(idMatch[1]) || null;
+      const named = message.guild.roles.cache.find(r => r.name.toLowerCase() === raw.toLowerCase());
+      return named || null;
+    }
+    default: return raw;
+  }
+}
+
+function buildFakeInteraction(message, cmdJson, parsed) {
+  let replied = false, deferred = false;
+  const values = {};
+  for (const [k, v] of Object.entries(parsed.values)) values[k] = resolvePrefixValue(v, message);
+  const get = (name) => (values[name] === undefined ? null : values[name]);
+
+  const fake = {
+    isChatInputCommand: () => true,
+    commandName: cmdJson.name,
+    user: message.author,
+    member: message.member,
+    guild: message.guild,
+    guildId: message.guild.id,
+    channel: message.channel,
+    channelId: message.channel.id,
+    client: message.client,
+    get deferred() { return deferred; },
+    get replied() { return replied; },
+    options: {
+      getUser: get, getMember: n => { const u = get(n); return u ? message.guild.members.cache.get(u.id) : null; },
+      getChannel: get, getRole: get, getString: get, getInteger: get, getNumber: get, getBoolean: get,
+      getSubcommand: () => parsed.subcommand, getSubcommandGroup: () => null,
+      getAttachment: () => message.attachments?.first() || null
+    },
+    reply: async (opts) => {
+      if (replied) return message.channel.send(opts);
+      replied = true;
+      const { ephemeral, ...rest } = opts || {};
+      return message.reply(rest);
+    },
+    editReply: async (opts) => {
+      const { ephemeral, ...rest } = opts || {};
+      return message.channel.send(rest);
+    },
+    deferReply: async () => { deferred = true; },
+    followUp: async (opts) => {
+      const { ephemeral, ...rest } = opts || {};
+      return message.channel.send(rest);
+    },
+    update: async (opts) => {
+      const { ephemeral, ...rest } = opts || {};
+      return message.channel.send(rest);
+    },
+    showModal: async () => message.reply({ content: 'This action opens a modal — use the slash version `/' + cmdJson.name + '`.' })
+  };
+  return fake;
+}
+
+async function handlePrefixCommand(message) {
+  const cfg = db.getConfig(message.guild.id);
+  const prefix = cfg.prefix || '!';
+  const content = message.content.trim();
+
+  let isCmd = false;
+  let body = '';
+  const mentionPattern = new RegExp(`^<@!?${message.client.user.id}>\\s*`);
+  if (content.startsWith(prefix)) { isCmd = true; body = content.slice(prefix.length).trim(); }
+  else if (mentionPattern.test(content)) { isCmd = true; body = content.replace(mentionPattern, '').trim(); }
+  if (!isCmd) return false;
+
+  const tokens = body.split(/\s+/).filter(Boolean);
+  const name = String(tokens.shift() || '').toLowerCase();
+  if (!name) return false;
+
+  const command = cmd.commands.find(c => c.data.name === name);
+  if (!command) return false;
+  if (command.ownerOnly && !sys.isOwner(message.author.id)) {
+    await message.reply({ embeds: [ui.errEmbed('Denied', 'Owner only.')] }).catch(() => {});
+    return true;
+  }
+  const disabled = db.getToggle(name);
+  if (disabled && !sys.isOwner(message.author.id)) {
+    await message.reply({ embeds: [ui.warnEmbed('Disabled', `**${name}** is temporarily disabled.`)] }).catch(() => {});
+    return true;
+  }
+
+  const cmdJson = command.data.toJSON();
+  const parsed = prefixParseTokens(cmdJson, tokens);
+  if (!parsed) {
+    await message.reply({ embeds: [ui.errEmbed('Invalid usage', `Use \`/${name}\` for the interactive version.`)] }).catch(() => {});
+    return true;
+  }
+  const fake = buildFakeInteraction(message, cmdJson, parsed);
+  try {
+    await command.execute(fake);
+    db.trackCommandUse(name, message.guild.id, true);
+  } catch (e) {
+    db.trackCommandUse(name, message.guild.id, false);
+    await logError(e, `Prefix ${name}`, { guildId: message.guild.id, userId: message.author.id });
+    await message.reply({ embeds: [ui.errEmbed('Command failed', String(e.message || e).slice(0, 200))] }).catch(() => {});
+  }
+  return true;
+}
+
+// =============================================================================
+// BUTTONS
 // =============================================================================
 async function handleButton(i) {
   const id = i.customId;
 
-  // ---- Help ---------------------------------------------------------------
+  // ---------- Help ----------
   if (id === 'help:refresh') return i.update(ui.helpMenuEmbed(i.client));
 
-  // ---- Setup extras -------------------------------------------------------
+  // ---------- Setup ----------
   if (id === 'setup:health') {
     await i.deferReply({ ephemeral: true });
     const issues = await sys.healthCheck(i.guild);
     const desc = issues.length
-      ? issues.map(x => `${x.severity === 'high' ? '🔴' : x.severity === 'medium' ? '🟡' : '🟢'} ${x.text}`).join('\n')
+      ? issues.map(x => `${x.severity === 'high' ? ui.emoji('error') : x.severity === 'medium' ? ui.emoji('warning') : ui.emoji('success')} ${x.text}`).join('\n')
       : 'All checks passed.';
-    return i.editReply({ embeds: [ui.embed('🩺 Health Check', desc)] });
+    return i.editReply({ embeds: [ui.embed(`${ui.emoji('health')} Health Check`, desc)] });
   }
   if (id === 'setup:backup') {
     const buf = Buffer.from(JSON.stringify(db.exportGuild(i.guildId), null, 2));
@@ -257,12 +427,11 @@ async function handleButton(i) {
   if (id === 'setup:wizard') {
     const menu = new StringSelectMenuBuilder().setCustomId('wizard:modules')
       .setPlaceholder('Choose modules to enable').setMinValues(1).setMaxValues(20)
-      .addOptions(ui.SETUP_MODULES.filter(m => m.cfgKey).map(m => ({ label: m.label, value: m.key, description: m.desc.slice(0, 100) })));
-    return i.reply({ embeds: [ui.infoEmbed('Guided Wizard', 'Select modules to enable.')], components: [ui.row(menu)], ephemeral: true });
+      .addOptions(ui.SETUP_MODULES.filter(m => m.cfgKey).map(m => ({ label: m.label, value: m.key, description: m.desc.slice(0, 100), emoji: ui.emoji(m.key2) })));
+    return i.reply({ embeds: [ui.infoEmbed(`${ui.emoji('wizard')} Guided Wizard`, 'Select modules to enable.')], components: [ui.row(menu)], ephemeral: true });
   }
-  if (id === 'setup:back') {
-    return i.update({ ...ui.setupPanelEmbed(i.guildId), ephemeral: true });
-  }
+  if (id === 'setup:back') return i.update({ ...ui.setupPanelEmbed(i.guildId), ephemeral: true });
+
   if (id.startsWith('setup:toggle:')) {
     if (!cmd.requireAdmin(i)) return;
     const key = id.split(':')[2];
@@ -284,18 +453,18 @@ async function handleButton(i) {
         : String(v).slice(0, 200)
     }));
     const e = ui.buildV2({
-      title: `🛡️ ${key} — Setup`,
-      description: `**Status:** ${cfg.enabled ? '🟢 Enabled' : '⚪ Disabled'}`,
+      title: `${ui.emoji('shield')} ${key} — Setup`,
+      description: `**Status:** ${cfg.enabled ? `${ui.emoji('enabled')} Enabled` : `${ui.emoji('disabled')} Disabled`}`,
       fields: fields.slice(0, 25),
       components: [ui.row(
         ui.toggleButton(`setup:toggle:${key}`, !!cfg.enabled),
-        ui.btn(`setup:refresh:${key}`, 'Refresh', ButtonStyle.Secondary)
+        ui.btn(`setup:refresh:${key}`, 'Refresh', ButtonStyle.Secondary, { emoji: ui.emoji('refresh') })
       )]
     });
     return i.update({ ...e, ephemeral: true });
   }
 
-  // ---- Ticket opener (button fallback) ------------------------------------
+  // ---------- Tickets ----------
   if (id === 'ticket:open') {
     await i.deferReply({ ephemeral: true });
     try {
@@ -304,13 +473,11 @@ async function handleButton(i) {
     } catch (e) { await i.editReply({ embeds: [ui.errEmbed('Failed', String(e.message || e))] }); }
     return;
   }
-
-  // ---- Ticket controls ----------------------------------------------------
   if (id === 'ticket:claim' || id === 'ticket:unclaim') {
     const t = db.getTicket(i.channel.id);
     if (!t) return i.reply({ embeds: [ui.errEmbed('Not a ticket', 'This works only inside a ticket.')], ephemeral: true });
     const cfg = db.getConfig(i.guildId).ticket;
-    const isSupport = (cfg.supportRoleId && i.member.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
+    const isSupport = (cfg.supportRoleId && i.member?.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
     if (!isSupport) return i.reply({ embeds: [ui.errEmbed('Denied', 'Support role required.')], ephemeral: true });
     const claiming = !t.claimedBy;
     db.setTicketStatus(i.channel.id, t.status, claiming ? i.user.id : null);
@@ -339,7 +506,7 @@ async function handleButton(i) {
     const t = db.getTicket(i.channel.id);
     if (!t) return i.reply({ embeds: [ui.errEmbed('Not a ticket', 'Not in a ticket.')], ephemeral: true });
     const cfg = db.getConfig(i.guildId).ticket;
-    const isSupport = (cfg.supportRoleId && i.member.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
+    const isSupport = (cfg.supportRoleId && i.member?.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
     if (!isSupport && i.user.id !== t.userId) return i.reply({ embeds: [ui.errEmbed('Denied', 'Only staff or the ticket owner can close.')], ephemeral: true });
     await i.deferReply({ ephemeral: true });
     try {
@@ -352,7 +519,7 @@ async function handleButton(i) {
     const t = db.getTicket(i.channel.id);
     if (!t) return i.reply({ embeds: [ui.errEmbed('Not a ticket', 'Not in a ticket.')], ephemeral: true });
     const cfg = db.getConfig(i.guildId).ticket;
-    const isSupport = (cfg.supportRoleId && i.member.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
+    const isSupport = (cfg.supportRoleId && i.member?.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
     if (!isSupport) return i.reply({ embeds: [ui.errEmbed('Denied', 'Support role required.')], ephemeral: true });
     await i.deferReply({ ephemeral: true });
     try {
@@ -381,7 +548,7 @@ async function handleButton(i) {
     const t = db.getTicket(i.channel.id);
     if (!t) return i.reply({ embeds: [ui.errEmbed('Not a ticket', 'Not in a ticket.')], ephemeral: true });
     const cfg = db.getConfig(i.guildId).ticket;
-    const isSupport = (cfg.supportRoleId && i.member.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
+    const isSupport = (cfg.supportRoleId && i.member?.roles.cache.has(cfg.supportRoleId)) || sys.isAdmin(i.member);
     if (!isSupport) return i.reply({ embeds: [ui.errEmbed('Denied', 'Support role required.')], ephemeral: true });
     db.setTicketStatus(i.channel.id, 'closed');
     db.logTicketEvent(i.guildId, i.channel.id, i.user.id, 'delete', null);
@@ -389,8 +556,6 @@ async function handleButton(i) {
     setTimeout(() => i.channel.delete().catch(() => {}), 1500);
     return;
   }
-
-  // ---- Ticket config ------------------------------------------------------
   if (id === 'ticket:cfg:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cfg = db.getConfig(i.guildId).ticket;
@@ -405,7 +570,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Posted', 'Panel is live.')], ephemeral: true });
   }
 
-  // ---- Giveaway entry -----------------------------------------------------
+  // ---------- Giveaway ----------
   if (id.startsWith('giveaway:enter:')) {
     const gid = parseInt(id.split(':')[2], 10);
     const g = db.getGiveaway(i.guildId, gid);
@@ -418,15 +583,15 @@ async function handleButton(i) {
     return i.reply({ content: has ? 'You left the giveaway.' : `Entered! ${participants.length} participant(s).`, ephemeral: true });
   }
 
-  // ---- Snipe navigation ---------------------------------------------------
+  // ---------- Snipe ----------
   if (id.startsWith('snipe:nav:')) {
     const [, , guildId, channelId, offsetStr] = id.split(':');
     return i.update({ ...sys.snipeView(guildId, channelId, parseInt(offsetStr, 10)), ephemeral: true });
   }
 
-  // ---- VoiceMaster controls -----------------------------------------------
+  // ---------- VoiceMaster ----------
   if (id.startsWith('vm_')) {
-    const vc = i.member.voice.channel;
+    const vc = i.member?.voice?.channel;
     if (!vc || !db.getVMChannel(vc.id)) return i.reply({ embeds: [ui.errEmbed('No channel', 'Join your VoiceMaster channel first.')], ephemeral: true });
     const rec = db.getVMChannel(vc.id);
     if (rec.ownerId !== i.user.id) return i.reply({ embeds: [ui.errEmbed('Denied', 'Only the channel owner can manage it.')], ephemeral: true });
@@ -479,7 +644,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // ---- AutoMod ------------------------------------------------------------
+  // ---------- AutoMod ----------
   if (id === 'automod:toggle' || id === 'automod:caps' || id === 'automod:invite' || id === 'automod:words') {
     if (!cmd.requireAdmin(i)) return;
     const cfg = db.getConfig(i.guildId).automod;
@@ -497,7 +662,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Updated', 'AutoMod settings updated.')], ephemeral: true });
   }
 
-  // ---- Bad-word -----------------------------------------------------------
+  // ---------- Bad-word ----------
   if (id === 'badword:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).antibadword;
@@ -514,7 +679,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // ---- Welcome / Leave ----------------------------------------------------
+  // ---------- Welcome / Leave ----------
   if (id === 'welcome:toggle' || id === 'leave:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const key = id.split(':')[0];
@@ -532,7 +697,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // ---- Greet message ------------------------------------------------------
+  // ---------- Greet message ----------
   if (id === 'greetmsg:toggle' || id === 'greetmsg:ping') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).greetmessage;
@@ -557,7 +722,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [e], ephemeral: true });
   }
 
-  // ---- Leveling -----------------------------------------------------------
+  // ---------- Leveling ----------
   if (id === 'leveling:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).leveling;
@@ -583,7 +748,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // ---- Honeypot -----------------------------------------------------------
+  // ---------- Honeypot ----------
   if (id === 'honeypot:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).honeypot;
@@ -592,10 +757,10 @@ async function handleButton(i) {
   }
   if (id === 'honeypot:log') {
     return i.reply({ embeds: [ui.infoEmbed('Set log channel', 'Pick a channel below.')],
-      components: [ui.row(new ChannelSelectMenuBuilder().setCustomId('honeypot:log:select').setPlaceholder('Log channel').addChannelTypes(0))], ephemeral: true });
+      components: [ui.row(new ChannelSelectMenuBuilder().setCustomId('honeypot:log:select').setPlaceholder('Log channel').setChannelTypes(ChannelType.GuildText))], ephemeral: true });
   }
 
-  // ---- Auto responder / reactor -------------------------------------------
+  // ---------- Auto responder / reactor ----------
   if (id === 'ar:toggle' || id === 'arr:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const key = id === 'ar:toggle' ? 'autoresponder' : 'autoreactor';
@@ -621,7 +786,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Updated', `Case ${!cur.ignoreCase ? 'insensitive' : 'sensitive'}.`)], ephemeral: true });
   }
 
-  // ---- Role panels (button + reaction) ------------------------------------
+  // ---------- Role panels ----------
   if (id.startsWith('brp:') || id.startsWith('rrp:')) {
     if (!cmd.requireAdmin(i)) return;
     const [, action, panelId] = id.split(':');
@@ -688,7 +853,7 @@ async function handleButton(i) {
     return;
   }
 
-  // ---- Role button click --------------------------------------------------
+  // ---------- Role button ----------
   if (id.startsWith('rolebtn:')) {
     const [, panelId, roleId] = id.split(':');
     const panel = db.findPanel(i.guildId, 'button', panelId);
@@ -705,7 +870,7 @@ async function handleButton(i) {
     } catch { return i.reply({ embeds: [ui.errEmbed('Failed', 'Role change failed.')], ephemeral: true }); }
   }
 
-  // ---- Staff applications -------------------------------------------------
+  // ---------- Applications ----------
   if (id === 'staffapp:apply') {
     const cfg = db.getConfig(i.guildId).staffApplications;
     if (!cfg.enabled || !(cfg.questions || []).length) return i.reply({ embeds: [ui.errEmbed('Unavailable', 'Applications not open.')], ephemeral: true });
@@ -748,16 +913,15 @@ async function handleButton(i) {
     const chId = cfg.panelChannelId || i.channel.id;
     const ch = i.guild.channels.cache.get(chId);
     if (!ch?.isTextBased()) return i.reply({ embeds: [ui.errEmbed('Missing', 'Panel channel not set.')], ephemeral: true });
-    const e = ui.buildV2({
-      title: cfg.title || 'Staff Applications',
+    await ch.send(ui.buildV2({
+      title: cfg.title || `${ui.emoji('applications')} Staff Applications`,
       description: cfg.description || 'Click Apply to start your application.',
-      components: [ui.row(ui.btn('staffapp:apply', 'Apply', ButtonStyle.Success, { emoji: '📝' }))]
-    });
-    await ch.send(e);
+      components: [ui.row(ui.btn('staffapp:apply', 'Apply', ButtonStyle.Success, { emoji: ui.emoji('submit') }))]
+    }));
     return i.reply({ embeds: [ui.okEmbed('Posted', `Posted in ${ch}.`)], ephemeral: true });
   }
 
-  // ---- Birthdays ----------------------------------------------------------
+  // ---------- Birthdays ----------
   if (id === 'bday:set') {
     const modal = new ModalBuilder().setCustomId('bday:set:modal').setTitle('Set Birthday');
     modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('Birthday (DD-MM)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)));
@@ -782,14 +946,14 @@ async function handleButton(i) {
     const ch = i.guild.channels.cache.get(chId);
     if (!ch?.isTextBased()) return i.reply({ embeds: [ui.errEmbed('Missing', 'Channel not set.')], ephemeral: true });
     await ch.send(ui.buildV2({
-      title: '🎂 Birthday Panel',
+      title: `${ui.emoji('birthday')} Birthday Panel`,
       description: 'Press the button to set your birthday.',
-      components: [ui.row(ui.btn('bday:set', 'Set Birthday', ButtonStyle.Primary, { emoji: '🎂' }))]
+      components: [ui.row(ui.btn('bday:set', 'Set Birthday', ButtonStyle.Primary, { emoji: ui.emoji('birthday') }))]
     }));
     return i.reply({ embeds: [ui.okEmbed('Posted', `Posted in ${ch}.`)], ephemeral: true });
   }
 
-  // ---- Template generator -------------------------------------------------
+  // ---------- Templategen ----------
   if (id.startsWith('tgen:type:')) {
     const type = id.split(':')[2];
     const sid = setSession(`tgen:${i.user.id}`, { type, step: 'naming' });
@@ -808,7 +972,7 @@ async function handleButton(i) {
     s.naming = style;
     return i.update({
       embeds: [ui.embed('Ready', `Type **${s.type}**, style **${style}**.`)],
-      components: [ui.row(ui.btn(`tgen:go:${sid}`, 'Generate', ButtonStyle.Success, { emoji: '🧩' }))]
+      components: [ui.row(ui.btn(`tgen:go:${sid}`, 'Generate', ButtonStyle.Success, { emoji: ui.emoji('generate') }))]
     });
   }
   if (id.startsWith('tgen:go:')) {
@@ -820,10 +984,10 @@ async function handleButton(i) {
       const tpl = await sys.generateTemplate({ serverType: s.type, namingStyle: s.naming, guildName: i.guild.name });
       s.template = tpl;
       const preview = tpl.categories.map(c =>
-        `**${c.emoji || ''} ${c.name}**\n${c.channels.map(ch => `  ${ch.type === 'voice' ? '🔊' : '#'} ${ch.emoji || ''} ${ch.name}`).join('\n')}`
+        `**${c.emoji || ''} ${c.name}**\n${c.channels.map(ch => `  ${ch.type === 'voice' ? ui.emoji('voice') : '#'} ${ch.emoji || ''} ${ch.name}`).join('\n')}`
       ).join('\n\n');
       const e = ui.buildV2({
-        title: '🧩 Preview',
+        title: `${ui.emoji('template')} Preview`,
         description: preview.slice(0, 3900) || 'empty',
         components: [ui.row(
           ui.btn(`tgen:apply:${sid}`, 'Apply', ButtonStyle.Success),
@@ -842,7 +1006,7 @@ async function handleButton(i) {
     if (!s?.template) return i.reply({ content: 'Session expired.', ephemeral: true });
     await i.deferReply({ ephemeral: true });
     const results = await sys.applyTemplateToGuild(i.guild, s.template, s.naming);
-    const e = ui.embed('✅ Template Applied').addFields(
+    const e = ui.embed(`${ui.emoji('success')} Template Applied`).addFields(
       { name: 'Categories', value: String(results.categories), inline: true },
       { name: 'Channels', value: String(results.channels), inline: true },
       { name: 'Roles', value: String(results.roles), inline: true },
@@ -856,30 +1020,29 @@ async function handleButton(i) {
     return i.update({ embeds: [ui.infoEmbed('Cancelled', 'No changes made.')], components: [] });
   }
 
-  // ---- No match -----------------------------------------------------------
-  // Silently ignore unknown buttons rather than crash.
-  return;
+  // Unknown button — silently ack to avoid "interaction failed"
+  if (i.isRepliable()) {
+    return i.deferUpdate().catch(() => {});
+  }
 }
 
-// Ticket log helper (called from the claim handler above)
 async function logTicketChange(guild, channel, label, actor) {
   const cfg = db.getConfig(guild.id).ticket;
   if (!cfg.logChannelId) return;
   const ch = guild.channels.cache.get(cfg.logChannelId);
   if (!ch?.isTextBased()) return;
-  await ch.send({ embeds: [ui.embed(`🎫 Ticket ${label}`, `**Channel:** ${channel}\n**Actor:** ${actor}`)] }).catch(() => {});
+  await ch.send({ embeds: [ui.embed(`${ui.emoji('ticket')} Ticket ${label}`, `**Channel:** ${channel}\n**Actor:** ${actor}`)] }).catch(() => {});
 }
 
 // =============================================================================
-// SELECT MENU HANDLER
+// SELECT / CHANNEL / ROLE / USER HANDLERS
 // =============================================================================
 async function handleSelect(i) {
   const id = i.customId;
-
   if (id === 'help_select') {
     const c = ui.HELP_CATEGORIES[i.values[0]];
     if (!c) return;
-    return i.update(ui.buildV2({ title: `${c.emoji} ${c.name}`, description: c.desc, components: [ui.helpSelectRow()] }));
+    return i.update(ui.buildV2({ title: `${ui.emoji(c.key)} ${c.name}`, description: c.desc, components: [ui.helpSelectRow()] }));
   }
   if (id === 'setup_module') {
     const mod = ui.SETUP_MODULES.find(m => m.key === i.values[0]);
@@ -888,11 +1051,11 @@ async function handleSelect(i) {
     const val = mod.cfgKey ? mod.cfgKey.split('.').reduce((a, k) => a?.[k], cfg) : null;
     const enabled = typeof val === 'boolean' ? val : val?.enabled;
     return i.update(ui.buildV2({
-      title: `⚙️ ${mod.label}`,
-      description: `**Status:** ${enabled ? '🟢 Enabled' : '⚪ Disabled'}\n\n${mod.desc}`,
+      title: `${ui.emoji(mod.key2)} ${mod.label}`,
+      description: `**Status:** ${enabled ? `${ui.emoji('enabled')} Enabled` : `${ui.emoji('disabled')} Disabled`}\n\n${mod.desc}`,
       components: [ui.row(
         ui.toggleButton(`setup:toggle:${mod.cfgKey}`, !!enabled),
-        ui.btn('setup:back', 'Back', ButtonStyle.Secondary)
+        ui.btn('setup:back', 'Back', ButtonStyle.Secondary, { emoji: ui.emoji('back') })
       )]
     }));
   }
@@ -929,7 +1092,7 @@ async function handleSelect(i) {
     return i.reply({ embeds: [ui.okEmbed('Removed', 'Trigger removed.')], ephemeral: true });
   }
   if (id === 'vm:kick:select') {
-    const vc = i.member.voice.channel;
+    const vc = i.member?.voice?.channel;
     if (!vc) return i.reply({ content: 'You are not in a voice channel.', ephemeral: true });
     const rec = db.getVMChannel(vc.id);
     if (!rec || rec.ownerId !== i.user.id) return i.reply({ content: 'Not allowed.', ephemeral: true });
@@ -939,14 +1102,10 @@ async function handleSelect(i) {
   }
 }
 
-// =============================================================================
-// CHANNEL SELECT HANDLER
-// =============================================================================
 async function handleChannelSelect(i) {
   const id = i.customId;
   const ch = i.values[0];
 
-  // Owner log setup — owner-only
   if (id.startsWith('ownerlogsetup:')) {
     if (!sys.isOwner(i.user.id)) return i.reply({ content: 'Owner only.', ephemeral: true });
     const kind = id.split(':')[1];
@@ -957,20 +1116,27 @@ async function handleChannelSelect(i) {
     return i.update({ ...ui.ownerLogSetupEmbed(cfg), ephemeral: true });
   }
 
-  if (id === 'welcome:channel') { db.saveConfig(i.guildId, { welcome: { channel: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', `Welcome channel: <#${ch}>.`)], ephemeral: true }); }
-  if (id === 'leave:channel') { db.saveConfig(i.guildId, { leave: { channel: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', `Leave channel: <#${ch}>.`)], ephemeral: true }); }
-  if (id === 'greetmsg:channel') { db.saveConfig(i.guildId, { greetmessage: { channelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Greet channel saved.')], ephemeral: true }); }
-  if (id === 'ticket:cfg:category') { db.saveConfig(i.guildId, { ticket: { categoryId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Ticket category set.')], ephemeral: true }); }
-  if (id === 'ticket:cfg:log') { db.saveConfig(i.guildId, { ticket: { logChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Ticket log channel set.')], ephemeral: true }); }
-  if (id === 'leveling:channel') { db.saveConfig(i.guildId, { leveling: { channel: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Level-up channel saved.')], ephemeral: true }); }
-  if (id === 'honeypot:channel') { db.saveConfig(i.guildId, { honeypot: { channelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Honeypot channel set.')], ephemeral: true }); }
-  if (id === 'honeypot:log:select') { db.saveConfig(i.guildId, { honeypot: { logChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Log channel set.')], ephemeral: true }); }
-  if (id === 'vm:cfg:hub') { db.saveConfig(i.guildId, { voicemaster: { hubChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Hub channel saved.')], ephemeral: true }); }
-  if (id === 'vm:cfg:category') { db.saveConfig(i.guildId, { voicemaster: { categoryId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Category saved.')], ephemeral: true }); }
-  if (id === 'app:cfg:review') { db.saveConfig(i.guildId, { staffApplications: { logChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Review channel set.')], ephemeral: true }); }
-  if (id === 'app:cfg:panel') { db.saveConfig(i.guildId, { staffApplications: { panelChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Panel channel saved.')], ephemeral: true }); }
-  if (id === 'bday:cfg:panel') { db.saveConfig(i.guildId, { birthdays: { panelChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Panel channel saved.')], ephemeral: true }); }
-  if (id === 'bday:cfg:wish') { db.saveConfig(i.guildId, { birthdays: { wishChannelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Wish channel saved.')], ephemeral: true }); }
+  const setters = {
+    'welcome:channel': () => ({ welcome: { channel: ch } }),
+    'leave:channel': () => ({ leave: { channel: ch } }),
+    'greetmsg:channel': () => ({ greetmessage: { channelId: ch } }),
+    'ticket:cfg:category': () => ({ ticket: { categoryId: ch } }),
+    'ticket:cfg:log': () => ({ ticket: { logChannelId: ch } }),
+    'leveling:channel': () => ({ leveling: { channel: ch } }),
+    'honeypot:channel': () => ({ honeypot: { channelId: ch } }),
+    'honeypot:log:select': () => ({ honeypot: { logChannelId: ch } }),
+    'vm:cfg:hub': () => ({ voicemaster: { hubChannelId: ch } }),
+    'vm:cfg:category': () => ({ voicemaster: { categoryId: ch } }),
+    'app:cfg:review': () => ({ staffApplications: { logChannelId: ch } }),
+    'app:cfg:panel': () => ({ staffApplications: { panelChannelId: ch } }),
+    'bday:cfg:panel': () => ({ birthdays: { panelChannelId: ch } }),
+    'bday:cfg:wish': () => ({ birthdays: { wishChannelId: ch } }),
+    'greetvoice_cfg:voice': () => ({ greetvoice: { vcId: ch } })
+  };
+  if (setters[id]) {
+    db.saveConfig(i.guildId, setters[id]());
+    return i.reply({ embeds: [ui.okEmbed('Set', `Channel saved: <#${ch}>`)], ephemeral: true });
+  }
   if (id === 'logsetup:channel') {
     const s = getSession(`logs:${i.user.id}`);
     if (!s?.key) return i.reply({ content: 'Pick a category first.', ephemeral: true });
@@ -988,13 +1154,14 @@ async function handleChannelSelect(i) {
   }
 }
 
-// =============================================================================
-// ROLE SELECT HANDLER
-// =============================================================================
 async function handleRoleSelect(i) {
   const id = i.customId;
   const roleId = i.values[0];
   if (id === 'ticket:cfg:support') { db.saveConfig(i.guildId, { ticket: { supportRoleId: roleId } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Support role saved.')], ephemeral: true }); }
+  if (id === 'greetvoice_cfg:role_select') {
+    db.saveConfig(i.guildId, { greetvoice: { roleId } });
+    return i.reply({ embeds: [ui.okEmbed('Set', `Gate role: <@&${roleId}>`)], ephemeral: true });
+  }
   if (id.startsWith('brp:addrole:') || id.startsWith('rrp:addrole:')) {
     const mode = id.startsWith('brp:') ? 'button' : 'reaction';
     const panelId = id.split(':')[2];
@@ -1013,9 +1180,6 @@ async function handleRoleSelect(i) {
   }
 }
 
-// =============================================================================
-// USER SELECT HANDLER
-// =============================================================================
 async function handleUserSelect(i) {
   const id = i.customId;
   const userId = i.values[0];
@@ -1087,12 +1251,9 @@ async function handleModal(i) {
     const match = i.fields.getTextInputValue('match').trim();
     const mode = /^exact$/i.test(i.fields.getTextInputValue('mode').trim()) ? 'exact' : 'contains';
     const cur = db.getConfig(i.guildId)[key];
-    let trigger;
-    if (key === 'autoresponder') {
-      trigger = { id: Math.random().toString(36).slice(2, 10), match, mode, response: i.fields.getTextInputValue('response').trim() };
-    } else {
-      trigger = { id: Math.random().toString(36).slice(2, 10), match, mode, emojis: i.fields.getTextInputValue('emojis').trim().split(/\s+/).filter(Boolean).slice(0, 5) };
-    }
+    const trigger = key === 'autoresponder'
+      ? { id: Math.random().toString(36).slice(2, 10), match, mode, response: i.fields.getTextInputValue('response').trim() }
+      : { id: Math.random().toString(36).slice(2, 10), match, mode, emojis: i.fields.getTextInputValue('emojis').trim().split(/\s+/).filter(Boolean).slice(0, 5) };
     db.saveConfig(i.guildId, { [key]: { triggers: [...(cur.triggers || []), trigger] } });
     return i.reply({ embeds: [ui.okEmbed('Saved', 'Trigger added.')], ephemeral: true });
   }
@@ -1123,7 +1284,7 @@ async function handleModal(i) {
     return i.reply({ embeds: [ui.okEmbed('Renamed', `Channel renamed to \`${name}\`.`)], ephemeral: true });
   }
   if (id === 'vm:rename:modal') {
-    const vc = i.member.voice.channel;
+    const vc = i.member?.voice?.channel;
     if (!vc) return i.reply({ content: 'Not in voice.', ephemeral: true });
     const rec = db.getVMChannel(vc.id);
     if (!rec || rec.ownerId !== i.user.id) return i.reply({ content: 'Not allowed.', ephemeral: true });
@@ -1132,7 +1293,7 @@ async function handleModal(i) {
     return i.reply({ embeds: [ui.okEmbed('Renamed', `Channel is now **${name}**.`)] });
   }
   if (id === 'vm:limit:modal') {
-    const vc = i.member.voice.channel;
+    const vc = i.member?.voice?.channel;
     if (!vc) return i.reply({ content: 'Not in voice.', ephemeral: true });
     const rec = db.getVMChannel(vc.id);
     if (!rec || rec.ownerId !== i.user.id) return i.reply({ content: 'Not allowed.', ephemeral: true });
@@ -1141,7 +1302,7 @@ async function handleModal(i) {
     return i.reply({ embeds: [ui.okEmbed('Set', `User limit: ${limit}.`)] });
   }
   if (id === 'vm:transfer:modal') {
-    const vc = i.member.voice.channel;
+    const vc = i.member?.voice?.channel;
     if (!vc) return i.reply({ content: 'Not in voice.', ephemeral: true });
     const rec = db.getVMChannel(vc.id);
     if (!rec || rec.ownerId !== i.user.id) return i.reply({ content: 'Not allowed.', ephemeral: true });
@@ -1190,8 +1351,8 @@ async function handleModal(i) {
           cfg.questions.slice(0, 5).map((q, n) => ({ name: `${n + 1}. ${q.slice(0, 200)}`, value: (answers[n] || '—').slice(0, 1000), inline: false }))
         );
         const buttons = ui.row(
-          ui.btn(`app:review:accepted:${app.id}`, 'Accept', ButtonStyle.Success),
-          ui.btn(`app:review:denied:${app.id}`, 'Deny', ButtonStyle.Danger)
+          ui.btn(`app:review:accepted:${app.id}`, 'Accept', ButtonStyle.Success, { emoji: ui.emoji('accept') }),
+          ui.btn(`app:review:denied:${app.id}`, 'Deny', ButtonStyle.Danger, { emoji: ui.emoji('deny') })
         );
         ch.send({ embeds: [e], components: [buttons] }).catch(() => {});
       }
@@ -1208,7 +1369,7 @@ async function handleModal(i) {
     const chId = channelRaw.replace(/[<#>]/g, '');
     const ch = i.guild.channels.cache.get(chId);
     if (!ch?.isTextBased()) return i.reply({ content: 'Channel not found.', ephemeral: true });
-    const e = new EmbedBuilder().setColor(color ?? ui.BLACK).setDescription(description).setTimestamp();
+    const e = new EmbedBuilder().setColor(color ?? ui.PRIMARY).setDescription(description).setTimestamp();
     if (title) e.setTitle(title);
     await ch.send({ embeds: [e] }).catch(() => {});
     return i.reply({ embeds: [ui.okEmbed('Posted', `Embed posted in ${ch}.`)], ephemeral: true });
@@ -1216,37 +1377,31 @@ async function handleModal(i) {
 }
 
 // =============================================================================
-// MESSAGE EVENTS
+// MESSAGE EVENT
 // =============================================================================
 client.on('messageCreate', async message => {
   try {
     if (!message.guild || message.author.bot) return;
     const cfg = db.getConfig(message.guild.id);
 
-    // Mention ping reply (bot at the start of the message)
-    if (message.mentions.users.has(client.user.id) && !message.mentions.everyone && message.content.trim().startsWith('<@')) {
+    // Ping reply (bot mention at the start)
+    const botMention = new RegExp(`^<@!?${client.user.id}>\\s*$`);
+    if (botMention.test(message.content.trim())) {
       const prefix = cfg.prefix || '!';
-      return message.reply({ embeds: [ui.embed(`🤖 ${client.user.username}`,
+      return message.reply({ embeds: [ui.embed(`${ui.emoji('bot_user')} ${client.user.username}`,
         `Welcome to **${message.guild.name}**!\n\nStart with **${prefix}help** or **/help**.\n**Prefix:** \`${prefix}\`\n**Ping:** \`${client.ws.ping}ms\``)] }).catch(() => {});
     }
     if (db.getGlobalBlacklist().includes(message.guild.ownerId)) return;
 
-    // Prefix commands (basic support)
+    // Prefix command routing
     const prefix = cfg.prefix || '!';
-    if (message.content.startsWith(prefix)) {
-      const args = message.content.slice(prefix.length).trim().split(/\s+/);
-      const c = args.shift().toLowerCase();
-      if (c === 'help') {
-        await message.reply({ embeds: [ui.embed('AunXz Help', `Use \`/help\` for the full command list.\n**Prefix:** \`${prefix}\``)] }).catch(() => {});
-        return;
-      }
-      if (c === 'ping') {
-        await message.reply({ content: `Pong! WS: ${client.ws.ping}ms` }).catch(() => {});
-        return;
-      }
+    const mentionPattern = new RegExp(`^<@!?${client.user.id}>\\s+`);
+    if (message.content.startsWith(prefix) || mentionPattern.test(message.content)) {
+      const handled = await handlePrefixCommand(message);
+      if (handled) return;
     }
 
-    // Automod (single authoritative path)
+    // Automod
     const blocked = await sys.runAutomod(message).catch(e => { console.error('[automod]', e?.message); return false; });
     if (blocked) return;
 
@@ -1283,7 +1438,7 @@ client.on('messageCreate', async message => {
       const whitelisted = (hp.whitelistRoleIds || []).some(r => message.member?.roles.cache.has(r));
       if (!whitelisted) {
         await message.delete().catch(() => {});
-        await sys.logSecurity(message.guild, { action: '🍯 Honeypot Triggered', target: message.author, outcome: hp.action });
+        await sys.logSecurity(message.guild, { action: `${ui.emoji('honeypot')} Honeypot Triggered`, target: message.author, outcome: hp.action });
         const member = await message.guild.members.fetch(message.author.id).catch(() => null);
         if (member) {
           if (hp.action === 'kick') await member.kick('Honeypot').catch(() => {});
@@ -1293,7 +1448,7 @@ client.on('messageCreate', async message => {
       }
     }
 
-    // Sticky message repost
+    // Sticky repost
     const sticky = db.getSticky(message.channel.id);
     if (sticky?.enabled) scheduleStickyRepost(message.channel.id);
   } catch (e) {
@@ -1301,7 +1456,6 @@ client.on('messageCreate', async message => {
   }
 });
 
-// Sticky repost engine — debounced per channel
 const stickyQueues = new Map();
 function scheduleStickyRepost(channelId) {
   let q = stickyQueues.get(channelId);
@@ -1326,7 +1480,7 @@ function scheduleStickyRepost(channelId) {
 }
 
 // =============================================================================
-// MESSAGE DELETE / UPDATE (snipe + logs)
+// MESSAGE DELETE / UPDATE
 // =============================================================================
 client.on('messageDelete', async message => {
   try {
@@ -1371,7 +1525,6 @@ client.on('messageUpdate', async (oldMsg, newMsg) => {
 // =============================================================================
 client.on('guildMemberAdd', async member => {
   try {
-    // Security checks in parallel
     await Promise.allSettled([
       sys.handleAntiBotJoin(member),
       sys.handleAntiAltJoin(member),
@@ -1386,7 +1539,7 @@ client.on('guildMemberAdd', async member => {
           user: `<@${member.id}>`, username: member.user.username,
           server: member.guild.name, count: member.guild.memberCount
         });
-        const e = new EmbedBuilder().setColor(ui.BLACK).setDescription(text).setTimestamp();
+        const e = new EmbedBuilder().setColor(ui.PRIMARY).setDescription(text).setTimestamp();
         if (cfg.greetmessage.title) e.setTitle(cfg.greetmessage.title);
         if (cfg.greetmessage.showAvatar !== false) e.setThumbnail(member.user.displayAvatarURL({ size: 256 }));
         if (cfg.greetmessage.image) e.setImage(cfg.greetmessage.image);
@@ -1421,7 +1574,7 @@ client.on('guildMemberAdd', async member => {
       if (valid.length) await member.roles.add(valid).catch(() => {});
     }
     await sys.logMember(member.guild, {
-      action: '📥 Member Joined', target: member.user,
+      action: `${ui.emoji('member_join')} Member Joined`, target: member.user,
       extra: { Account: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>` }
     });
   } catch (e) { await logError(e, 'guildMemberAdd', { guildId: member.guild?.id }); }
@@ -1438,20 +1591,20 @@ client.on('guildMemberRemove', async member => {
       }
     }
     if (member.roles?.cache?.size) db.setStickyRoles(member.guild.id, member.id, member.roles.cache.filter(r => r.id !== member.guild.id).map(r => r.id));
-    await sys.logMember(member.guild, { action: '📤 Member Left', target: member.user });
+    await sys.logMember(member.guild, { action: `${ui.emoji('member_leave')} Member Left`, target: member.user });
   } catch (e) { await logError(e, 'guildMemberRemove', { guildId: member.guild?.id }); }
 });
 
 client.on('guildMemberUpdate', async (oldM, newM) => {
   try {
     if (oldM.nickname !== newM.nickname) {
-      await sys.logMember(newM.guild, { action: 'Nickname Changed', target: newM.user, extra: { Before: oldM.nickname || '—', After: newM.nickname || '—' } });
+      await sys.logMember(newM.guild, { action: `${ui.emoji('nick')} Nickname Changed`, target: newM.user, extra: { Before: oldM.nickname || '—', After: newM.nickname || '—' } });
     }
     const added = newM.roles.cache.filter(r => !oldM.roles.cache.has(r.id));
     const removed = oldM.roles.cache.filter(r => !newM.roles.cache.has(r.id));
     if (added.size || removed.size) {
       await sys.logMember(newM.guild, {
-        action: 'Roles Updated', target: newM.user,
+        action: `${ui.emoji('roles')} Roles Updated`, target: newM.user,
         extra: {
           Added: added.size ? added.map(r => `<@&${r.id}>`).join(', ').slice(0, 500) : '—',
           Removed: removed.size ? removed.map(r => `<@&${r.id}>`).join(', ').slice(0, 500) : '—'
@@ -1469,7 +1622,7 @@ client.on('guildMemberUpdate', async (oldM, newM) => {
 });
 
 // =============================================================================
-// AUDIT-LOG EVENTS
+// AUDIT LOG EVENTS
 // =============================================================================
 client.on('channelCreate', async ch => {
   if (!ch.guild) return;
@@ -1510,11 +1663,11 @@ client.on('roleDelete', async role => {
 client.on('guildBanAdd', async ban => {
   const exec = await sys.auditExecutor(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
   if (exec) await sys.antinukeStrike(ban.guild, exec.id, 'ban').catch(() => {});
-  await sys.logMod(ban.guild, { action: '🔨 Member Banned', target: ban.user, moderator: exec });
+  await sys.logMod(ban.guild, { action: `${ui.emoji('ban')} Member Banned`, target: ban.user, moderator: exec });
 });
 client.on('guildBanRemove', async ban => {
   const exec = await sys.auditExecutor(ban.guild, AuditLogEvent.MemberBanRemove, ban.user.id);
-  await sys.logMod(ban.guild, { action: '✅ Member Unbanned', target: ban.user, moderator: exec });
+  await sys.logMod(ban.guild, { action: `${ui.emoji('undo')} Member Unbanned`, target: ban.user, moderator: exec });
 });
 client.on('webhookUpdate', async channel => {
   await sys.handleAntiWebhookCreate(channel).catch(() => {});
@@ -1537,7 +1690,7 @@ client.on('voiceStateUpdate', async (oldS, newS) => {
 });
 
 // =============================================================================
-// SHUTDOWN
+// SHUTDOWN + LOGIN
 // =============================================================================
 async function shutdown(sig) {
   console.log(`\n${sig} received — shutting down.`);
@@ -1548,9 +1701,6 @@ async function shutdown(sig) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-// =============================================================================
-// LOGIN
-// =============================================================================
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('❌ Login failed:', err.message);
   process.exit(1);
