@@ -5,10 +5,9 @@ console.log('[AunXz] Booting…');
 
 const {
   Client, GatewayIntentBits, Partials, REST, Routes,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder,
-  ChannelSelectMenuBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder,
-  ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder,
-  PermissionFlagsBits, AuditLogEvent
+  ButtonStyle, StringSelectMenuBuilder, ChannelSelectMenuBuilder,
+  UserSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle,
+  ActionRowBuilder, EmbedBuilder, PermissionFlagsBits, AuditLogEvent
 } = require('discord.js');
 const db = require('./database');
 const sys = require('./systems');
@@ -38,10 +37,8 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.DirectMessages
   ],
-  partials: [Partials.Channel, Partialels_Message, Partials.GuildMember, Partials.Reaction].filter(Boolean)
+  partials: [Partials.Channel, Partials.Message, Partials.GuildMember, Partials.Reaction]
 });
-// NOTE: replace `Partialels_Message` above with `Partials.Message` if it errored — kept
-// here as a single typo-guard so a copy/paste error can't silently hide a real issue.
 
 // =============================================================================
 // RUNTIME SESSIONS
@@ -84,10 +81,8 @@ client.once('ready', async () => {
   console.log(`   Database: ${db.DB_PATH}`);
   client.user.setActivity('/help', { type: 3 });
 
-  // ---- Command registration -----------------------------------------------
-  // Public commands register GLOBALLY (available in every server).
-  // Owner-only commands register ONLY to GUILD_ID / OWNER_GUILD_ID so they
-  // never appear in other servers' slash menus.
+  // ---- Command registration ---------------------------------------------
+  // Public commands → global. Owner-only commands → GUILD_ID / OWNER_GUILD_ID.
   try {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
@@ -105,10 +100,10 @@ client.once('ready', async () => {
     }
   } catch (e) { await logError(e, 'Command registration'); }
 
-  // Prime automod cache for every guild
+  // Prime automod cache for every guild the bot is in
   for (const g of client.guilds.cache.values()) sys.refreshAutomod(g.id);
 
-  // ---- Giveaway scheduler -------------------------------------------------
+  // ---- Giveaway scheduler -----------------------------------------------
   setInterval(async () => {
     try {
       const now = Date.now();
@@ -133,26 +128,54 @@ client.once('ready', async () => {
     } catch (e) { console.error('giveaway tick', e?.message); }
   }, 15000).unref?.();
 
-  // ---- Join tracker pruning -----------------------------------------------
+  // ---- Join tracker pruning ---------------------------------------------
   setInterval(() => {
     for (const g of client.guilds.cache.values()) db.pruneJoins(g.id, 3600);
   }, 300000).unref?.();
 
-  // ---- Scheduled events runner -------------------------------------------
+  // ---- Birthday wishes (once per hour, dedupe per day) ------------------
+  const birthdaySent = new Map(); // "guild:user:yyyy-mm-dd" -> ts
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const month = now.getUTCMonth() + 1, day = now.getUTCDate();
+      const dayToken = now.toISOString().slice(0, 10);
+      const rows = db.birthdaysFor(month, day);
+      for (const r of rows) {
+        const guild = client.guilds.cache.get(r.guildId);
+        if (!guild) continue;
+        const cfg = db.getConfig(guild.id).birthdays;
+        if (!cfg.enabled || !cfg.wishChannelId) continue;
+        const key = `${r.guildId}:${r.userId}:${dayToken}`;
+        if (birthdaySent.has(key)) continue;
+        birthdaySent.set(key, Date.now());
+        const ch = guild.channels.cache.get(cfg.wishChannelId);
+        if (ch?.isTextBased()) {
+          const text = sys.applyTemplate(cfg.wishMessage || 'Happy Birthday {user}!', { user: `<@${r.userId}>` });
+          ch.send({ content: text, allowedMentions: { users: [r.userId] } }).catch(() => {});
+        }
+      }
+      // prune
+      const cutoff = Date.now() - 8 * 86400000;
+      for (const [k, ts] of birthdaySent) if (ts < cutoff) birthdaySent.delete(k);
+    } catch (e) { console.error('birthday tick', e?.message); }
+  }, 3600000).unref?.();
+
+  // ---- Scheduled events runner ------------------------------------------
   setInterval(async () => {
     try {
       const due = db.dueEvents(Date.now(), 25);
-      for (const ev of due) {
-        db.deleteEvent(ev.id);
-        // Currently no scheduled event kinds are used by default.
-      }
+      for (const ev of due) db.deleteEvent(ev.id);
     } catch (e) { console.error('scheduled tick', e?.message); }
   }, 30000).unref?.();
 });
 
 function uniqueByName(list) {
   const seen = new Set();
-  return list.filter(b => { if (seen.has(b.name)) { console.warn(`[AunXz] Duplicate slash registration skipped: /${b.name}`); return false; } seen.add(b.name); return true; });
+  return list.filter(b => {
+    if (seen.has(b.name)) { console.warn(`[AunXz] Duplicate slash registration skipped: /${b.name}`); return false; }
+    seen.add(b.name); return true;
+  });
 }
 
 // =============================================================================
@@ -160,20 +183,25 @@ function uniqueByName(list) {
 // =============================================================================
 client.on('interactionCreate', async interaction => {
   try {
+    // Autocomplete short-circuit
+    if (interaction.isAutocomplete()) return;
+
     // Global blacklist
     if (interaction.user && db.getGlobalBlacklist().includes(interaction.user.id)) {
       return interaction.reply({ content: 'You are blocked from using AunXz.', ephemeral: true }).catch(() => {});
     }
-    // Maintenance mode
+    // Maintenance mode (owner bypasses)
     if (db.getOwnerConfig().maintenance && !sys.isOwner(interaction.user.id)) {
       return interaction.reply({ content: 'AunXz is in maintenance mode.', ephemeral: true }).catch(() => {});
     }
 
-    if (interaction.isAutocomplete()) return;
-
     if (interaction.isChatInputCommand()) {
       const c = cmd.commands.find(x => x.data.name === interaction.commandName);
       if (!c) return;
+      // Owner-only safety: check even if Discord let the command through
+      if (c.ownerOnly && !sys.isOwner(interaction.user.id)) {
+        return interaction.reply({ embeds: [ui.errEmbed('Denied', 'Owner only.')], ephemeral: true }).catch(() => {});
+      }
       const disabled = db.getToggle(interaction.commandName);
       if (disabled && !sys.isOwner(interaction.user.id)) {
         return interaction.reply({
@@ -184,12 +212,12 @@ client.on('interactionCreate', async interaction => {
       return await c.execute(interaction);
     }
 
-    if (interaction.isStringSelectMenu()) return await handleSelect(interaction);
+    if (interaction.isStringSelectMenu())  return await handleSelect(interaction);
     if (interaction.isChannelSelectMenu()) return await handleChannelSelect(interaction);
-    if (interaction.isRoleSelectMenu()) return await handleRoleSelect(interaction);
-    if (interaction.isUserSelectMenu()) return await handleUserSelect(interaction);
-    if (interaction.isButton()) return await handleButton(interaction);
-    if (interaction.isModalSubmit()) return await handleModal(interaction);
+    if (interaction.isRoleSelectMenu())    return await handleRoleSelect(interaction);
+    if (interaction.isUserSelectMenu())    return await handleUserSelect(interaction);
+    if (interaction.isButton())            return await handleButton(interaction);
+    if (interaction.isModalSubmit())       return await handleModal(interaction);
   } catch (e) {
     await logError(e, `Interaction ${interaction.commandName || interaction.customId || interaction.id}`, {
       command: interaction.commandName,
@@ -210,10 +238,10 @@ client.on('interactionCreate', async interaction => {
 async function handleButton(i) {
   const id = i.customId;
 
-  // Help
+  // ---- Help ---------------------------------------------------------------
   if (id === 'help:refresh') return i.update(ui.helpMenuEmbed(i.client));
 
-  // Setup extras
+  // ---- Setup extras -------------------------------------------------------
   if (id === 'setup:health') {
     await i.deferReply({ ephemeral: true });
     const issues = await sys.healthCheck(i.guild);
@@ -267,7 +295,7 @@ async function handleButton(i) {
     return i.update({ ...e, ephemeral: true });
   }
 
-  // Ticket panel opener (button fallback — the select menu is the primary path)
+  // ---- Ticket opener (button fallback) ------------------------------------
   if (id === 'ticket:open') {
     await i.deferReply({ ephemeral: true });
     try {
@@ -277,7 +305,7 @@ async function handleButton(i) {
     return;
   }
 
-  // Ticket controls
+  // ---- Ticket controls ----------------------------------------------------
   if (id === 'ticket:claim' || id === 'ticket:unclaim') {
     const t = db.getTicket(i.channel.id);
     if (!t) return i.reply({ embeds: [ui.errEmbed('Not a ticket', 'This works only inside a ticket.')], ephemeral: true });
@@ -342,7 +370,10 @@ async function handleButton(i) {
     const cfg = db.getConfig(i.guildId).ticket;
     if (cfg.logChannelId) {
       const logCh = i.guild.channels.cache.get(cfg.logChannelId);
-      if (logCh?.isTextBased()) logCh.send({ content: `Transcript for <#${i.channel.id}>`, files: [{ attachment: buf, name: `transcript-${i.channel.id}.txt` }] }).catch(() => {});
+      if (logCh?.isTextBased()) logCh.send({
+        content: `Transcript for <#${i.channel.id}>`,
+        files: [{ attachment: buf, name: `transcript-${i.channel.id}.txt` }]
+      }).catch(() => {});
     }
     return i.editReply({ content: 'Transcript', files: [{ attachment: buf, name: `transcript-${i.channel.id}.txt` }] });
   }
@@ -359,7 +390,7 @@ async function handleButton(i) {
     return;
   }
 
-  // Ticket config
+  // ---- Ticket config ------------------------------------------------------
   if (id === 'ticket:cfg:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cfg = db.getConfig(i.guildId).ticket;
@@ -374,7 +405,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Posted', 'Panel is live.')], ephemeral: true });
   }
 
-  // Giveaway entry
+  // ---- Giveaway entry -----------------------------------------------------
   if (id.startsWith('giveaway:enter:')) {
     const gid = parseInt(id.split(':')[2], 10);
     const g = db.getGiveaway(i.guildId, gid);
@@ -387,13 +418,13 @@ async function handleButton(i) {
     return i.reply({ content: has ? 'You left the giveaway.' : `Entered! ${participants.length} participant(s).`, ephemeral: true });
   }
 
-  // Snipe navigation
+  // ---- Snipe navigation ---------------------------------------------------
   if (id.startsWith('snipe:nav:')) {
     const [, , guildId, channelId, offsetStr] = id.split(':');
     return i.update({ ...sys.snipeView(guildId, channelId, parseInt(offsetStr, 10)), ephemeral: true });
   }
 
-  // VoiceMaster controls
+  // ---- VoiceMaster controls -----------------------------------------------
   if (id.startsWith('vm_')) {
     const vc = i.member.voice.channel;
     if (!vc || !db.getVMChannel(vc.id)) return i.reply({ embeds: [ui.errEmbed('No channel', 'Join your VoiceMaster channel first.')], ephemeral: true });
@@ -435,8 +466,6 @@ async function handleButton(i) {
     }
     return;
   }
-
-  // VoiceMaster setup panel
   if (id === 'vm:cfg:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).voicemaster;
@@ -450,7 +479,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // AutoMod
+  // ---- AutoMod ------------------------------------------------------------
   if (id === 'automod:toggle' || id === 'automod:caps' || id === 'automod:invite' || id === 'automod:words') {
     if (!cmd.requireAdmin(i)) return;
     const cfg = db.getConfig(i.guildId).automod;
@@ -468,7 +497,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Updated', 'AutoMod settings updated.')], ephemeral: true });
   }
 
-  // Bad-word
+  // ---- Bad-word -----------------------------------------------------------
   if (id === 'badword:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).antibadword;
@@ -485,7 +514,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // Welcome / Leave
+  // ---- Welcome / Leave ----------------------------------------------------
   if (id === 'welcome:toggle' || id === 'leave:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const key = id.split(':')[0];
@@ -503,7 +532,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // Greet message
+  // ---- Greet message ------------------------------------------------------
   if (id === 'greetmsg:toggle' || id === 'greetmsg:ping') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).greetmessage;
@@ -528,7 +557,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [e], ephemeral: true });
   }
 
-  // Leveling
+  // ---- Leveling -----------------------------------------------------------
   if (id === 'leveling:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).leveling;
@@ -554,7 +583,7 @@ async function handleButton(i) {
     return i.showModal(modal);
   }
 
-  // Honeypot
+  // ---- Honeypot -----------------------------------------------------------
   if (id === 'honeypot:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).honeypot;
@@ -563,10 +592,10 @@ async function handleButton(i) {
   }
   if (id === 'honeypot:log') {
     return i.reply({ embeds: [ui.infoEmbed('Set log channel', 'Pick a channel below.')],
-      components: [ui.row(new ChannelSelectMenuBuilder().setCustomId('honeypot:log:select').setPlaceholder('Log channel').setChannelTypes(ChannelType.GuildText))], ephemeral: true });
+      components: [ui.row(new ChannelSelectMenuBuilder().setCustomId('honeypot:log:select').setPlaceholder('Log channel').addChannelTypes(0))], ephemeral: true });
   }
 
-  // Auto responder / reactor
+  // ---- Auto responder / reactor -------------------------------------------
   if (id === 'ar:toggle' || id === 'arr:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const key = id === 'ar:toggle' ? 'autoresponder' : 'autoreactor';
@@ -592,7 +621,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Updated', `Case ${!cur.ignoreCase ? 'insensitive' : 'sensitive'}.`)], ephemeral: true });
   }
 
-  // Role panels
+  // ---- Role panels (button + reaction) ------------------------------------
   if (id.startsWith('brp:') || id.startsWith('rrp:')) {
     if (!cmd.requireAdmin(i)) return;
     const [, action, panelId] = id.split(':');
@@ -659,7 +688,7 @@ async function handleButton(i) {
     return;
   }
 
-  // Role button click
+  // ---- Role button click --------------------------------------------------
   if (id.startsWith('rolebtn:')) {
     const [, panelId, roleId] = id.split(':');
     const panel = db.findPanel(i.guildId, 'button', panelId);
@@ -676,7 +705,7 @@ async function handleButton(i) {
     } catch { return i.reply({ embeds: [ui.errEmbed('Failed', 'Role change failed.')], ephemeral: true }); }
   }
 
-  // Applications — Apply
+  // ---- Staff applications -------------------------------------------------
   if (id === 'staffapp:apply') {
     const cfg = db.getConfig(i.guildId).staffApplications;
     if (!cfg.enabled || !(cfg.questions || []).length) return i.reply({ embeds: [ui.errEmbed('Unavailable', 'Applications not open.')], ephemeral: true });
@@ -699,8 +728,6 @@ async function handleButton(i) {
     if (user) user.send({ embeds: [ui.embed(`Application ${decision}`, `Your application has been **${decision}** by ${i.user.tag}.`)] }).catch(() => {});
     return i.update({ embeds: [ui.okEmbed('Recorded', `Application #${app.id} ${decision}.`)], components: [] });
   }
-
-  // Application setup buttons
   if (id === 'app:cfg:toggle') {
     if (!cmd.requireAdmin(i)) return;
     const cur = db.getConfig(i.guildId).staffApplications;
@@ -730,7 +757,7 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Posted', `Posted in ${ch}.`)], ephemeral: true });
   }
 
-  // Birthday
+  // ---- Birthdays ----------------------------------------------------------
   if (id === 'bday:set') {
     const modal = new ModalBuilder().setCustomId('bday:set:modal').setTitle('Set Birthday');
     modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('Birthday (DD-MM)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)));
@@ -762,17 +789,17 @@ async function handleButton(i) {
     return i.reply({ embeds: [ui.okEmbed('Posted', `Posted in ${ch}.`)], ephemeral: true });
   }
 
-  // Template generator
+  // ---- Template generator -------------------------------------------------
   if (id.startsWith('tgen:type:')) {
     const type = id.split(':')[2];
     const sid = setSession(`tgen:${i.user.id}`, { type, step: 'naming' });
-    const row = ui.row(
+    const r = ui.row(
       ui.btn(`tgen:naming:${sid}:emoji_divider`, 'Emoji + Divider', ButtonStyle.Secondary),
       ui.btn(`tgen:naming:${sid}:tree`, 'Tree Structure', ButtonStyle.Secondary),
       ui.btn(`tgen:naming:${sid}:decorative`, 'Decorative', ButtonStyle.Secondary),
       ui.btn(`tgen:naming:${sid}:minimal`, 'Minimal', ButtonStyle.Secondary)
     );
-    return i.update({ embeds: [ui.embed('Step 2', `Type: **${type}**. Choose naming style.`)], components: [row] });
+    return i.update({ embeds: [ui.embed('Step 2', `Type: **${type}**. Choose naming style.`)], components: [r] });
   }
   if (id.startsWith('tgen:naming:')) {
     const [, , sid, style] = id.split(':');
@@ -804,9 +831,9 @@ async function handleButton(i) {
         )]
       });
       return i.editReply(e);
-    } catch (e) {
-      await logError(e, 'templategen');
-      return i.editReply({ embeds: [ui.errEmbed('Failed', String(e.message))] });
+    } catch (err) {
+      await logError(err, 'templategen');
+      return i.editReply({ embeds: [ui.errEmbed('Failed', String(err.message))] });
     }
   }
   if (id.startsWith('tgen:apply:')) {
@@ -829,10 +856,12 @@ async function handleButton(i) {
     return i.update({ embeds: [ui.infoEmbed('Cancelled', 'No changes made.')], components: [] });
   }
 
+  // ---- No match -----------------------------------------------------------
+  // Silently ignore unknown buttons rather than crash.
   return;
 }
 
-// Small helper for logging ticket state changes to the ticket log channel
+// Ticket log helper (called from the claim handler above)
 async function logTicketChange(guild, channel, label, actor) {
   const cfg = db.getConfig(guild.id).ticket;
   if (!cfg.logChannelId) return;
@@ -846,6 +875,7 @@ async function logTicketChange(guild, channel, label, actor) {
 // =============================================================================
 async function handleSelect(i) {
   const id = i.customId;
+
   if (id === 'help_select') {
     const c = ui.HELP_CATEGORIES[i.values[0]];
     if (!c) return;
@@ -910,11 +940,23 @@ async function handleSelect(i) {
 }
 
 // =============================================================================
-// CHANNEL / ROLE / USER SELECT HANDLERS
+// CHANNEL SELECT HANDLER
 // =============================================================================
 async function handleChannelSelect(i) {
   const id = i.customId;
   const ch = i.values[0];
+
+  // Owner log setup — owner-only
+  if (id.startsWith('ownerlogsetup:')) {
+    if (!sys.isOwner(i.user.id)) return i.reply({ content: 'Owner only.', ephemeral: true });
+    const kind = id.split(':')[1];
+    const patch = kind === 'error' ? { errorChannelId: ch }
+      : kind === 'online' ? { onlineChannelId: ch }
+      : { joinChannelId: ch };
+    const cfg = db.saveOwnerConfig(patch);
+    return i.update({ ...ui.ownerLogSetupEmbed(cfg), ephemeral: true });
+  }
+
   if (id === 'welcome:channel') { db.saveConfig(i.guildId, { welcome: { channel: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', `Welcome channel: <#${ch}>.`)], ephemeral: true }); }
   if (id === 'leave:channel') { db.saveConfig(i.guildId, { leave: { channel: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', `Leave channel: <#${ch}>.`)], ephemeral: true }); }
   if (id === 'greetmsg:channel') { db.saveConfig(i.guildId, { greetmessage: { channelId: ch } }); return i.reply({ embeds: [ui.okEmbed('Set', 'Greet channel saved.')], ephemeral: true }); }
@@ -946,6 +988,9 @@ async function handleChannelSelect(i) {
   }
 }
 
+// =============================================================================
+// ROLE SELECT HANDLER
+// =============================================================================
 async function handleRoleSelect(i) {
   const id = i.customId;
   const roleId = i.values[0];
@@ -968,6 +1013,9 @@ async function handleRoleSelect(i) {
   }
 }
 
+// =============================================================================
+// USER SELECT HANDLER
+// =============================================================================
 async function handleUserSelect(i) {
   const id = i.customId;
   const userId = i.values[0];
@@ -1165,27 +1213,7 @@ async function handleModal(i) {
     await ch.send({ embeds: [e] }).catch(() => {});
     return i.reply({ embeds: [ui.okEmbed('Posted', `Embed posted in ${ch}.`)], ephemeral: true });
   }
-  if (id.startsWith('ownerlogsetup:')) {
-    // Triggered by the channel select flow, not a modal — handled below.
-  }
 }
-
-// Owner log channel selects (handled through channel select)
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChannelSelectMenu?.()) return;
-  if (!interaction.customId.startsWith('ownerlogsetup:')) return;
-  try {
-    if (!sys.isOwner(interaction.user.id)) {
-      return interaction.reply({ content: 'Owner only.', ephemeral: true }).catch(() => {});
-    }
-    const kind = interaction.customId.split(':')[1];
-    const patch = kind === 'error' ? { errorChannelId: interaction.values[0] }
-      : kind === 'online' ? { onlineChannelId: interaction.values[0] }
-      : { joinChannelId: interaction.values[0] };
-    const cfg = db.saveOwnerConfig(patch);
-    return interaction.update({ ...ui.ownerLogSetupEmbed(cfg), ephemeral: true });
-  } catch (e) { await logError(e, 'ownerlogsetup'); }
-});
 
 // =============================================================================
 // MESSAGE EVENTS
@@ -1195,13 +1223,28 @@ client.on('messageCreate', async message => {
     if (!message.guild || message.author.bot) return;
     const cfg = db.getConfig(message.guild.id);
 
-    // Ping reply
+    // Mention ping reply (bot at the start of the message)
     if (message.mentions.users.has(client.user.id) && !message.mentions.everyone && message.content.trim().startsWith('<@')) {
       const prefix = cfg.prefix || '!';
       return message.reply({ embeds: [ui.embed(`🤖 ${client.user.username}`,
         `Welcome to **${message.guild.name}**!\n\nStart with **${prefix}help** or **/help**.\n**Prefix:** \`${prefix}\`\n**Ping:** \`${client.ws.ping}ms\``)] }).catch(() => {});
     }
     if (db.getGlobalBlacklist().includes(message.guild.ownerId)) return;
+
+    // Prefix commands (basic support)
+    const prefix = cfg.prefix || '!';
+    if (message.content.startsWith(prefix)) {
+      const args = message.content.slice(prefix.length).trim().split(/\s+/);
+      const c = args.shift().toLowerCase();
+      if (c === 'help') {
+        await message.reply({ embeds: [ui.embed('AunXz Help', `Use \`/help\` for the full command list.\n**Prefix:** \`${prefix}\``)] }).catch(() => {});
+        return;
+      }
+      if (c === 'ping') {
+        await message.reply({ content: `Pong! WS: ${client.ws.ping}ms` }).catch(() => {});
+        return;
+      }
+    }
 
     // Automod (single authoritative path)
     const blocked = await sys.runAutomod(message).catch(e => { console.error('[automod]', e?.message); return false; });
@@ -1328,7 +1371,7 @@ client.on('messageUpdate', async (oldMsg, newMsg) => {
 // =============================================================================
 client.on('guildMemberAdd', async member => {
   try {
-    // Security checks run in parallel
+    // Security checks in parallel
     await Promise.allSettled([
       sys.handleAntiBotJoin(member),
       sys.handleAntiAltJoin(member),
@@ -1377,7 +1420,10 @@ client.on('guildMemberAdd', async member => {
       const valid = sticky.filter(r => { const role = member.guild.roles.cache.get(r); return role && role.position < me.roles.highest.position; });
       if (valid.length) await member.roles.add(valid).catch(() => {});
     }
-    await sys.logMember(member.guild, { action: '📥 Member Joined', target: member.user, extra: { Account: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>` } });
+    await sys.logMember(member.guild, {
+      action: '📥 Member Joined', target: member.user,
+      extra: { Account: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>` }
+    });
   } catch (e) { await logError(e, 'guildMemberAdd', { guildId: member.guild?.id }); }
 });
 
