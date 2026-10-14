@@ -1,16 +1,27 @@
 {
   "name": "aunxz",
-  "version": "3.1.0",
+  "version": "3.2.0",
+  "description": "AunXz — all-in-one Discord server management platform with voice greeting, tickets, logging, AI, and full customization.",
   "main": "index.js",
   "type": "commonjs",
-  "engines": { "node": ">=20.10.0" },
+  "engines": {
+    "node": ">=20.10.0"
+  },
   "scripts": {
     "start": "node index.js",
+    "dev": "node --watch index.js",
     "check": "node --check index.js && node --check commands.js && node --check systems.js && node --check ui.js && node --check database.js"
   },
   "dependencies": {
+    "@discordjs/opus": "^0.9.0",
+    "@discordjs/voice": "^0.18.0",
+    "@snazzah/davey": "^0.1.6",
     "better-sqlite3": "^11.3.0",
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "google-tts-api": "^2.0.2",
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.1.1"
   }
 }
