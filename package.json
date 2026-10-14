@@ -1,17 +1,16 @@
 {
   "name": "aunxz",
-  "version": "3.0.0",
-  "description": "AunXz — all-in-one Discord server management platform.",
+  "version": "3.1.0",
   "main": "index.js",
   "type": "commonjs",
   "engines": { "node": ">=20.10.0" },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check commands.js && node --check systems.js && node --check database.js"
+    "check": "node --check index.js && node --check commands.js && node --check systems.js && node --check ui.js && node --check database.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
-    "discord.js": "^14.15.0",
+    "discord.js": "^14.16.3",
     "dotenv": "^16.4.5"
   }
 }
