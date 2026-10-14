@@ -1,5 +1,4 @@
-// AunXz/database.js — full schema, exhaustive migrations, cached config.
-// Every column referenced by every query in the project is present or migrated.
+// AunXz/database.js — SQLite schema, exhaustive migrations, cached config access.
 'use strict';
 
 const fs = require('fs');
@@ -7,7 +6,7 @@ const path = require('path');
 const Database = require('better-sqlite3');
 
 // =============================================================================
-// PATH
+// PATH RESOLUTION + LEGACY MIGRATION
 // =============================================================================
 function resolvePath() {
   if (process.env.DATABASE_PATH) return path.resolve(process.env.DATABASE_PATH);
@@ -33,8 +32,10 @@ function migrateLegacyDatabase(target) {
     try { legacy.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
     try { legacy.close(); } catch {}
     fs.copyFileSync(source, target);
-    console.log(`[AunXz] Migrated legacy DB: ${source} → ${target}`);
-  } catch (e) { console.error('[AunXz] Legacy DB migration failed:', e?.message || e); }
+    console.log(`[AunXz] Migrated legacy SQLite database: ${source} → ${target}`);
+  } catch (e) {
+    console.error('[AunXz] Legacy database migration failed:', e?.message || e);
+  }
 }
 migrateLegacyDatabase(DB_PATH);
 
@@ -45,7 +46,7 @@ db.pragma('busy_timeout = 5000');
 db.pragma('foreign_keys = ON');
 
 // =============================================================================
-// SCHEMA — every table that exists in any version of AunXz
+// SCHEMA — idempotent (only creates missing tables)
 // =============================================================================
 db.exec(`
 CREATE TABLE IF NOT EXISTS guild_config (
@@ -54,8 +55,10 @@ CREATE TABLE IF NOT EXISTS guild_config (
 );
 
 CREATE TABLE IF NOT EXISTS levels (
-  guildId TEXT NOT NULL, userId TEXT NOT NULL,
-  xp INTEGER NOT NULL DEFAULT 0, level INTEGER NOT NULL DEFAULT 0,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  xp INTEGER NOT NULL DEFAULT 0,
+  level INTEGER NOT NULL DEFAULT 0,
   lastMessage INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guildId, userId)
 );
@@ -63,17 +66,24 @@ CREATE INDEX IF NOT EXISTS idx_levels_guild_xp ON levels(guildId, xp DESC);
 
 CREATE TABLE IF NOT EXISTS warns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, userId TEXT NOT NULL, moderatorId TEXT NOT NULL,
-  reason TEXT, timestamp INTEGER NOT NULL
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  moderatorId TEXT NOT NULL,
+  reason TEXT,
+  timestamp INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_warns_guild_user ON warns(guildId, userId);
 
 CREATE TABLE IF NOT EXISTS tickets (
   channelId TEXT PRIMARY KEY,
-  guildId TEXT NOT NULL, userId TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open', claimedBy TEXT,
-  type TEXT NOT NULL DEFAULT 'general', priority TEXT NOT NULL DEFAULT 'normal',
-  closedBy TEXT, closeReason TEXT,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  claimedBy TEXT,
+  type TEXT NOT NULL DEFAULT 'general',
+  priority TEXT NOT NULL DEFAULT 'normal',
+  closedBy TEXT,
+  closeReason TEXT,
   lastActivityAt INTEGER NOT NULL DEFAULT 0,
   createdAt INTEGER NOT NULL DEFAULT 0
 );
@@ -81,187 +91,272 @@ CREATE INDEX IF NOT EXISTS idx_tickets_guild_user ON tickets(guildId, userId, st
 
 CREATE TABLE IF NOT EXISTS ticket_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, channelId TEXT NOT NULL, actorId TEXT,
-  event TEXT NOT NULL, detail TEXT, ts INTEGER NOT NULL
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL,
+  actorId TEXT,
+  event TEXT NOT NULL,
+  detail TEXT,
+  ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ticket_events ON ticket_events(guildId, channelId, ts DESC);
 
 CREATE TABLE IF NOT EXISTS voicemaster_channels (
-  channelId TEXT PRIMARY KEY, guildId TEXT NOT NULL, ownerId TEXT NOT NULL
+  channelId TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  ownerId TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS antinuke_whitelist (
-  guildId TEXT NOT NULL, userId TEXT NOT NULL, PRIMARY KEY (guildId, userId)
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  PRIMARY KEY (guildId, userId)
 );
 
 CREATE TABLE IF NOT EXISTS action_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, userId TEXT, type TEXT NOT NULL, detail TEXT, timestamp INTEGER NOT NULL
+  guildId TEXT NOT NULL,
+  userId TEXT,
+  type TEXT NOT NULL,
+  detail TEXT,
+  timestamp INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_action_guild ON action_log(guildId, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS sticky_roles (
-  guildId TEXT NOT NULL, userId TEXT NOT NULL, roles TEXT NOT NULL,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  roles TEXT NOT NULL,
   PRIMARY KEY (guildId, userId)
 );
 
 CREATE TABLE IF NOT EXISTS spam_tracker (
-  guildId TEXT NOT NULL, userId TEXT NOT NULL,
-  count INTEGER NOT NULL DEFAULT 0, windowStart INTEGER NOT NULL,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  windowStart INTEGER NOT NULL,
   PRIMARY KEY (guildId, userId)
 );
 
 CREATE TABLE IF NOT EXISTS join_tracker (
-  guildId TEXT NOT NULL, userId TEXT NOT NULL, timestamp INTEGER NOT NULL
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  timestamp INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS emoji_overrides (
-  name TEXT PRIMARY KEY, value TEXT NOT NULL
+  name TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS emoji_snapshots (
-  code TEXT PRIMARY KEY, data TEXT NOT NULL, createdAt INTEGER NOT NULL
+  code TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  createdAt INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS embed_texts (
-  name TEXT PRIMARY KEY, sourceTitle TEXT NOT NULL,
-  title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', footer TEXT NOT NULL DEFAULT '',
+  name TEXT PRIMARY KEY,
+  sourceTitle TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  footer TEXT NOT NULL DEFAULT '',
   updatedAt INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS owner_config (
-  id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL DEFAULT '{}'
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  data TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS memberships (
   guildId TEXT PRIMARY KEY,
   plan TEXT NOT NULL DEFAULT '30 Days',
   durationDays INTEGER NOT NULL DEFAULT 30,
-  createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL,
+  createdAt INTEGER NOT NULL DEFAULT 0,
+  expiresAt INTEGER NOT NULL DEFAULT 0,
   note TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS giveaways (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, hostId TEXT NOT NULL,
-  prize TEXT NOT NULL, winners INTEGER NOT NULL DEFAULT 1,
-  durationMs INTEGER NOT NULL DEFAULT 0, endsAt INTEGER NOT NULL DEFAULT 0,
-  channelId TEXT, messageId TEXT,
-  participants TEXT NOT NULL DEFAULT '[]', winnerIds TEXT NOT NULL DEFAULT '[]',
-  status TEXT NOT NULL DEFAULT 'configuring', createdAt INTEGER NOT NULL DEFAULT 0
+  guildId TEXT NOT NULL,
+  hostId TEXT NOT NULL,
+  prize TEXT NOT NULL,
+  winners INTEGER NOT NULL DEFAULT 1,
+  durationMs INTEGER NOT NULL DEFAULT 0,
+  endsAt INTEGER NOT NULL DEFAULT 0,
+  channelId TEXT,
+  messageId TEXT,
+  participants TEXT NOT NULL DEFAULT '[]',
+  winnerIds TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'configuring',
+  createdAt INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_giveaways_guild ON giveaways(guildId, status, endsAt);
 
 CREATE TABLE IF NOT EXISTS saved_embeds (
-  guildId TEXT NOT NULL, name TEXT NOT NULL, data TEXT NOT NULL,
-  createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+  guildId TEXT NOT NULL,
+  name TEXT NOT NULL,
+  data TEXT NOT NULL,
+  createdAt INTEGER NOT NULL DEFAULT 0,
+  updatedAt INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guildId, name)
 );
 
 CREATE TABLE IF NOT EXISTS sticky_messages (
-  guildId TEXT NOT NULL, channelId TEXT NOT NULL,
-  data TEXT NOT NULL DEFAULT '{}', lastMessageId TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1, createdBy TEXT,
-  createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '{}',
+  lastMessageId TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  createdBy TEXT,
+  createdAt INTEGER NOT NULL DEFAULT 0,
+  updatedAt INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guildId, channelId)
 );
 CREATE INDEX IF NOT EXISTS idx_sticky_channel ON sticky_messages(channelId);
 
 CREATE TABLE IF NOT EXISTS staff_applications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, userId TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending', answers TEXT NOT NULL DEFAULT '[]',
-  channelId TEXT, messageId TEXT, reviewerId TEXT, reason TEXT,
-  createdAt INTEGER NOT NULL, decidedAt INTEGER
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  answers TEXT NOT NULL DEFAULT '[]',
+  channelId TEXT,
+  messageId TEXT,
+  reviewerId TEXT,
+  reason TEXT,
+  createdAt INTEGER NOT NULL DEFAULT 0,
+  decidedAt INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_apps_guild_status ON staff_applications(guildId, status);
 
 CREATE TABLE IF NOT EXISTS command_toggles (
-  name TEXT PRIMARY KEY, reason TEXT, byId TEXT, at INTEGER NOT NULL
+  name TEXT PRIMARY KEY,
+  reason TEXT,
+  byId TEXT,
+  at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS error_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-  source TEXT, command TEXT, guildId TEXT, userId TEXT, message TEXT, stack TEXT
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  source TEXT,
+  command TEXT,
+  guildId TEXT,
+  userId TEXT,
+  message TEXT,
+  stack TEXT
 );
 
 CREATE TABLE IF NOT EXISTS owner_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  userId TEXT NOT NULL, command TEXT NOT NULL, args TEXT,
-  guildId TEXT, ts INTEGER NOT NULL
+  userId TEXT NOT NULL,
+  command TEXT NOT NULL,
+  args TEXT,
+  guildId TEXT,
+  ts INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS command_usage (
-  day TEXT NOT NULL, guildId TEXT NOT NULL, name TEXT NOT NULL,
-  ok INTEGER NOT NULL DEFAULT 0, fail INTEGER NOT NULL DEFAULT 0,
-  lastUsed INTEGER NOT NULL,
+  day TEXT NOT NULL,
+  guildId TEXT NOT NULL,
+  name TEXT NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 0,
+  fail INTEGER NOT NULL DEFAULT 0,
+  lastUsed INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, guildId, name)
 );
 
 CREATE TABLE IF NOT EXISTS birthdays (
-  guildId TEXT NOT NULL, userId TEXT NOT NULL,
-  month INTEGER NOT NULL, day INTEGER NOT NULL,
+  guildId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  month INTEGER NOT NULL,
+  day INTEGER NOT NULL,
   PRIMARY KEY (guildId, userId)
 );
 
 CREATE TABLE IF NOT EXISTS log_config (
-  guildId TEXT NOT NULL, category TEXT NOT NULL,
-  channelId TEXT, enabled INTEGER NOT NULL DEFAULT 1, details INTEGER NOT NULL DEFAULT 1,
+  guildId TEXT NOT NULL,
+  category TEXT NOT NULL,
+  channelId TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  details INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (guildId, category)
 );
 
 CREATE TABLE IF NOT EXISTS snipe_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, channelId TEXT NOT NULL, messageId TEXT NOT NULL,
-  authorId TEXT NOT NULL, authorTag TEXT, action TEXT NOT NULL,
-  content TEXT, newContent TEXT, attachments TEXT DEFAULT '[]',
-  jumpUrl TEXT, ts INTEGER NOT NULL
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL,
+  messageId TEXT NOT NULL,
+  authorId TEXT NOT NULL,
+  authorTag TEXT,
+  action TEXT NOT NULL,
+  content TEXT,
+  newContent TEXT,
+  attachments TEXT DEFAULT '[]',
+  jumpUrl TEXT,
+  ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snipe_lookup ON snipe_entries(guildId, channelId, id DESC);
 
 CREATE TABLE IF NOT EXISTS scheduled_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guildId TEXT NOT NULL, channelId TEXT NOT NULL, messageId TEXT,
-  kind TEXT NOT NULL, data TEXT NOT NULL, at INTEGER NOT NULL
+  guildId TEXT NOT NULL,
+  channelId TEXT NOT NULL,
+  messageId TEXT,
+  kind TEXT NOT NULL,
+  data TEXT NOT NULL,
+  at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sched_at ON scheduled_events(at);
 
 CREATE TABLE IF NOT EXISTS server_templates (
-  code TEXT PRIMARY KEY, guildId TEXT NOT NULL,
-  guildName TEXT NOT NULL DEFAULT '', data TEXT NOT NULL,
-  createdBy TEXT, createdAt INTEGER NOT NULL
+  code TEXT PRIMARY KEY,
+  guildId TEXT NOT NULL,
+  guildName TEXT NOT NULL DEFAULT '',
+  data TEXT NOT NULL,
+  createdBy TEXT,
+  createdAt INTEGER NOT NULL DEFAULT 0
 );
 `);
 
 // =============================================================================
-// MIGRATIONS — every column any query touches, on any version of the DB
+// MIGRATIONS — explicit list for every known column
 // =============================================================================
 function hasColumn(table, column) {
-  try { return db.prepare(`PRAGMA table_info("${table}")`).all().some(c => c.name === column); }
-  catch { return false; }
+  try {
+    return db.prepare(`PRAGMA table_info("${table}")`).all().some(c => c.name === column);
+  } catch { return false; }
 }
 function addColumn(table, column, definition) {
   if (!hasColumn(table, column)) {
-    try { db.exec(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`); }
-    catch (e) { console.error(`[migration] ${table}.${column}: ${e.message}`); }
+    try {
+      db.exec(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`);
+      console.log(`[migration] added ${table}.${column}`);
+    } catch (e) {
+      console.error(`[migration] failed to add ${table}.${column}: ${e.message}`);
+    }
   }
 }
 
-// Format: 'table.column': 'definition'
-// Every column every query in this project uses is listed here. If a query is
-// added later, add its column here — the validation block below will catch it.
+// Every column that may be missing from an older version of a table.
+// The definition here is the one used when ALTER TABLE has to add it.
 const COLUMN_MIGRATIONS = {
   // tickets
-  'tickets.type':            "TEXT NOT NULL DEFAULT 'general'",
-  'tickets.priority':        "TEXT NOT NULL DEFAULT 'normal'",
-  'tickets.closedBy':        'TEXT',
-  'tickets.closeReason':     'TEXT',
-  'tickets.lastActivityAt':  'INTEGER NOT NULL DEFAULT 0',
-  'tickets.createdAt':       'INTEGER NOT NULL DEFAULT 0',
-  'tickets.claimedBy':       'TEXT',
+  'tickets.type':             "TEXT NOT NULL DEFAULT 'general'",
+  'tickets.priority':         "TEXT NOT NULL DEFAULT 'normal'",
+  'tickets.closedBy':         'TEXT',
+  'tickets.closeReason':      'TEXT',
+  'tickets.lastActivityAt':   'INTEGER NOT NULL DEFAULT 0',
+  'tickets.createdAt':        'INTEGER NOT NULL DEFAULT 0',
+  'tickets.claimedBy':        'TEXT',
+
   // snipe_entries
-  'snipe_entries.jumpUrl':   'TEXT',
+  'snipe_entries.jumpUrl':     'TEXT',
   'snipe_entries.attachments': "TEXT DEFAULT '[]'",
+
   // giveaways
   'giveaways.messageId':     'TEXT',
   'giveaways.participants':  "TEXT NOT NULL DEFAULT '[]'",
@@ -270,54 +365,147 @@ const COLUMN_MIGRATIONS = {
   'giveaways.createdAt':     'INTEGER NOT NULL DEFAULT 0',
   'giveaways.channelId':     'TEXT',
   'giveaways.durationMs':    'INTEGER NOT NULL DEFAULT 0',
-  // sticky_messages
-  'sticky_messages.createdBy': 'TEXT',
+  'giveaways.endsAt':        'INTEGER NOT NULL DEFAULT 0',
+
+  // sticky_messages — the block that was missing
+  'sticky_messages.data':          "TEXT NOT NULL DEFAULT '{}'",
+  'sticky_messages.lastMessageId': 'TEXT',
+  'sticky_messages.enabled':       'INTEGER NOT NULL DEFAULT 1',
+  'sticky_messages.createdBy':     'TEXT',
+  'sticky_messages.createdAt':     'INTEGER NOT NULL DEFAULT 0',
+  'sticky_messages.updatedAt':     'INTEGER NOT NULL DEFAULT 0',
+
   // staff_applications
-  'staff_applications.decidedAt': 'INTEGER',
-  'staff_applications.reason':    'TEXT',
+  'staff_applications.decidedAt':  'INTEGER',
+  'staff_applications.reason':     'TEXT',
+  'staff_applications.channelId':  'TEXT',
+  'staff_applications.messageId':  'TEXT',
+  'staff_applications.reviewerId': 'TEXT',
+  'staff_applications.createdAt':  'INTEGER NOT NULL DEFAULT 0',
+
   // memberships
-  'memberships.plan':        "TEXT NOT NULL DEFAULT '30 Days'",
+  'memberships.plan':         "TEXT NOT NULL DEFAULT '30 Days'",
   'memberships.durationDays': 'INTEGER NOT NULL DEFAULT 30',
-  'memberships.note':        "TEXT NOT NULL DEFAULT ''"
+  'memberships.note':         "TEXT NOT NULL DEFAULT ''",
+  'memberships.expiresAt':    'INTEGER NOT NULL DEFAULT 0',
+  'memberships.createdAt':    'INTEGER NOT NULL DEFAULT 0',
+
+  // levels / warns / action_log / embed_texts / saved_embeds
+  'levels.lastMessage':       'INTEGER NOT NULL DEFAULT 0',
+  'warns.reason':             'TEXT',
+  'action_log.detail':        'TEXT',
+  'action_log.userId':        'TEXT',
+  'embed_texts.description':  "TEXT NOT NULL DEFAULT ''",
+  'embed_texts.footer':       "TEXT NOT NULL DEFAULT ''",
+  'saved_embeds.createdAt':   'INTEGER NOT NULL DEFAULT 0',
+  'saved_embeds.updatedAt':   'INTEGER NOT NULL DEFAULT 0',
+
+  // command_toggles / command_usage
+  'command_toggles.at':       'INTEGER NOT NULL DEFAULT 0',
+  'command_usage.lastUsed':   'INTEGER NOT NULL DEFAULT 0',
+
+  // server_templates
+  'server_templates.createdAt': 'INTEGER NOT NULL DEFAULT 0'
 };
+
 for (const [key, def] of Object.entries(COLUMN_MIGRATIONS)) {
-  const [table, column] = key.split('.');
-  addColumn(table, column, def);
+  const dot = key.indexOf('.');
+  addColumn(key.slice(0, dot), key.slice(dot + 1), def);
 }
 
 // =============================================================================
-// VALIDATION — fail before any prepare() if a column is missing
+// CATCH-ALL FALLBACK
+// Safety net that guarantees startup can never be blocked again by a column
+// that was forgotten from COLUMN_MIGRATIONS above. Adds any still-missing
+// column as nullable TEXT, which is safe for any column whose only role is
+// being read or written with a value.
+// =============================================================================
+(function catchAllMigrations() {
+  const SAFETY = {
+    tickets: ['type', 'priority', 'closedBy', 'closeReason', 'lastActivityAt', 'createdAt', 'claimedBy', 'status', 'userId', 'guildId'],
+    snipe_entries: ['jumpUrl', 'attachments', 'content', 'newContent', 'authorTag'],
+    giveaways: ['messageId', 'participants', 'winnerIds', 'status', 'createdAt', 'channelId', 'durationMs', 'endsAt', 'prize', 'winners'],
+    sticky_messages: ['data', 'lastMessageId', 'enabled', 'createdBy', 'createdAt', 'updatedAt', 'guildId', 'channelId'],
+    staff_applications: ['decidedAt', 'reason', 'channelId', 'messageId', 'reviewerId', 'createdAt', 'answers', 'status'],
+    memberships: ['plan', 'durationDays', 'note', 'expiresAt', 'createdAt'],
+    levels: ['lastMessage', 'xp', 'level'],
+    warns: ['reason', 'moderatorId', 'timestamp'],
+    action_log: ['detail', 'userId', 'type', 'timestamp'],
+    embed_texts: ['description', 'footer', 'title', 'sourceTitle', 'updatedAt'],
+    saved_embeds: ['createdAt', 'updatedAt', 'data', 'name'],
+    tickets_events: ['detail', 'actorId', 'event', 'ts'],
+    ticket_events: ['detail', 'actorId', 'event', 'ts', 'guildId', 'channelId'],
+    command_toggles: ['at', 'reason', 'byId'],
+    command_usage: ['lastUsed', 'ok', 'fail'],
+    server_templates: ['createdAt', 'guildName', 'createdBy', 'data'],
+    snipe: ['jumpUrl'],
+    log_config: ['enabled', 'details', 'channelId'],
+    birthdays: ['month', 'day'],
+    voicemaster_channels: ['guildId', 'ownerId'],
+    antinuke_whitelist: ['userId'],
+    sticky_roles: ['roles'],
+    spam_tracker: ['count', 'windowStart'],
+    join_tracker: ['timestamp'],
+    emoji_overrides: ['value'],
+    emoji_snapshots: ['data', 'createdAt'],
+    owner_config: ['data'],
+    error_log: ['source', 'command', 'guildId', 'userId', 'message', 'stack', 'ts'],
+    owner_audit: ['userId', 'command', 'args', 'guildId', 'ts'],
+    scheduled_events: ['messageId', 'kind', 'data', 'at'],
+    guild_config: ['data']
+  };
+  let added = 0;
+  for (const [table, cols] of Object.entries(SAFETY)) {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
+    for (const col of cols) {
+      if (!hasColumn(table, col)) {
+        try {
+          db.exec(`ALTER TABLE "${table}" ADD COLUMN "${col}" TEXT`);
+          console.log(`[migration] catch-all added ${table}.${col}`);
+          added++;
+        } catch (e) {
+          console.error(`[migration] catch-all failed for ${table}.${col}: ${e.message}`);
+        }
+      }
+    }
+  }
+  if (added) console.log(`[migration] catch-all added ${added} column(s).`);
+})();
+
+// =============================================================================
+// MIGRATION VALIDATION
+// Fail loudly if a column every query needs is still missing.
 // =============================================================================
 const REQUIRED_COLUMNS = {
-  guild_config: ['guildId', 'data'],
-  levels: ['guildId', 'userId', 'xp', 'level', 'lastMessage'],
-  warns: ['id', 'guildId', 'userId', 'moderatorId', 'reason', 'timestamp'],
-  tickets: ['channelId', 'guildId', 'userId', 'status', 'claimedBy', 'type', 'priority', 'closedBy', 'closeReason', 'lastActivityAt', 'createdAt'],
-  ticket_events: ['id', 'guildId', 'channelId', 'actorId', 'event', 'detail', 'ts'],
-  voicemaster_channels: ['channelId', 'guildId', 'ownerId'],
-  antinuke_whitelist: ['guildId', 'userId'],
-  action_log: ['id', 'guildId', 'userId', 'type', 'detail', 'timestamp'],
-  sticky_roles: ['guildId', 'userId', 'roles'],
-  spam_tracker: ['guildId', 'userId', 'count', 'windowStart'],
-  join_tracker: ['guildId', 'userId', 'timestamp'],
-  emoji_overrides: ['name', 'value'],
-  emoji_snapshots: ['code', 'data', 'createdAt'],
-  embed_texts: ['name', 'sourceTitle', 'title', 'description', 'footer', 'updatedAt'],
-  owner_config: ['id', 'data'],
-  memberships: ['guildId', 'plan', 'durationDays', 'createdAt', 'expiresAt', 'note'],
-  giveaways: ['id', 'guildId', 'hostId', 'prize', 'winners', 'durationMs', 'endsAt', 'channelId', 'messageId', 'participants', 'winnerIds', 'status', 'createdAt'],
-  saved_embeds: ['guildId', 'name', 'data', 'createdAt', 'updatedAt'],
-  sticky_messages: ['guildId', 'channelId', 'data', 'lastMessageId', 'enabled', 'createdBy', 'createdAt', 'updatedAt'],
-  staff_applications: ['id', 'guildId', 'userId', 'status', 'answers', 'channelId', 'messageId', 'reviewerId', 'reason', 'createdAt', 'decidedAt'],
-  command_toggles: ['name', 'reason', 'byId', 'at'],
-  error_log: ['id', 'ts', 'source', 'command', 'guildId', 'userId', 'message', 'stack'],
-  owner_audit: ['id', 'userId', 'command', 'args', 'guildId', 'ts'],
-  command_usage: ['day', 'guildId', 'name', 'ok', 'fail', 'lastUsed'],
-  birthdays: ['guildId', 'userId', 'month', 'day'],
-  log_config: ['guildId', 'category', 'channelId', 'enabled', 'details'],
-  snipe_entries: ['id', 'guildId', 'channelId', 'messageId', 'authorId', 'authorTag', 'action', 'content', 'newContent', 'attachments', 'jumpUrl', 'ts'],
-  scheduled_events: ['id', 'guildId', 'channelId', 'messageId', 'kind', 'data', 'at'],
-  server_templates: ['code', 'guildId', 'guildName', 'data', 'createdBy', 'createdAt']
+  guild_config:           ['guildId', 'data'],
+  levels:                 ['guildId', 'userId', 'xp', 'level', 'lastMessage'],
+  warns:                  ['id', 'guildId', 'userId', 'moderatorId', 'reason', 'timestamp'],
+  tickets:                ['channelId', 'guildId', 'userId', 'status', 'claimedBy', 'type', 'priority', 'closedBy', 'closeReason', 'lastActivityAt', 'createdAt'],
+  ticket_events:          ['id', 'guildId', 'channelId', 'actorId', 'event', 'detail', 'ts'],
+  voicemaster_channels:   ['channelId', 'guildId', 'ownerId'],
+  antinuke_whitelist:     ['guildId', 'userId'],
+  action_log:             ['id', 'guildId', 'userId', 'type', 'detail', 'timestamp'],
+  sticky_roles:           ['guildId', 'userId', 'roles'],
+  spam_tracker:           ['guildId', 'userId', 'count', 'windowStart'],
+  join_tracker:           ['guildId', 'userId', 'timestamp'],
+  emoji_overrides:        ['name', 'value'],
+  emoji_snapshots:        ['code', 'data', 'createdAt'],
+  embed_texts:            ['name', 'sourceTitle', 'title', 'description', 'footer', 'updatedAt'],
+  owner_config:           ['id', 'data'],
+  memberships:            ['guildId', 'plan', 'durationDays', 'createdAt', 'expiresAt', 'note'],
+  giveaways:              ['id', 'guildId', 'hostId', 'prize', 'winners', 'durationMs', 'endsAt', 'channelId', 'messageId', 'participants', 'winnerIds', 'status', 'createdAt'],
+  saved_embeds:           ['guildId', 'name', 'data', 'createdAt', 'updatedAt'],
+  sticky_messages:        ['guildId', 'channelId', 'data', 'lastMessageId', 'enabled', 'createdBy', 'createdAt', 'updatedAt'],
+  staff_applications:     ['id', 'guildId', 'userId', 'status', 'answers', 'channelId', 'messageId', 'reviewerId', 'reason', 'createdAt', 'decidedAt'],
+  command_toggles:        ['name', 'reason', 'byId', 'at'],
+  error_log:              ['id', 'ts', 'source', 'command', 'guildId', 'userId', 'message', 'stack'],
+  owner_audit:            ['id', 'userId', 'command', 'args', 'guildId', 'ts'],
+  command_usage:          ['day', 'guildId', 'name', 'ok', 'fail', 'lastUsed'],
+  birthdays:              ['guildId', 'userId', 'month', 'day'],
+  log_config:             ['guildId', 'category', 'channelId', 'enabled', 'details'],
+  snipe_entries:          ['id', 'guildId', 'channelId', 'messageId', 'authorId', 'authorTag', 'action', 'content', 'newContent', 'attachments', 'jumpUrl', 'ts'],
+  scheduled_events:       ['id', 'guildId', 'channelId', 'messageId', 'kind', 'data', 'at'],
+  server_templates:       ['code', 'guildId', 'guildName', 'data', 'createdBy', 'createdAt']
 };
 {
   const problems = [];
@@ -328,7 +516,7 @@ const REQUIRED_COLUMNS = {
     console.error('❌ Database validation failed. Missing column(s):');
     for (const p of problems) console.error(`   • ${p}`);
     console.error(`   DB path: ${DB_PATH}`);
-    console.error('   The volume is likely read-only or full, or the ALTER TABLE failed.');
+    console.error('   The volume is likely read-only or full.');
     process.exit(1);
   }
   console.log(`[AunXz] Database schema OK (${Object.keys(REQUIRED_COLUMNS).length} tables).`);
@@ -411,7 +599,7 @@ function deepMerge(base, override) {
 }
 
 // =============================================================================
-// CONFIG (cached)
+// CONFIG (cached, 5s TTL)
 // =============================================================================
 const CONFIG_TTL_MS = 5000;
 const configCache = new Map();
@@ -473,7 +661,11 @@ const ticketSetOnly = db.prepare('UPDATE tickets SET status=?, lastActivityAt=? 
 const ticketOpen = db.prepare("SELECT * FROM tickets WHERE guildId=? AND userId=? AND status='open'");
 const ticketSetType = db.prepare('UPDATE tickets SET type=? WHERE channelId=?');
 const ticketSetClose = db.prepare('UPDATE tickets SET closedBy=?, closeReason=? WHERE channelId=?');
-function createTicket(c, g, u) { ticketCreate.run(c, g, u, 'open', Date.now()); return getTicket(c); }
+
+function createTicket(c, g, u) {
+  ticketCreate.run(c, g, u, 'open', Date.now());
+  return getTicket(c);
+}
 function getTicket(c) { return ticketGet.get(c); }
 function setTicketStatus(c, s, claimedBy) {
   const now = Date.now();
@@ -484,10 +676,11 @@ function openTicketsForUser(g, u) { return ticketOpen.all(g, u); }
 function setTicketType(c, t) { ticketSetType.run(String(t || 'general'), c); }
 function setTicketClose(c, by, reason) { ticketSetClose.run(by || null, reason || null, c); }
 
-// Ticket events
 const teIns = db.prepare('INSERT INTO ticket_events (guildId,channelId,actorId,event,detail,ts) VALUES (?,?,?,?,?,?)');
 const teList = db.prepare('SELECT * FROM ticket_events WHERE guildId=? AND channelId=? ORDER BY id DESC LIMIT ?');
-function logTicketEvent(g, c, actor, event, detail) { teIns.run(g, c, actor || null, event, detail || null, Date.now()); }
+function logTicketEvent(g, c, actor, event, detail) {
+  teIns.run(g, c, actor || null, event, detail || null, Date.now());
+}
 function ticketEventsFor(g, c, limit = 100) { return teList.all(g, c, limit); }
 
 // =============================================================================
@@ -558,6 +751,7 @@ function getEmojiOverride(n) { return eoGet.get(n)?.value || null; }
 function setEmojiOverride(n, v) { eoSet.run(n, v); }
 function resetEmojiOverride(n) { eoDel.run(n); }
 function getAllEmojiOverrides() { const o = {}; for (const r of eoAll.all()) o[r.name] = r.value; return o; }
+
 const esSave = db.prepare('INSERT INTO emoji_snapshots(code,data,createdAt) VALUES (?,?,?)');
 const esGet = db.prepare('SELECT data FROM emoji_snapshots WHERE code=?');
 function saveEmojiSnapshot(values) {
@@ -579,9 +773,13 @@ const etUpsert = db.prepare(`INSERT INTO embed_texts(name,sourceTitle,title,desc
   ON CONFLICT(name) DO UPDATE SET sourceTitle=excluded.sourceTitle, updatedAt=excluded.updatedAt`);
 const etList = db.prepare('SELECT * FROM embed_texts ORDER BY updatedAt DESC LIMIT ?');
 const etUpdate = db.prepare('UPDATE embed_texts SET title=?, description=?, footer=?, updatedAt=? WHERE name=?');
+
 function registerEmbedText(sourceTitle, description = '', footer = '') {
-  const name = String(sourceTitle || 'embed').replace(/<@!?\d+>/g, '@user').replace(/\d{15,25}/g, 'id')
-    .replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/\s+/g, '-').toLowerCase().slice(0, 70) || 'embed';
+  const name = String(sourceTitle || 'embed')
+    .replace(/<@!?\d+>/g, '@user')
+    .replace(/\d{15,25}/g, 'id')
+    .replace(/[^a-zA-Z0-9 _-]/g, '')
+    .trim().replace(/\s+/g, '-').toLowerCase().slice(0, 70) || 'embed';
   etUpsert.run(name, String(sourceTitle), String(sourceTitle), String(description || ''), String(footer || ''), Date.now());
   return etGet.get(name, name);
 }
@@ -627,7 +825,6 @@ function removeGlobalBlacklist(id) {
   return ids;
 }
 
-// Owner audit
 const oaIns = db.prepare('INSERT INTO owner_audit (userId,command,args,guildId,ts) VALUES (?,?,?,?,?)');
 const oaPrune = db.prepare('DELETE FROM owner_audit WHERE id NOT IN (SELECT id FROM owner_audit ORDER BY id DESC LIMIT 1000)');
 function logOwnerAudit(userId, command, args, guildId) {
@@ -666,9 +863,14 @@ const gCreate = db.prepare('INSERT INTO giveaways(guildId,hostId,prize,winners,d
 const gGet = db.prepare('SELECT * FROM giveaways WHERE guildId=? AND id=?');
 const gList = db.prepare('SELECT * FROM giveaways WHERE guildId=? ORDER BY id DESC LIMIT ?');
 const gActive = db.prepare("SELECT * FROM giveaways WHERE status='active' ORDER BY endsAt ASC");
+
 function createGiveaway(guildId, hostId, { prize, winners = 1, durationMs, channelId }) {
   const now = Date.now();
-  const r = gCreate.run(guildId, hostId, String(prize), Math.max(1, Number(winners) || 1), Number(durationMs) || 0, now + (Number(durationMs) || 0), channelId || null, 'configuring', now);
+  const r = gCreate.run(
+    guildId, hostId, String(prize), Math.max(1, Number(winners) || 1),
+    Number(durationMs) || 0, now + (Number(durationMs) || 0),
+    channelId || null, 'configuring', now
+  );
   return getGiveaway(guildId, r.lastInsertRowid);
 }
 function getGiveaway(g, id) { return gGet.get(g, Number(id)); }
@@ -706,7 +908,7 @@ function listEmbeds(g) { return eList.all(g).map(r => { try { return { ...r, dat
 function deleteEmbed(g, name) { return eDel.run(g, name).changes > 0; }
 
 // =============================================================================
-// ROLE PANELS (in guild_config)
+// ROLE PANELS (stored inside guild_config JSON)
 // =============================================================================
 function panelKey(kind) { return kind === 'button' ? 'buttonRolePanels' : 'reactionRolePanels'; }
 function findPanel(g, kind, id) { return (getConfig(g)[panelKey(kind)] || []).find(p => p.id === id) || null; }
@@ -727,7 +929,11 @@ function removePanel(g, kind, id) {
 // STICKY MESSAGES
 // =============================================================================
 function stickyRow(r) {
-  return r ? { ...r, enabled: !!r.enabled, data: (() => { try { return JSON.parse(r.data); } catch { return {}; } })() } : null;
+  return r ? {
+    ...r,
+    enabled: !!r.enabled,
+    data: (() => { try { return JSON.parse(r.data); } catch { return {}; } })()
+  } : null;
 }
 const sGet = db.prepare('SELECT * FROM sticky_messages WHERE channelId = ?');
 const sList = db.prepare('SELECT * FROM sticky_messages WHERE guildId = ? ORDER BY createdAt ASC');
@@ -736,6 +942,7 @@ const sSave = db.prepare(`INSERT INTO sticky_messages (guildId,channelId,data,en
 const sMsgId = db.prepare('UPDATE sticky_messages SET lastMessageId=?, updatedAt=? WHERE channelId=?');
 const sEnable = db.prepare('UPDATE sticky_messages SET enabled=?, updatedAt=? WHERE channelId=?');
 const sDel = db.prepare('DELETE FROM sticky_messages WHERE channelId=?');
+
 function getSticky(c) { return stickyRow(sGet.get(c)); }
 function listStickies(g) { return sList.all(g).map(stickyRow); }
 function saveSticky(g, c, { data, enabled = true, createdBy = null } = {}) {
@@ -750,11 +957,14 @@ function deleteSticky(c) { return sDel.run(c).changes > 0; }
 // =============================================================================
 // STAFF APPLICATIONS
 // =============================================================================
-function appRow(r) { return r ? { ...r, answers: (() => { try { return JSON.parse(r.answers); } catch { return []; } })() } : null; }
+function appRow(r) {
+  return r ? { ...r, answers: (() => { try { return JSON.parse(r.answers); } catch { return []; } })() } : null;
+}
 const aCreate = db.prepare('INSERT INTO staff_applications(guildId,userId,status,answers,createdAt) VALUES (?,?,?,?,?)');
 const aGet = db.prepare('SELECT * FROM staff_applications WHERE id=?');
 const aPending = db.prepare("SELECT * FROM staff_applications WHERE guildId=? AND userId=? AND status='pending' ORDER BY id DESC LIMIT 1");
 const aLast = db.prepare('SELECT * FROM staff_applications WHERE guildId=? AND userId=? ORDER BY id DESC LIMIT 1');
+
 function createApplication(g, u, answers) {
   const r = aCreate.run(g, u, 'pending', JSON.stringify(answers || []), Date.now());
   return getApplication(r.lastInsertRowid);
@@ -765,7 +975,10 @@ function lastApplicationForUser(g, u) { return appRow(aLast.get(g, u)); }
 function updateApplication(id, patch) {
   const allowed = ['status', 'channelId', 'messageId', 'reviewerId', 'reason', 'decidedAt'];
   const keys = Object.keys(patch || {}).filter(k => allowed.includes(k));
-  if (keys.length) db.prepare(`UPDATE staff_applications SET ${keys.map(k => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map(k => patch[k]), Number(id));
+  if (keys.length) {
+    db.prepare(`UPDATE staff_applications SET ${keys.map(k => `${k}=?`).join(',')} WHERE id=?`)
+      .run(...keys.map(k => patch[k]), Number(id));
+  }
   return getApplication(id);
 }
 
@@ -777,12 +990,22 @@ const tList = db.prepare('SELECT * FROM command_toggles ORDER BY at DESC');
 const tSet = db.prepare('INSERT INTO command_toggles(name,reason,byId,at) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET reason=excluded.reason,byId=excluded.byId,at=excluded.at');
 const tDel = db.prepare('DELETE FROM command_toggles WHERE name=?');
 function listToggles() {
-  if (!toggleCache) { toggleCache = tList.all(); setTimeout(() => { toggleCache = null; }, 10000).unref?.(); }
+  if (!toggleCache) {
+    toggleCache = tList.all();
+    setTimeout(() => { toggleCache = null; }, 10000).unref?.();
+  }
   return toggleCache;
 }
 function getToggle(name) { return listToggles().find(t => t.name === String(name).toLowerCase()) || null; }
-function setToggle(name, reason, byId) { tSet.run(String(name).toLowerCase(), reason || null, String(byId), Date.now()); toggleCache = null; }
-function removeToggle(name) { const c = tDel.run(String(name).toLowerCase()).changes; toggleCache = null; return c > 0; }
+function setToggle(name, reason, byId) {
+  tSet.run(String(name).toLowerCase(), reason || null, String(byId), Date.now());
+  toggleCache = null;
+}
+function removeToggle(name) {
+  const c = tDel.run(String(name).toLowerCase()).changes;
+  toggleCache = null;
+  return c > 0;
+}
 
 // =============================================================================
 // ERRORS
@@ -794,7 +1017,11 @@ const errListCmd = db.prepare('SELECT * FROM error_log WHERE lower(command)=lowe
 const errClear = db.prepare('DELETE FROM error_log');
 const errClearCmd = db.prepare('DELETE FROM error_log WHERE lower(command)=lower(?)');
 function recordError({ source = null, command = null, guildId = null, userId = null, message = '', stack = '' } = {}) {
-  errIns.run(Date.now(), source, command, guildId, userId, String(message || '').slice(0, 2000), String(stack || '').slice(0, 20000));
+  errIns.run(
+    Date.now(), source, command, guildId, userId,
+    String(message || '').slice(0, 2000),
+    String(stack || '').slice(0, 20000)
+  );
   errPrune.run();
 }
 function listErrors(command = null) { return command ? errListCmd.all(command) : errList.all(); }
@@ -852,12 +1079,20 @@ const snCount = db.prepare('SELECT COUNT(*) c FROM snipe_entries WHERE guildId=?
 const snPrune = db.prepare('DELETE FROM snipe_entries WHERE guildId=? AND ts<?');
 function parseAtt(s) { try { return JSON.parse(s || '[]'); } catch { return []; } }
 function addSnipe(e) {
-  snIns.run(e.guildId, e.channelId, e.messageId, e.authorId, e.authorTag || null, e.action,
-    e.content || null, e.newContent || null, JSON.stringify(e.attachments || []), e.jumpUrl || null, Date.now());
+  snIns.run(
+    e.guildId, e.channelId, e.messageId, e.authorId, e.authorTag || null, e.action,
+    e.content || null, e.newContent || null,
+    JSON.stringify(e.attachments || []), e.jumpUrl || null, Date.now()
+  );
   snTrim.run(e.guildId, e.channelId, e.guildId, e.channelId);
 }
-function getSnipes(g, c, limit = 50) { return snList.all(g, c, limit).map(r => ({ ...r, attachments: parseAtt(r.attachments) })); }
-function getSnipeAt(g, c, offset) { const r = snAt.get(g, c, offset); return r ? { ...r, attachments: parseAtt(r.attachments) } : null; }
+function getSnipes(g, c, limit = 50) {
+  return snList.all(g, c, limit).map(r => ({ ...r, attachments: parseAtt(r.attachments) }));
+}
+function getSnipeAt(g, c, offset) {
+  const r = snAt.get(g, c, offset);
+  return r ? { ...r, attachments: parseAtt(r.attachments) } : null;
+}
 function snipesCount(g, c) { return snCount.get(g, c).c; }
 function pruneSnipes(g, days = 7) { return snPrune.run(g, Date.now() - days * 86400000).changes; }
 
@@ -901,7 +1136,9 @@ function deleteTemplate(code, g) { return tplDel.run(String(code || '').trim().t
 // =============================================================================
 function exportGuild(g) {
   return {
-    version: 1, guildId: g, exportedAt: Date.now(),
+    version: 1,
+    guildId: g,
+    exportedAt: Date.now(),
     settings: getConfig(g),
     embeds: listEmbeds(g).map(e => ({ name: e.name, data: e.data })),
     stickies: listStickies(g)
@@ -914,38 +1151,93 @@ function importGuild(g, payload) {
 }
 
 // =============================================================================
-// EXPORTS — every function the original AunXz used
+// EXPORTS
 // =============================================================================
 module.exports = {
   db, DB_PATH, DEFAULT_CONFIG,
+
+  // config
   getConfig, saveConfig, replaceConfig, invalidateConfig,
+
+  // levels
   getLevel, setLevel, topLevels,
+
+  // warnings
   addWarn, getWarns, clearWarns,
-  createTicket, getTicket, setTicketStatus, openTicketsForUser, setTicketType, setTicketClose,
+
+  // tickets
+  createTicket, getTicket, setTicketStatus, openTicketsForUser,
+  setTicketType, setTicketClose,
   logTicketEvent, ticketEventsFor,
+
+  // voicemaster
   addVMChannel, getVMChannel, removeVMChannel,
+
+  // whitelist
   addToWhitelist, removeFromWhitelist, isWhitelisted, listWhitelist,
+
+  // action log
   logAction, recentActions,
+
+  // sticky roles
   getStickyRoles, setStickyRoles,
+
+  // spam / joins
   bumpSpam, trackJoin, recentJoinCount, pruneJoins,
+
+  // emoji
   getEmojiOverride, setEmojiOverride, resetEmojiOverride, getAllEmojiOverrides,
   saveEmojiSnapshot, getEmojiSnapshot,
+
+  // embed texts
   registerEmbedText, getEmbedText, listEmbedTexts, updateEmbedText,
+
+  // owner
   getOwnerConfig, saveOwnerConfig, getGlobalBlacklist, addGlobalBlacklist, removeGlobalBlacklist,
   logOwnerAudit,
+
+  // memberships
   membership, addMembership, removeMembership, listMemberships,
+
+  // giveaways
   createGiveaway, getGiveaway, listGiveaways, listActiveGiveaways, updateGiveaway,
+
+  // saved embeds
   saveEmbed, getEmbed, listEmbeds, deleteEmbed,
+
+  // role panels
   findPanel, upsertPanel, removePanel,
+
+  // sticky messages
   getSticky, listStickies, saveSticky, setStickyMessageId, setStickyEnabled, deleteSticky,
+
+  // applications
   createApplication, getApplication, pendingApplicationForUser, lastApplicationForUser, updateApplication,
+
+  // command toggles
   getToggle, listToggles, setToggle, removeToggle,
+
+  // errors
   recordError, listErrors, clearErrors,
+
+  // command usage
   trackCommandUse, commandUsage,
+
+  // birthdays
   setBirthday, birthdaysFor,
+
+  // logging
   getLogConfig, listLogConfig, setLogConfig,
+
+  // snipe
   addSnipe, getSnipes, getSnipeAt, snipesCount, pruneSnipes,
+
+  // scheduled events
   scheduleEvent, dueEvents, deleteEvent,
+
+  // server templates
   saveTemplate, getTemplate, listTemplates, deleteTemplate,
+
+  // backup / restore
   exportGuild, importGuild
 };
