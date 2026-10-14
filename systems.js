@@ -5,8 +5,6 @@ const { PermissionFlagsBits, ChannelType, AuditLogEvent, Collection, EmbedBuilde
 const db = require('./database');
 const ui = require('./ui');
 
-const BRAND = ui.BRAND;
-
 // =============================================================================
 // TEMPLATES
 // =============================================================================
@@ -24,7 +22,8 @@ function applyTemplate(template, vars = {}, { allowMentions = false } = {}) {
 // PERMISSIONS
 // =============================================================================
 const OWNER_IDS = new Set(
-  [process.env.OWNER_ID, ...(process.env.OWNER_IDS || '').split(',')].map(s => String(s || '').trim()).filter(Boolean)
+  [process.env.OWNER_ID, ...(process.env.OWNER_IDS || '').split(',')]
+    .map(s => String(s || '').trim()).filter(Boolean)
 );
 const isOwner = id => OWNER_IDS.has(String(id || ''));
 const isAdmin = m => m?.permissions?.has(PermissionFlagsBits.Administrator) || isOwner(m?.id);
@@ -42,6 +41,23 @@ function canModerate(guild, mod, target) {
   if (target.id === guild.members.me.id) return false;
   return mod.roles.highest.position > target.roles.highest.position
     && guild.members.me.roles.highest.position > target.roles.highest.position;
+}
+function missingChannelPerms(channel, member, flags) {
+  if (!channel || !member) return ['View Channel'];
+  const perms = channel.permissionsFor(member);
+  if (!perms) return ['View Channel'];
+  return flags.filter(f => !perms.has(f));
+}
+
+// =============================================================================
+// BOUNDED-CONCURRENCY POOL
+// =============================================================================
+async function pool(items, size, fn) {
+  const arr = [...items];
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(size, arr.length) }, async () => {
+    while (i < arr.length) { const k = i++; await fn(arr[k]); }
+  }));
 }
 
 // =============================================================================
@@ -90,7 +106,7 @@ async function logEvent(guild, category, payload) {
       title: payload.title,
       description: payload.description,
       fields: payload.fields || [],
-      footer: `${BRAND} • ${category}`
+      footer: `${ui.BRAND} • ${category}`
     });
     await ch.send({ ...v2, allowedMentions: { parse: [] } }).catch(() => {});
   } catch (e) { console.error('[log]', e?.message || e); }
@@ -103,7 +119,10 @@ async function logMessage(guild, { action, author, channel, content, newContent,
   if (executor) fields.push({ name: 'Executor', value: `<@${executor.id}>`, inline: true });
   if (content !== undefined) fields.push({ name: action === 'edit' ? 'Before' : 'Content', value: (content || '*no content*').slice(0, 1000) });
   if (newContent !== undefined) fields.push({ name: 'After', value: (newContent || '*no content*').slice(0, 1000) });
-  if (attachments?.length) fields.push({ name: `Attachments (${attachments.length})`, value: attachments.slice(0, 5).map(a => `[${a.name || 'file'}](${a.url})`).join('\n').slice(0, 1000) });
+  if (attachments?.length) fields.push({
+    name: `Attachments (${attachments.length})`,
+    value: attachments.slice(0, 5).map(a => `[${a.name || 'file'}](${a.url})`).join('\n').slice(0, 1000)
+  });
   if (jumpUrl) fields.push({ name: 'Jump', value: `[Open](${jumpUrl})`, inline: true });
   const titles = { delete: '🗑️ Message Deleted', edit: '✏️ Message Edited', bulk: '🧹 Bulk Delete', create: '📝 Message' };
   await logEvent(guild, 'message', { title: titles[action] || 'Message', fields });
@@ -166,7 +185,9 @@ async function moderate(action, { guild, moderator, target, reason, durationMs }
     untimeout: PermissionFlagsBits.ModerateMembers
   }[action];
   if (need && !me.permissions.has(need)) throw new Error('Bot lacks the required permission.');
-  if (target?.id && !canModerate(guild, moderator, target)) throw new Error('You cannot act on this user (hierarchy or self).');
+  if (target?.id && !canModerate(guild, moderator, target)) {
+    throw new Error('You cannot act on this user (hierarchy or self).');
+  }
 
   switch (action) {
     case 'ban': await guild.members.ban(target.id, { reason }); break;
@@ -180,7 +201,7 @@ async function moderate(action, { guild, moderator, target, reason, durationMs }
     default: throw new Error(`Unknown action: ${action}`);
   }
   db.logAction(guild.id, target?.id || 'unknown', action, reason || '');
-  await logMod(guild, { action: `🔨 Moderation — ${action}`, target, moderator, reason });
+  await logMod(guild, { action: `🔨 ${action}`, target, moderator, reason });
 }
 
 // =============================================================================
@@ -218,7 +239,9 @@ async function runAutomod(message) {
     const links = content.match(/(https?:\/\/[^\s]+|discord\.gg\/[^\s]+)/gi);
     if (links && !links.every(l => cfg.antilink.whitelistedDomains.some(d => l.includes(d)))) { action = 'delete'; reason = 'antilink'; }
   }
-  if (!action && cfg.antibadword.enabled && wordsPattern && wordsPattern.test(content)) { action = cfg.antibadword.action || 'delete'; reason = 'badword'; }
+  if (!action && cfg.antibadword.enabled && wordsPattern && wordsPattern.test(content)) {
+    action = cfg.antibadword.action || 'delete'; reason = 'badword';
+  }
   if (!action && cfg.automod.enabled && cfg.automod.capsFilter) {
     const letters = content.replace(/[^A-Za-z]/g, '');
     if (letters.length >= 8) {
@@ -226,7 +249,9 @@ async function runAutomod(message) {
       if ((caps / letters.length) * 100 >= (cfg.automod.capsThreshold || 70)) { action = 'delete'; reason = 'caps'; }
     }
   }
-  if (!action && cfg.automod.enabled && cfg.automod.inviteFilter && /(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i.test(content)) { action = 'delete'; reason = 'invite'; }
+  if (!action && cfg.automod.enabled && cfg.automod.inviteFilter && /(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i.test(content)) {
+    action = 'delete'; reason = 'invite';
+  }
   if (!action && cfg.antispam.enabled) {
     const key = `${message.channel.id}:${message.author.id}`;
     const now = Date.now();
@@ -235,7 +260,9 @@ async function runAutomod(message) {
     bucket.push(now); spamWindow.set(key, bucket);
     if (bucket.length > cfg.antispam.maxMessages) { action = cfg.antispam.punishment || 'mute'; reason = 'spam'; }
   }
-  if (!action && cfg.antispam.enabled && (message.mentions.users.size + message.mentions.roles.size) > cfg.antispam.maxMentions) { action = 'delete'; reason = 'mentions'; }
+  if (!action && cfg.antispam.enabled && (message.mentions.users.size + message.mentions.roles.size) > cfg.antispam.maxMentions) {
+    action = 'delete'; reason = 'mentions';
+  }
 
   if (!action) return false;
   await message.delete().catch(() => {});
@@ -294,12 +321,6 @@ async function antinukeStrike(guild, executorId, actionKey) {
 // =============================================================================
 // ANTI-RAID / ANTI-BOT / ANTI-ALT / ANTI-WEBHOOK
 // =============================================================================
-const pool = async (items, size, fn) => {
-  const arr = [...items]; let i = 0;
-  await Promise.all(Array.from({ length: Math.min(size, arr.length) }, async () => {
-    while (i < arr.length) { const k = i++; await fn(arr[k]); }
-  }));
-};
 async function handleAntiraidJoin(member) {
   const cfg = db.getConfig(member.guild.id).antiraid;
   if (!cfg.enabled) return;
@@ -315,7 +336,9 @@ async function handleAntiraidJoin(member) {
     if (cfg.action === 'lockdown') {
       const everyone = member.guild.roles.everyone;
       const chs = member.guild.channels.cache.filter(c => c.type === ChannelType.GuildText);
-      await pool(chs.values(), 5, ch => ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: 'Anti-raid' }).catch(() => {}));
+      await pool(chs.values(), 5, ch =>
+        ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: 'Anti-raid' }).catch(() => {})
+      );
     } else if (cfg.action === 'kick_new') {
       await member.kick('Antiraid').catch(() => {});
     }
@@ -399,7 +422,7 @@ async function openTicket(guild, opener, { type = 'general', subject = null } = 
     name: baseName,
     type: ChannelType.GuildText,
     parent: category.id,
-    topic: `Ticket by ${opener.tag} • ${type}`.slice(0, 1024),
+    topic: `Ticket by ${opener.tag} • ${type}${subject ? ` • ${subject}` : ''}`.slice(0, 1024),
     permissionOverwrites: ticketPermissionOverwrites(guild, opener, cfg.supportRoleId),
     reason: `Ticket opened by ${opener.tag}`
   }).catch(e => {
@@ -407,8 +430,9 @@ async function openTicket(guild, opener, { type = 'general', subject = null } = 
     if (e.code === 50035) throw new Error('Discord rejected the channel name. Try again.');
     throw e;
   });
+
   db.createTicket(channel.id, guild.id, opener.id);
-  db.db.prepare('UPDATE tickets SET type = ? WHERE channelId = ?').run(type, channel.id);
+  db.setTicketType(channel.id, type);
   db.logTicketEvent(guild.id, channel.id, opener.id, 'open', type);
 
   const welcome = ui.ticketWelcome(cfg, opener);
@@ -424,7 +448,7 @@ async function closeTicketWith(channel, guild, actor, reason) {
   if (!ticket) throw new Error('Not a ticket channel.');
   if (ticket.status === 'closed') throw new Error('Ticket is already closed.');
   db.setTicketStatus(channel.id, 'closed', ticket.claimedBy);
-  db.db.prepare('UPDATE tickets SET closedBy = ?, closeReason = ? WHERE channelId = ?').run(actor.id, reason || null, channel.id);
+  db.setTicketClose(channel.id, actor.id, reason || null);
   db.logTicketEvent(guild.id, channel.id, actor.id, 'close', reason);
   await logTicket(guild, { action: '🔒 Ticket Closed', ticket, actor, detail: reason });
   if (!channel.name.startsWith('closed-')) await channel.setName(`closed-${channel.name}`.slice(0, 100)).catch(() => {});
@@ -482,10 +506,13 @@ async function handleLevelingMessage(message) {
         await message.member.roles.add(role, `Level ${level} reward`).catch(() => {});
       }
     }
-    await logEvent(message.guild, 'system', { title: '📈 Level Up', fields: [
-      { name: 'User', value: `<@${message.author.id}>`, inline: true },
-      { name: 'New level', value: String(level), inline: true }
-    ]});
+    await logEvent(message.guild, 'system', {
+      title: '📈 Level Up',
+      fields: [
+        { name: 'User', value: `<@${message.author.id}>`, inline: true },
+        { name: 'New level', value: String(level), inline: true }
+      ]
+    });
   }
 }
 
@@ -495,6 +522,7 @@ async function handleLevelingMessage(message) {
 async function handleVoicemasterJoin(oldState, newState) {
   const cfg = db.getConfig(newState.guild.id).voicemaster;
   if (!cfg.enabled || !cfg.hubChannelId) return;
+
   if (newState.channelId === cfg.hubChannelId) {
     const guild = newState.guild;
     const me = guild.members.me;
@@ -517,6 +545,7 @@ async function handleVoicemasterJoin(oldState, newState) {
     } catch (e) { console.error('[vm]', e?.message); }
     return;
   }
+
   if (oldState.channelId && oldState.channel) {
     const rec = db.getVMChannel(oldState.channelId);
     if (rec && oldState.channel.members.size === 0) {
@@ -550,7 +579,10 @@ function snipeView(guildId, channelId, offset) {
     fields.push({ name: 'Content', value: (e.content || '*no content*').slice(0, 1000) });
   }
   if (e.attachments?.length) {
-    fields.push({ name: `Attachments (${e.attachments.length})`, value: e.attachments.slice(0, 5).map(a => `[${a.name || 'file'}](${a.url})`).join('\n').slice(0, 1000) });
+    fields.push({
+      name: `Attachments (${e.attachments.length})`,
+      value: e.attachments.slice(0, 5).map(a => `[${a.name || 'file'}](${a.url})`).join('\n').slice(0, 1000)
+    });
   }
   if (e.jumpUrl) fields.push({ name: 'Jump', value: `[Open message](${e.jumpUrl})` });
 
@@ -562,13 +594,13 @@ function snipeView(guildId, channelId, offset) {
   return ui.buildV2({
     title: e.action === 'edit' ? '✏️ Edited Message' : '🗑️ Deleted Message',
     fields,
-    footer: `${BRAND} • Record ${idx + 1} of ${total}`,
+    footer: `${ui.BRAND} • Record ${idx + 1} of ${total}`,
     components
   });
 }
 
 // =============================================================================
-// GROQ AI
+// AI (GROQ)
 // =============================================================================
 const GROQ_BASE = (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '');
 const GROQ_TIMEOUT_MS = Math.max(1000, Math.min(120000, parseInt(process.env.GROQ_TIMEOUT_MS || '15000', 10) || 15000));
@@ -577,24 +609,38 @@ const GROQ_FALLBACK = process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant';
 const GROQ_MAX_RETRIES = Math.max(0, Math.min(3, parseInt(process.env.GROQ_MAX_RETRIES || '1', 10)));
 
 class GroqError extends Error {
-  constructor(code, message, opts = {}) { super(message); this.code = code; this.status = opts.status ?? null; this.retryable = !!opts.retryable; }
+  constructor(code, message, opts = {}) {
+    super(message);
+    this.code = code;
+    this.status = opts.status ?? null;
+    this.retryable = !!opts.retryable;
+  }
 }
 
 async function groqChat(messages, { model, maxTokens = 700, temperature = 0.2, jsonMode = false } = {}) {
   const key = process.env.GROQ_API_KEY;
   if (!key) throw new GroqError('ai_missing_key', 'GROQ_API_KEY is not configured.');
   if (!Array.isArray(messages) || !messages.length) throw new GroqError('ai_validation', 'Messages must be a non-empty array.');
+
   const models = [...new Set([model || GROQ_PRIMARY, GROQ_FALLBACK].filter(Boolean))];
   let lastErr;
+
   for (let i = 0; i < models.length; i++) {
     for (let attempt = 0; attempt <= GROQ_MAX_RETRIES; attempt++) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), GROQ_TIMEOUT_MS);
       try {
         const res = await fetch(`${GROQ_BASE}/chat/completions`, {
-          method: 'POST', signal: ctrl.signal,
+          method: 'POST',
+          signal: ctrl.signal,
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-          body: JSON.stringify({ model: models[i], messages, temperature, max_tokens: maxTokens, ...(jsonMode ? { response_format: { type: 'json_object' } } : {}) })
+          body: JSON.stringify({
+            model: models[i],
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+            ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
+          })
         });
         clearTimeout(timer);
         if (res.ok) {
@@ -613,9 +659,14 @@ async function groqChat(messages, { model, maxTokens = 700, temperature = 0.2, j
         if (attempt < GROQ_MAX_RETRIES) await new Promise(r => setTimeout(r, 250 * (2 ** attempt)));
       } catch (e) {
         clearTimeout(timer);
-        if (e instanceof GroqError) { lastErr = e; if (!e.retryable) { if (i < models.length - 1) break; throw e; } }
-        else if (e.name === 'AbortError' || e.name === 'TimeoutError') lastErr = new GroqError('ai_timeout', 'Groq request timed out.', { retryable: true });
-        else lastErr = new GroqError('ai_network', 'Could not reach Groq.', { retryable: true });
+        if (e instanceof GroqError) {
+          lastErr = e;
+          if (!e.retryable) { if (i < models.length - 1) break; throw e; }
+        } else if (e.name === 'AbortError' || e.name === 'TimeoutError') {
+          lastErr = new GroqError('ai_timeout', 'Groq request timed out.', { retryable: true });
+        } else {
+          lastErr = new GroqError('ai_network', 'Could not reach Groq.', { retryable: true });
+        }
         if (attempt < GROQ_MAX_RETRIES) await new Promise(r => setTimeout(r, 250 * (2 ** attempt)));
       }
     }
@@ -628,8 +679,16 @@ async function groqChat(messages, { model, maxTokens = 700, temperature = 0.2, j
 // =============================================================================
 const EMOJI_POOL = ['❄','🥮','🍂','🍁','💨','💢','🪵','☃️','⚡','🪢','🧶','♣️','♟','🎃','⚰️','💎','⚜️','🔱','♻️'];
 const DIVIDERS = ['〢', '・', '┊', '┃', '┆', '︱'];
+const NAMING_STYLES = ['emoji_divider', 'tree', 'decorative', 'emoji_decor', 'minimal', 'ai'];
+
 function cleanChannelName(name) {
-  return String(name || '').toLowerCase().replace(/[^\p{L}\p{N}\- _]/gu, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 90) || 'channel';
+  return String(name || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\- _]/gu, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 90) || 'channel';
 }
 function applyNaming(style, emojiChar, name, { first = false, last = false, divider = '〢' } = {}) {
   const clean = cleanChannelName(name);
@@ -643,7 +702,7 @@ function applyNaming(style, emojiChar, name, { first = false, last = false, divi
   }
 }
 async function generateTemplate({ serverType, namingStyle, emojiMode = 'individual', description = '', guildName = '' }) {
-  const system = `You design Discord server structures. Respond with STRICT JSON only.`;
+  const system = 'You design Discord server structures. Respond with STRICT JSON only.';
   const user = `Design a Discord server structure.
 Server name: ${guildName || 'the server'}
 Type: ${serverType}
@@ -657,7 +716,10 @@ Return JSON:
   "roles": [{ "name": string, "color": "#RRGGBB", "hoist": boolean }]
 }
 3-6 categories, 3-10 channels each. No extra text.`;
-  const { content } = await groqChat([{ role: 'system', content: system }, { role: 'user', content: user }], { maxTokens: 2000, temperature: 0.4, jsonMode: true });
+  const { content } = await groqChat(
+    [{ role: 'system', content: system }, { role: 'user', content: user }],
+    { maxTokens: 2000, temperature: 0.4, jsonMode: true }
+  );
   const parsed = JSON.parse(content);
   if (!Array.isArray(parsed.categories)) throw new Error('AI returned malformed template.');
   return parsed;
@@ -665,8 +727,12 @@ Return JSON:
 async function applyTemplateToGuild(guild, template, namingStyle) {
   const results = { categories: 0, channels: 0, roles: 0, errors: [] };
   const me = guild.members.me;
-  if (!me?.permissions.has(PermissionFlagsBits.ManageChannels)) { results.errors.push('Bot lacks Manage Channels.'); return results; }
+  if (!me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    results.errors.push('Bot lacks Manage Channels.');
+    return results;
+  }
   const style = namingStyle === 'ai' ? 'emoji_divider' : namingStyle;
+
   for (const r of template.roles || []) {
     try {
       if (!guild.roles.cache.find(x => x.name === r.name)) {
@@ -675,11 +741,16 @@ async function applyTemplateToGuild(guild, template, namingStyle) {
       }
     } catch (e) { results.errors.push(`role ${r.name}: ${e.message}`); }
   }
+
   for (const cat of template.categories || []) {
     try {
       let category = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === cat.name);
-      if (!category) { category = await guild.channels.create({ name: cat.name.slice(0, 100), type: ChannelType.GuildCategory }); results.categories++; }
-      const total = cat.channels.length; let i = 0;
+      if (!category) {
+        category = await guild.channels.create({ name: cat.name.slice(0, 100), type: ChannelType.GuildCategory });
+        results.categories++;
+      }
+      const total = cat.channels.length;
+      let i = 0;
       for (const ch of cat.channels) {
         i++;
         const name = applyNaming(style, ch.emoji || '💬', ch.name, { first: i === 1, last: i === total });
@@ -705,6 +776,7 @@ async function healthCheck(guild) {
   const issues = [];
   const me = guild.members.me;
   if (!me) return [{ severity: 'high', text: 'Bot is not in the guild cache.' }];
+
   const required = [
     ['Manage Roles', PermissionFlagsBits.ManageRoles],
     ['Manage Channels', PermissionFlagsBits.ManageChannels],
@@ -714,7 +786,9 @@ async function healthCheck(guild) {
     ['Moderate Members', PermissionFlagsBits.ModerateMembers],
     ['View Audit Log', PermissionFlagsBits.ViewAuditLog]
   ];
-  for (const [name, bit] of required) if (!me.permissions.has(bit)) issues.push({ severity: 'high', text: `Bot missing permission: **${name}**` });
+  for (const [name, bit] of required) {
+    if (!me.permissions.has(bit)) issues.push({ severity: 'high', text: `Bot missing permission: **${name}**` });
+  }
 
   const cfg = db.getConfig(guild.id);
   const checkChannel = (val, label) => { if (val && !guild.channels.cache.has(val)) issues.push({ severity: 'medium', text: `${label} configured but channel missing (\`${val}\`)` }); };
@@ -730,12 +804,71 @@ async function healthCheck(guild) {
   checkRole(cfg.staffApplications.acceptedRoleId, 'Accepted staff role');
 
   if (me.roles.highest.position <= 1) issues.push({ severity: 'high', text: 'Bot role position is too low for moderation.' });
+
   return issues;
 }
 
+// =============================================================================
+// STICKY MESSAGES
+// =============================================================================
+async function repostSticky(client, channelId) {
+  const row = db.getSticky(channelId);
+  if (!row || !row.enabled) return { skipped: true };
+  let channel = client.channels.cache.get(channelId);
+  if (!channel) {
+    try { channel = await client.channels.fetch(channelId); }
+    catch (e) {
+      if (e?.code === 10003) { db.deleteSticky(channelId); return { removed: true }; }
+      throw new Error(`Cannot access channel ${channelId}: ${e?.message || 'unknown'}`);
+    }
+  }
+  if (row.lastMessageId) {
+    await channel.messages.delete(row.lastMessageId).catch(() => {});
+  }
+  const e = new EmbedBuilder()
+    .setColor(row.data.color ?? ui.BLACK)
+    .setTimestamp();
+  if (row.data.title) e.setTitle(row.data.title);
+  if (row.data.description) e.setDescription(row.data.description);
+  const sent = await channel.send({ embeds: [e] });
+  db.setStickyMessageId(channelId, sent.id);
+  return { messageId: sent.id };
+}
+
+// =============================================================================
+// STAFF APPLICATIONS
+// =============================================================================
+async function submitApplication(guild, user, answers, cfg) {
+  if (!cfg.enabled || !(cfg.questions || []).length) throw new Error('Applications are not open.');
+  if (db.pendingApplicationForUser(guild.id, user.id)) throw new Error('You already have a pending application.');
+  const app = db.createApplication(guild.id, user.id, answers);
+  if (cfg.logChannelId) {
+    const ch = guild.channels.cache.get(cfg.logChannelId);
+    if (ch?.isTextBased()) {
+      const e = ui.embed(`Application #${app.id}`, `**Applicant:** ${user} (\`${user.id}\`)`)
+        .addFields(cfg.questions.slice(0, 5).map((q, n) => ({
+          name: `${n + 1}. ${q.slice(0, 200)}`,
+          value: (answers[n] || '—').slice(0, 1000),
+          inline: false
+        })));
+      const buttons = ui.row(
+        ui.btn(`app:review:accepted:${app.id}`, 'Accept', 3),
+        ui.btn(`app:review:denied:${app.id}`, 'Deny', 4)
+      );
+      ch.send({ embeds: [e], components: [buttons] }).catch(() => {});
+    }
+  }
+  return app;
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
 module.exports = {
   // permissions
-  isOwner, isAdmin, isStaff, canModerate,
+  isOwner, isAdmin, isStaff, canModerate, missingChannelPerms,
+  // pool
+  pool,
   // logging
   LOG_CATEGORIES, auditExecutor, resolveLogChannel, logEvent,
   logMessage, logMember, logMod, logSecurity, logTicket, logVoice, logServer,
@@ -756,9 +889,13 @@ module.exports = {
   // ai
   GroqError, groqChat,
   // template
-  EMOJI_POOL, DIVIDERS, applyNaming, cleanChannelName, generateTemplate, applyTemplateToGuild,
+  EMOJI_POOL, DIVIDERS, NAMING_STYLES, applyNaming, cleanChannelName, generateTemplate, applyTemplateToGuild,
   // health
   healthCheck,
+  // sticky
+  repostSticky,
+  // applications
+  submitApplication,
   // helpers
-  applyTemplate, pool
+  applyTemplate
 };
