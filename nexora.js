@@ -46,7 +46,7 @@ const DEFAULT_SETTINGS = {
   travelCooldownSeconds: 10, battleCooldownSeconds: 30, levelCap: 50, xpCurve: 'quadratic', maintenance: false,
   notificationChannelId: null, announcementChannelId: null, commandChannelId: null, adminRoleIds: [], allowedRoleIds: [], restrictedRoleIds: [],
   modules: { game:true, world:true, exploration:true, characters:true, classes:true, combat:true, quests:true, inventory:true, crafting:true, trading:true, leaderboards:true, channels:true, backup:true, advanced:true, bosses:false, pets:false, guilds:false, events:false, minigames:false, rewards:true, ai:false, seasons:false },
-  ai: { provider:'openrouter', model:'', tone:'adventurous', enabled:false, maxRequestsPerHour:10 },
+  ai: { provider:'groq', model:'', tone:'adventurous', enabled:false, maxRequestsPerHour:10 },
   security: { maxActionPerMinute:8, maxInventoryStack:999, maxRewardCoins:5000, maxRewardXp:5000 },
   season: { enabled:false, lengthDays:90, resetProgress:false }
 };
