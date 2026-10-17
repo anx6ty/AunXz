@@ -1,7 +1,7 @@
 {
   "name": "aunxz-discord-bot",
   "version": "1.0.0",
-  "description": "Compact all-in-one AunXz Discord bot with local server-template generation and loading.",
+  "description": "AunXz Discord bot with persistent configuration, moderation, logging, tickets, templates, and gaming systems.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
