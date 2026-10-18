@@ -1,3 +1,4 @@
+
 'use strict';
 // Exercises the REAL bundled database.js (migration + saved-embed API, on a real SQLite engine via node:sqlite)
 // and the REAL embedsystem.js (command/interaction logic with fake Discord interaction objects).
@@ -63,7 +64,7 @@ function fake({ user = 'u1', userPerms = ['ManageMessages'], customId = null, su
     member: { id: user, userAllow: null }, memberPermissions: perms(...userPerms), deferred: false, replied: false,
     reply: async p => { calls.push(['reply', p]); i.replied = true; }, followUp: async p => calls.push(['followUp', p]), update: async p => calls.push(['update', p]),
     editReply: async p => calls.push(['editReply', p]), deferReply: async () => { i.deferred = true; calls.push(['defer']); }, showModal: async m => calls.push(['modal', m]),
-    isModalSubmit: () => !!modalFields, isFromMessage: () => true, isStringSelectMenu: () => !!values, values,
+    isButton: () => !!customId && !modalFields && !values, isModalSubmit: () => !!modalFields, isFromMessage: () => true, isStringSelectMenu: () => !!values, values,
     fields: { getTextInputValue: k => (modalFields && modalFields[k]) || '' },
     options: { getSubcommand: () => sub, getString: k => strings[k] ?? null, getChannel: () => channelOpt, getFocused: () => '' }
   };
@@ -410,4 +411,86 @@ test('list works and the obsolete /embedbuilder command is gone from the shipped
   assert.match(BUNDLE, /embedSystem\.handleInteraction\(interaction\)/);
   assert.match(BUNDLE, /embedSystem\.handleAutocomplete\(interaction\)/);
   assert.equal((BUNDLE.match(/embedSystem\.handleInteraction/g) || []).length, 1, 'handler registered once');
+});
+
+// ───────────────────────── embed-name (reveal) buttons ─────────────────────────
+test('button modal takes an embed NAME, resolves it to a stable id, and rejects unknown/duplicate-cap targets', async () => {
+  const { dbm, es } = fresh();
+  const target = dbm.createSavedEmbed('g1', 'Rules Detail', GOOD, 'u1').embed;
+  const resolve = n => dbm.findSavedEmbed('g1', n);
+  const { applyModal, emptyDraft, validateDraft } = es._internals;
+  const ok = applyModal(emptyDraft(), 'button', k => ({ label: 'More', embed: '  rules   DETAIL ', emoji: '' }[k]), resolve);
+  assert.equal(ok.draft.buttons[0].targetId, target.id);
+  assert.equal(ok.draft.buttons[0].targetName, 'Rules Detail');
+  assert.ok(!('url' in ok.draft.buttons[0]));
+  assert.deepEqual(validateDraft({ ...ok.draft, description: 'x' }), []);
+  assert.match(applyModal(emptyDraft(), 'button', k => ({ label: 'More', embed: 'ghost', emoji: '' }[k]), resolve).error, /No saved embed named/);
+  assert.match(applyModal(emptyDraft(), 'button', k => ({ label: 'More', embed: '', emoji: '' }[k]), resolve).error, /name of the saved embed/);
+  assert.match(applyModal(emptyDraft(), 'button', k => ({ label: 'More', embed: 'rules detail', emoji: 'abc' }[k]), resolve).error, /emoji/);
+  let d = emptyDraft();
+  for (let n = 0; n < 10; n++) d = applyModal(d, 'button', k => ({ label: 'b' + n, embed: 'rules detail', emoji: '' }[k]), resolve).draft;
+  assert.match(applyModal(d, 'button', k => ({ label: 'x', embed: 'rules detail', emoji: '' }[k]), resolve).error, /At most 10/);
+});
+test('clicking a reveal button privately shows the target; missing, foreign-server and damaged targets are handled', async () => {
+  const { dbm, es } = fresh();
+  const target = dbm.createSavedEmbed('g1', 'Details', { ...GOOD, title: 'Secret details' }, 'u1').embed;
+  let i = fake({ user: 'anyone', userPerms: [], customId: `embreveal:${target.id}` });
+  assert.equal(await es.handleInteraction(i), true);
+  assert.equal(last(i)[0], 'reply');
+  assert.equal(last(i)[1].ephemeral, true);
+  assert.ok(last(i)[1].embeds.length === 1 && last(i)[1].components);
+  // chained: target with its own reveal button
+  const chain2 = dbm.createSavedEmbed('g1', 'Chain', { ...GOOD, buttons: [{ label: 'Next', targetId: target.id, targetName: 'Details', emoji: '' }] }, 'u1').embed;
+  i = fake({ customId: `embreveal:${chain2.id}` });
+  await es.handleInteraction(i);
+  assert.equal(last(i)[0], 'reply');
+  // other server cannot reveal it
+  const foreign = fake({ customId: `embreveal:${target.id}` }); foreign.guildId = 'g2';
+  await es.handleInteraction(foreign);
+  assert.equal(titleOf(last(foreign)), 'Embed Not Found');
+  // deleted target
+  dbm.deleteSavedEmbedById(target.id);
+  i = fake({ customId: `embreveal:${target.id}` });
+  await es.handleInteraction(i);
+  assert.equal(titleOf(last(i)), 'Embed Not Found');
+  // garbage id
+  i = fake({ customId: 'embreveal:not-a-real-id' });
+  await es.handleInteraction(i);
+  assert.equal(titleOf(last(i)), 'Embed Not Found');
+  // damaged data
+  const bad = dbm.createSavedEmbed('g1', 'Broken', GOOD, 'u1').embed;
+  dbm.db.prepare('UPDATE saved_embeds SET data=? WHERE id=?').run('{not json', bad.id);
+  i = fake({ customId: `embreveal:${bad.id}` });
+  await es.handleInteraction(i);
+  assert.equal(titleOf(last(i)), 'Embed Unavailable');
+});
+test('saving or sending an embed whose button target was deleted is refused', async () => {
+  const { dbm, es } = fresh();
+  const target = dbm.createSavedEmbed('g1', 'Target', GOOD, 'u1').embed;
+  await es.command.execute(fake({ sub: 'create', strings: { name: 'Host' } }));
+  const sid = [...es._internals.sessions.keys()][0];
+  await press(es, sid, 'm_text', { modalFields: { title: 'Host', description: 'x' } });
+  await press(es, sid, 'm_button', { modalFields: { label: 'Open', embed: 'target' } });
+  assert.equal(es._internals.sessions.get(sid).draft.buttons.length, 1);
+  dbm.deleteSavedEmbedById(target.id);
+  const r = await press(es, sid, 'save');
+  assert.equal(titleOf(last(r.i)), 'Cannot Save Yet');
+  assert.equal(dbm.findSavedEmbed('g1', 'host'), null);
+  // already-saved host whose target disappears cannot be sent
+  const t2 = dbm.createSavedEmbed('g1', 'T2', GOOD, 'u1').embed;
+  dbm.createSavedEmbed('g1', 'Host2', { ...GOOD, buttons: [{ label: 'x', targetId: t2.id, targetName: 'T2', emoji: '' }] }, 'u1');
+  dbm.deleteSavedEmbedById(t2.id);
+  const ch = textChannel('c1');
+  const i = fake({ sub: 'send', strings: { name: 'host2' }, channels: [ch] });
+  await es.command.execute(i);
+  assert.equal(titleOf(last(i)), 'Embed Is Invalid');
+  assert.equal(ch.sent.length, 0);
+});
+test('reveal clicks are routed by the bundle dispatcher and legacy URL buttons still load', () => {
+  const { es } = fresh();
+  const n = es._internals.normalizeDraft({ buttons: [{ label: 'Docs', url: 'https://a.io' }, { label: 'R', targetId: 'abc', targetName: 'X' }, { label: 'bad' }] });
+  assert.equal(n.buttons.length, 2);
+  assert.equal(n.buttons[0].url, 'https://a.io');
+  assert.equal(n.buttons[1].targetId, 'abc');
+  assert.match(BUNDLE, /embreveal:/);
 });
