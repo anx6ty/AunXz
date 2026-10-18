@@ -1,12 +1,13 @@
 {
   "name": "aunxz-discord-bot",
   "version": "1.0.0",
-  "description": "AunXz Discord bot with persistent configuration, moderation, logging, tickets, templates, and gaming systems.",
+  "description": "Compact all-in-one AunXz Discord bot with local server-template generation and loading.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check nexora.js && node --check advancedlogging.js"
+    "check": "node --check index.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=22.12.0"
