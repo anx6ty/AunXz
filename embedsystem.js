@@ -9,7 +9,7 @@ const {
 const dbm = require('./database');
 const ui = require('./ui');
 
-const LIMITS = { title: 256, description: 4096, fieldName: 256, fieldValue: 1024, fields: 25, footer: 2048, author: 256, total: 6000, buttons: 5, buttonLabel: 80, buttonUrl: 512, name: 64, perGuild: 250 };
+const LIMITS = { title: 256, description: 4096, fieldName: 256, fieldValue: 1024, fields: 25, footer: 2048, author: 256, total: 6000, buttons: 10, buttonLabel: 80, buttonUrl: 512, name: 64, perGuild: 250 };
 const SESSION_TTL = 20 * 60 * 1000;
 const CONFIRM_TTL = 2 * 60 * 1000;
 const MAX_EDITORS_PER_USER = 5;
@@ -74,7 +74,9 @@ function normalizeDraft(raw) {
     if (Array.isArray(raw.fields))
         d.fields = raw.fields.filter(x => x && (x.name || x.value)).slice(0, LIMITS.fields).map(x => ({ name: str(x.name).slice(0, LIMITS.fieldName), value: str(x.value).slice(0, LIMITS.fieldValue), inline: !!x.inline }));
     if (Array.isArray(raw.buttons))
-        d.buttons = raw.buttons.filter(b => b && b.label && b.url).slice(0, LIMITS.buttons).map(b => ({ label: str(b.label).slice(0, LIMITS.buttonLabel), url: str(b.url), emoji: b.emoji ? str(b.emoji) : '' }));
+        d.buttons = raw.buttons.filter(b => b && b.label && (b.url || b.targetId)).slice(0, LIMITS.buttons).map(b => (b.targetId
+            ? { label: str(b.label).slice(0, LIMITS.buttonLabel), targetId: str(b.targetId), targetName: str(b.targetName), emoji: b.emoji ? str(b.emoji) : '' }
+            : { label: str(b.label).slice(0, LIMITS.buttonLabel), url: str(b.url), emoji: b.emoji ? str(b.emoji) : '' }));
     return d;
 }
 function embedLength(d) {
@@ -117,12 +119,16 @@ function validateDraft(d) {
     if (d.footer.iconUrl && !d.footer.text)
         p.push('Footer icon needs footer text.');
     if (d.buttons.length > LIMITS.buttons)
-        p.push(`Too many link buttons (max ${LIMITS.buttons}).`);
+        p.push(`Too many buttons (max ${LIMITS.buttons}).`);
     d.buttons.forEach((b, i) => {
         if (!b.label || b.label.length > LIMITS.buttonLabel)
             p.push(`Button ${i + 1} needs a label (max ${LIMITS.buttonLabel}).`);
-        if (!isHttpUrl(b.url, LIMITS.buttonUrl))
-            p.push(`Button ${i + 1} needs a valid http(s) URL (max ${LIMITS.buttonUrl} characters).`);
+        if (b.targetId) {
+            if (typeof b.targetId !== 'string' || b.targetId.length > 64)
+                p.push(`Button ${i + 1} has an invalid target embed.`);
+        }
+        else if (!isHttpUrl(b.url, LIMITS.buttonUrl))
+            p.push(`Button ${i + 1} needs a target embed.`);
         if (b.emoji && !isValidButtonEmoji(b.emoji))
             p.push(`Button ${i + 1} has an invalid emoji.`);
     });
@@ -152,16 +158,31 @@ function buildEmbed(d, { placeholder = false } = {}) {
         e.setTimestamp();
     return e;
 }
+// Buttons: reveal buttons (customId embreveal:<embedId>) show another saved embed privately; legacy URL buttons stay link buttons.
 function buildLinkRows(d) {
-    if (!d.buttons.length)
-        return [];
     const btns = d.buttons.map(b => {
-        const btn = new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(b.label).setURL(b.url);
+        const btn = b.targetId
+            ? new ButtonBuilder().setStyle(ButtonStyle.Secondary).setLabel(b.label).setCustomId(`embreveal:${b.targetId}`)
+            : new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(b.label).setURL(b.url);
         if (b.emoji)
             btn.setEmoji(b.emoji.trim());
         return btn;
     });
-    return [new ActionRowBuilder().addComponents(btns)];
+    const rows = [];
+    for (let k = 0; k < btns.length; k += 5)
+        rows.push(new ActionRowBuilder().addComponents(btns.slice(k, k + 5)));
+    return rows;
+}
+// Every reveal button must point at an existing, readable embed of THIS server.
+function targetProblems(d, guildId) {
+    const p = [];
+    d.buttons.forEach((b, i) => {
+        if (!b.targetId) return;
+        const row = dbm.getSavedEmbedById(b.targetId);
+        if (!row || row.guildId !== guildId) p.push(`Button ${i + 1} points to an embed that no longer exists.`);
+        else if (!row.data) p.push(`Button ${i + 1} points to an unreadable embed.`);
+    });
+    return p;
 }
 function cleanName(name) { return dbm.normalizeEmbedName(name); }
 function validateName(name) {
@@ -253,14 +274,14 @@ function editorPayload(sid, s) {
     const S = ButtonStyle;
     const rows = [
         new ActionRowBuilder().addComponents(b('text', 'Text', S.Primary, '📝'), b('style', 'Style', S.Primary, '🎨'), b('author', 'Author', S.Secondary, '👤'), b('footer', 'Footer', S.Secondary, '🔻'), b('images', 'Images', S.Secondary, '🖼️')),
-        new ActionRowBuilder().addComponents(b('field', 'Field', S.Secondary, '➕', d.fields.length >= LIMITS.fields), b('button', 'Link', S.Secondary, '🔗', d.buttons.length >= LIMITS.buttons), b('ts', d.timestamp ? 'Time: On' : 'Time: Off', d.timestamp ? S.Success : S.Secondary, '🕒'), b('preview', 'Preview', S.Primary, '👁️'))
+        new ActionRowBuilder().addComponents(b('field', 'Field', S.Secondary, '➕', d.fields.length >= LIMITS.fields), b('button', 'Button', S.Secondary, '🔘', d.buttons.length >= LIMITS.buttons), b('ts', d.timestamp ? 'Time: On' : 'Time: Off', d.timestamp ? S.Success : S.Secondary, '🕒'), b('preview', 'Preview', S.Primary, '👁️'))
     ];
     if (d.fields.length)
         rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`emb:${sid}:rmf`).setPlaceholder(`Remove a field (${d.fields.length})…`)
             .addOptions(d.fields.slice(0, 25).map((f, i) => ({ label: `${i + 1}. ${f.name}`.slice(0, 100), value: String(i) })))));
     if (d.buttons.length)
-        rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`emb:${sid}:rmb`).setPlaceholder(`Remove a link button (${d.buttons.length})…`)
-            .addOptions(d.buttons.slice(0, 5).map((x, i) => ({ label: `${i + 1}. ${x.label}`.slice(0, 100), value: String(i) })))));
+        rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`emb:${sid}:rmb`).setPlaceholder(`Remove a button (${d.buttons.length})…`)
+            .addOptions(d.buttons.slice(0, 10).map((x, i) => ({ label: `${i + 1}. ${x.label}${x.targetName ? ` → ${x.targetName}` : ''}`.slice(0, 100), value: String(i) })))));
     const last = [b('save', 'Save', S.Success, '💾'), b('cancel', 'Cancel', S.Secondary, '✖️')];
     if (s.mode === 'edit')
         last.push(b('del', 'Delete', S.Danger, '🗑️'));
@@ -283,12 +304,12 @@ function modalFor(sid, kind, d) {
         case 'footer': return m.setTitle('Footer').addComponents(input('text', 'Footer text', { value: d.footer.text, max: LIMITS.footer }), input('iconUrl', 'Footer icon URL', { value: d.footer.iconUrl, max: 500 }));
         case 'images': return m.setTitle('Images').addComponents(input('imageUrl', 'Large image URL', { value: d.imageUrl, max: 500 }), input('thumbnailUrl', 'Thumbnail URL', { value: d.thumbnailUrl, max: 500 }));
         case 'field': return m.setTitle('Add Field').addComponents(input('name', 'Field name', { required: true, max: LIMITS.fieldName }), input('value', 'Field value', { long: true, required: true, max: LIMITS.fieldValue }), input('inline', 'Inline? (yes / no)', { max: 5, placeholder: 'no' }));
-        case 'button': return m.setTitle('Add Link Button').addComponents(input('label', 'Button label', { required: true, max: LIMITS.buttonLabel }), input('url', 'URL (https://…)', { required: true, max: LIMITS.buttonUrl }), input('emoji', 'Emoji (optional)', { max: 64 }));
+        case 'button': return m.setTitle('Add Embed Button').addComponents(input('label', 'Button label', { required: true, max: LIMITS.buttonLabel }), input('embed', 'Name of the saved embed to reveal', { required: true, max: LIMITS.name }), input('emoji', 'Emoji (optional)', { max: 64 }));
         default: return null;
     }
 }
 // Applies a modal submission to a COPY of the draft. Returns { draft } or { error }.
-function applyModal(draft, kind, get) {
+function applyModal(draft, kind, get, resolve = () => null) {
     const n = JSON.parse(JSON.stringify(draft));
     const url = (v, label) => (v && !isHttpUrl(v) ? `${label} must be a valid http(s) URL.` : null);
     let err = null;
@@ -316,12 +337,15 @@ function applyModal(draft, kind, get) {
         else n.fields.push({ name: get('name'), value: get('value'), inline: /^(y|yes|true|1|on)$/i.test(get('inline')) });
     }
     else if (kind === 'button') {
-        const b = { label: get('label'), url: get('url'), emoji: get('emoji') };
-        if (n.buttons.length >= LIMITS.buttons) err = `At most ${LIMITS.buttons} link buttons fit in one row.`;
-        else if (!b.label) err = 'A button needs a label.';
-        else if (!isHttpUrl(b.url, LIMITS.buttonUrl)) err = `Button URL must be a valid http(s) URL (max ${LIMITS.buttonUrl} characters).`;
-        else if (b.emoji && !isValidButtonEmoji(b.emoji)) err = 'That emoji is not valid. Use a standard emoji or <:name:id>.';
-        else n.buttons.push(b);
+        const label = get('label'), emoji = get('emoji');
+        const target = get('embed') ? resolve(get('embed')) : null;
+        if (n.buttons.length >= LIMITS.buttons) err = `At most ${LIMITS.buttons} buttons fit on one embed.`;
+        else if (!label) err = 'A button needs a label.';
+        else if (!get('embed')) err = 'Enter the name of the saved embed this button should reveal.';
+        else if (!target) err = `No saved embed named **${cleanName(get('embed')).slice(0, 64)}** exists in this server. Create it first with \`/embed create\`.`;
+        else if (!target.data) err = `**${target.name}** has damaged data and cannot be used.`;
+        else if (emoji && !isValidButtonEmoji(emoji)) err = 'That emoji is not valid. Use a standard emoji or <:name:id>.';
+        else n.buttons.push({ label, targetId: target.id, targetName: target.name, emoji });
     }
     else err = 'Unknown editor section.';
     if (!err && embedLength(n) > LIMITS.total) err = `That would push the embed over Discord's ${LIMITS.total}-character limit (${embedLength(n)}).`;
@@ -437,7 +461,7 @@ async function cmdSend(i) {
     if (userMissing.length)
         return fail(i, 'You Cannot Send There', `You are missing in ${channel}: **${userMissing.join(', ')}**.`);
     const draft = normalizeDraft(r.row.data);
-    const problems = validateDraft(draft);
+    const problems = [...validateDraft(draft), ...targetProblems(draft, i.guildId)];
     if (problems.length)
         return fail(i, 'Embed Is Invalid', `Fix this with \`/embed edit\` first:\n• ${problems.slice(0, 5).join('\n• ')}`);
     await i.deferReply({ ephemeral: true });
@@ -479,8 +503,31 @@ async function refresh(i, sid, s) {
         return i.reply({ ...payload, ephemeral: true });
     return i.update(payload);
 }
+// A reveal button on a sent embed: shows the target saved embed privately to whoever clicked it.
+async function handleReveal(i) {
+    try {
+        const row = i.guildId ? dbm.getSavedEmbedById(i.customId.slice('embreveal:'.length)) : null;
+        if (!row || row.guildId !== i.guildId) {
+            await respond(i, { embeds: [E.warn('Embed Not Found', 'The embed this button points to no longer exists.')] });
+            return true;
+        }
+        const draft = row.data ? normalizeDraft(row.data) : null;
+        if (!draft || validateDraft(draft).length) {
+            await respond(i, { embeds: [E.warn('Embed Unavailable', 'This embed is damaged or invalid. Ask a server manager to fix it with `/embed edit`.')] });
+            return true;
+        }
+        await i.reply({ embeds: [buildEmbed(draft)], components: buildLinkRows(draft), ephemeral: true });
+    }
+    catch (e) {
+        logError('reveal', e, i);
+        await respond(i, { embeds: [E.err('Embed Error', friendlyError(e))] }).catch(() => { });
+    }
+    return true;
+}
 async function handleInteraction(i) {
     const id = i.customId;
+    if (typeof id === 'string' && id.startsWith('embreveal:') && i.isButton?.())
+        return handleReveal(i);
     if (typeof id !== 'string' || !id.startsWith('emb:'))
         return false;
     try {
@@ -529,7 +576,7 @@ async function handleEditor(i, sid, s, action) {
     const d = s.draft;
     if (i.isModalSubmit?.()) {
         const kind = action.replace(/^m_/, '');
-        const r = applyModal(d, kind, k => str(i.fields.getTextInputValue(k)).trim());
+        const r = applyModal(d, kind, k => str(i.fields.getTextInputValue(k)).trim(), n => dbm.findSavedEmbed(i.guildId, n));
         if (r.error) {
             await respond(i, { embeds: [E.err('Invalid Input', r.error)] });
             return true;
@@ -557,7 +604,7 @@ async function handleEditor(i, sid, s, action) {
             const problems = validateDraft(d);
             await i.reply({
                 content: problems.length ? `⚠️ Not ready to save:\n• ${problems.slice(0, 6).join('\n• ')}` : '👁️ Preview — exactly what will be sent:',
-                embeds: [buildEmbed(d, { placeholder: true })], components: buildLinkRows(d).filter(() => !problems.some(p => p.startsWith('Button'))), ephemeral: true
+                embeds: [buildEmbed(d, { placeholder: true })], components: problems.some(p => p.startsWith('Button')) ? [] : buildLinkRows(d), ephemeral: true
             });
             return true;
         }
@@ -579,7 +626,7 @@ async function handleEditor(i, sid, s, action) {
     }
 }
 async function saveSession(i, sid, s) {
-    const problems = validateDraft(s.draft);
+    const problems = [...validateDraft(s.draft), ...targetProblems(s.draft, i.guildId)];
     if (problems.length) {
         await respond(i, { embeds: [E.err('Cannot Save Yet', `• ${problems.slice(0, 8).join('\n• ')}`)] });
         return true;
