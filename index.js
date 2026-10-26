@@ -6880,6 +6880,9 @@ client.once('ready', async () => {
     catch (e) {
         console.warn('[GreetVoice] dependency report failed:', e.message);
     }
+    sys.restoreVoiceConnections(client).then(result => {
+        if (result.total) console.log(`[Voice] Rejoined ${result.restored}/${result.total} saved voice channel(s).`);
+    }).catch(e => console.warn('[Voice] Startup rejoin failed:', e.message || e));
     try {
         await registerCommands();
     }
@@ -7347,14 +7350,23 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.isButton() && interaction.customId.startsWith('emoji:list:')) {
             if (!isOwner(interaction.user.id))
                 return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
-            const page = Number(interaction.customId.split(':')[2]) || 1;
+            const page = Number(interaction.customId.split(':')[3]) || 1;
             return interaction.update({ embeds: [ui.emojisListEmbed(db.getAllEmojiOverrides(), page)], components: ui.emojisListRows(page) });
         }
         if (interaction.isButton() && interaction.customId.startsWith('em:list:')) {
             if (!isOwner(interaction.user.id))
                 return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
-            const page = Number(interaction.customId.split(':')[2]) || 1;
+            const page = Number(interaction.customId.split(':')[3]) || 1;
             return interaction.update({ embeds: [ui.embedTextsListEmbed(page)], components: ui.embedTextsListRows(page) });
+        }
+        if (interaction.isButton() && interaction.customId.startsWith('ms:list:')) {
+            if (!isOwner(interaction.user.id))
+                return interaction.reply({ embeds: [ui.errorEmbed('Denied', 'Owner only.')], ephemeral: true });
+            const memberships = db.listMemberships();
+            const totalPages = Math.max(1, Math.ceil(memberships.length / 5));
+            const requestedPage = Number(interaction.customId.split(':')[3]) || 1;
+            const page = Math.min(totalPages, Math.max(1, requestedPage));
+            return interaction.update({ embeds: [ui.membershipListEmbed(memberships, page)], components: ui.membershipListRows(memberships, page) });
         }
         if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('ownerlogsetup:')) {
             if (!isOwner(interaction.user.id))
@@ -8922,6 +8934,8 @@ client.on('messageCreate', async (message) => {
     }
 });
 client.on('voiceStateUpdate', async (oldState, newState) => {
+    if (client.user && newState.id === client.user.id && newState.channelId)
+        sys.rememberVoiceChannel(newState.guild.id, newState.channelId);
     await sys.handleVoiceStateUpdate(oldState, newState)
         .catch(err => console.error('voiceStateUpdate:', err));
 });
@@ -8948,7 +8962,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const zlib = require('zlib');
-const { randomBytes } = require('crypto');
+const { randomBytes, createHash } = require('crypto');
 const db = require('./database');
 const ui = require('./ui');
 const h = require('./helpers');
@@ -9174,9 +9188,10 @@ async function createPortableBackup(databaseFile) {
     const archive = path.join(os.tmpdir(), `aunxz-backup-${code}.tar.gz`);
     const volDir = path.join(stage, 'volume');
     fs.mkdirSync(volDir, { recursive: true });
+    const railwayVolume = process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH) : null;
     const projectRootIsData = path.resolve(db.DATA_DIR) === path.resolve(__dirname);
-    const assetRoot = projectRootIsData ? path.join(db.DATA_DIR, 'data') : db.DATA_DIR;
-    const assetRootLabel = projectRootIsData ? 'data' : '.';
+    const assetRoot = railwayVolume || (projectRootIsData ? path.join(db.DATA_DIR, 'data') : db.DATA_DIR);
+    const assetRootLabel = railwayVolume ? 'volume' : (projectRootIsData ? 'data' : '.');
     const backupDb = path.join(stage, 'backup.sqlite');
     fs.copyFileSync(databaseFile, backupDb);
     const files = copyVolumeTree(assetRoot, volDir, assetRoot, []);
@@ -9222,7 +9237,11 @@ function progressEmbed(percent, title, detail) {
 }
 function copyRestoredVolume(volumeDir, assetRootLabel) {
     if (!volumeDir || !fs.existsSync(volumeDir)) return 0;
-    const targetRoot = assetRootLabel === 'data' ? path.join(db.DATA_DIR, 'data') : db.DATA_DIR;
+    const targetRoot = assetRootLabel === 'data'
+        ? path.join(db.DATA_DIR, 'data')
+        : assetRootLabel === 'volume'
+            ? (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH) : db.DATA_DIR)
+            : db.DATA_DIR;
     fs.mkdirSync(targetRoot, { recursive: true });
     let copied = 0;
     function walk(src, dst) {
@@ -9348,7 +9367,7 @@ async function loadBackupAttachment(attachments, onProgress = async () => {}) {
             const manifestPath = path.join(extracted, 'manifest.json');
             if (!fs.existsSync(tmp) || !fs.existsSync(manifestPath)) throw new Error('This archive is missing its AunXz backup manifest or database.');
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-            if (manifest.format !== 'AUNXZ_FULL_BACKUP' || manifest.version !== 1 || !['.', 'data'].includes(manifest.assetRoot)) throw new Error('This is not a supported AunXz full-volume backup.');
+            if (manifest.format !== 'AUNXZ_FULL_BACKUP' || manifest.version !== 1 || !['.', 'data', 'volume'].includes(manifest.assetRoot)) throw new Error('This is not a supported AunXz full-volume backup.');
             const hash = createHash('sha256').update(fs.readFileSync(tmp)).digest('hex');
             if (hash !== manifest.databaseSha256) throw new Error('The backup database checksum does not match; the file may be corrupted.');
             const counts = validateBackupDatabase(tmp);
@@ -10344,6 +10363,66 @@ catch (e) {
     console.warn('[AunXz] ffmpeg-static could not be loaded:', e.message);
 }
 const persistentConnections = new Map();
+function voiceStateFile() {
+    const root = process.env.RAILWAY_VOLUME_MOUNT_PATH
+        ? path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH)
+        : db.DATA_DIR;
+    return path.join(root, '.aunxz-voice-connections.json');
+}
+function readVoiceState() {
+    try {
+        const value = JSON.parse(fs.readFileSync(voiceStateFile(), 'utf8'));
+        const source = value && typeof value === 'object' && value.channels && typeof value.channels === 'object'
+            ? value.channels
+            : value;
+        return new Map(Object.entries(source || {}).filter(([guildId, channelId]) =>
+            /^\d{15,25}$/.test(String(guildId)) && /^\d{15,25}$/.test(String(channelId))));
+    }
+    catch (e) {
+        if (e.code !== 'ENOENT') console.warn('[Voice] Could not read saved voice channels:', e.message || e);
+        return new Map();
+    }
+}
+const desiredVoiceChannels = readVoiceState();
+function persistVoiceState() {
+    const file = voiceStateFile();
+    const tmp = `${file}.tmp`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, updatedAt: new Date().toISOString(), channels: Object.fromEntries(desiredVoiceChannels) }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+}
+function rememberVoiceChannel(guildId, channelId) {
+    if (!/^\d{15,25}$/.test(String(guildId || '')) || !/^\d{15,25}$/.test(String(channelId || ''))) return;
+    if (desiredVoiceChannels.get(String(guildId)) === String(channelId)) return;
+    desiredVoiceChannels.set(String(guildId), String(channelId));
+    try {
+        persistVoiceState();
+    }
+    catch (e) {
+        console.warn('[Voice] Could not persist the selected voice channel:', e.message || e);
+    }
+}
+async function restoreVoiceConnections(client) {
+    if (!client) return { restored: 0, total: desiredVoiceChannels.size };
+    let restored = 0;
+    for (const [guildId, channelId] of desiredVoiceChannels) {
+        try {
+            const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+            if (!guild) continue;
+            const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+            if (!channel || channel.type !== ChannelType.GuildVoice) {
+                console.warn(`[Voice] Saved channel ${channelId} in guild ${guildId} is unavailable; it was not removed from saved state.`);
+                continue;
+            }
+            const result = await ensureBotInVC(guild, channelId);
+            if (result.joined || getVoiceConnection(guildId)?.joinConfig?.channelId === channelId) restored++;
+        }
+        catch (e) {
+            console.warn(`[Voice] Could not rejoin saved channel ${channelId} in guild ${guildId}:`, e.message || e);
+        }
+    }
+    return { restored, total: desiredVoiceChannels.size };
+}
 async function joinAndStayInVC(voiceChannel) {
     let connection = getVoiceConnection(voiceChannel.guild.id);
     if (connection && connection.joinConfig?.channelId !== voiceChannel.id) {
@@ -10384,6 +10463,7 @@ async function joinAndStayInVC(voiceChannel) {
         });
     }
     await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+    rememberVoiceChannel(voiceChannel.guild.id, voiceChannel.id);
     return connection;
 }
 async function ensureBotInVC(guild, vcId) {
@@ -10396,8 +10476,10 @@ async function ensureBotInVC(guild, vcId) {
         throw new Error(`I need **View Channel** and **Connect** in ${channel}.`);
     const existing = getVoiceConnection(guild.id);
     const already = me?.voice?.channelId === channel.id && existing && existing.state.status !== VoiceConnectionStatus.Destroyed;
-    if (already)
+    if (already) {
+        rememberVoiceChannel(guild.id, channel.id);
         return { joined: false, channel };
+    }
     await joinAndStayInVC(channel);
     return { joined: true, channel };
 }
@@ -11621,7 +11703,7 @@ async function handleAutoreactor(message) {
     }
 }
 module.exports = {
-    joinAndStayInVC, ensureBotInVC, TTS_VOICES, buildTTSBuffer, playTTSInChannel, playAudioInput, playGreetvoiceGreeting, saveGreetvoiceAudio, removeGreetvoiceAudio,
+    joinAndStayInVC, ensureBotInVC, restoreVoiceConnections, rememberVoiceChannel, TTS_VOICES, buildTTSBuffer, playTTSInChannel, playAudioInput, playGreetvoiceGreeting, saveGreetvoiceAudio, removeGreetvoiceAudio,
     antinukeStrike, findAuditExecutor, getLogChannel,
     handleAntiraidJoin,
     handleAntiBotJoin, handleAntiAltJoin, handleAntiWebhookUpdate,
@@ -12982,8 +13064,10 @@ function embedTextsListEmbed(page = 1, pageSize = 6) {
         .setDescription(`${lines.join('\n\n') || 'No embed texts have been registered yet. Use the bot normally, then run this again.'}\n\n**Page ${safePage}/${totalPages} • ${rows.length} registered embeds**`);
 }
 function embedTextsListRows(page = 1, pageSize = 6) {
-    const total = Math.max(1, Math.ceil(db.listEmbedTexts(500).length / pageSize));
-    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`em:list:prev:${Math.max(1, page - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1).setEmoji('◀️'), new ButtonBuilder().setCustomId(`em:page:${page}`).setLabel(`${page}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true), new ButtonBuilder().setCustomId(`em:list:next:${Math.min(total, page + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= total).setEmoji('▶️'))];
+    const rows = db.listEmbedTexts(500);
+    const total = Math.max(1, Math.ceil(rows.length / pageSize));
+    const safe = Math.min(total, Math.max(1, Number(page) || 1));
+    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`em:list:prev:${Math.max(1, safe - 1)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(safe <= 1).setEmoji('◀️'), new ButtonBuilder().setCustomId(`em:page:${safe}`).setLabel(`${safe}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true), new ButtonBuilder().setCustomId(`em:list:next:${Math.min(total, safe + 1)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safe >= total).setEmoji('▶️'))];
 }
 function levelUpEmbed(text) {
     return base(`${emoji('level')} Level Up!`).setColor(OK).setDescription(text);
