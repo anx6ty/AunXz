@@ -8963,6 +8963,7 @@ const path = require('path');
 const os = require('os');
 const zlib = require('zlib');
 const { randomBytes, createHash } = require('crypto');
+const { execFileSync } = require('child_process');
 const db = require('./database');
 const ui = require('./ui');
 const h = require('./helpers');
